@@ -4,6 +4,7 @@ use crate::priority_queue::{PriorityQueueReceiver, PriorityQueueSender};
 use crate::proto;
 use anyhow::{anyhow, Context, Result};
 use proto::action_request::ActionRequest;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::{error::Error, io::ErrorKind};
 use tokio::sync::mpsc::{self, Sender};
@@ -54,6 +55,7 @@ pub struct OspreyCoordinatorServer {
     #[allow(unused)]
     priority_queue_sender: PriorityQueueSender, // TODO: use this for retrying sync actions
     metrics: Arc<OspreyCoordinatorMetrics>,
+    connected_workers: Arc<AtomicI64>,
 }
 
 impl OspreyCoordinatorServer {
@@ -66,7 +68,35 @@ impl OspreyCoordinatorServer {
             priority_queue_sender,
             priority_queue_receiver,
             metrics,
+            connected_workers: Arc::new(AtomicI64::new(0)),
         }
+    }
+
+    /// Live count of bidi worker streams currently attached to this coordinator.
+    /// Used as a readiness signal — sync_action calls have nowhere to dispatch
+    /// to until at least one worker is connected.
+    pub fn connected_workers(&self) -> Arc<AtomicI64> {
+        self.connected_workers.clone()
+    }
+}
+
+/// Drop guard that increments the connected-worker counter on construction
+/// and decrements it on drop, so disconnects (graceful or via panic / cancellation)
+/// don't leak count.
+struct WorkerConnectionGuard {
+    counter: Arc<AtomicI64>,
+}
+
+impl WorkerConnectionGuard {
+    fn new(counter: Arc<AtomicI64>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for WorkerConnectionGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -189,6 +219,7 @@ impl proto::osprey_coordinator_service_server::OspreyCoordinatorService
         let (tx, rx) = mpsc::channel(128);
         let action_receiver = self.priority_queue_receiver.clone();
         let metrics = self.metrics.clone();
+        let connection_guard = WorkerConnectionGuard::new(self.connected_workers.clone());
         let max_pq_receive_await_time_ms = Duration::from_millis(
             std::env::var("MAX_PQ_RECEIVE_AWAIT_TIME_MS")
                 .unwrap_or("5000".to_string())
@@ -196,6 +227,7 @@ impl proto::osprey_coordinator_service_server::OspreyCoordinatorService
                 .unwrap(),
         );
         tokio::spawn(async move {
+            let _connection_guard = connection_guard;
             let mut client_state = ClientState::NoOutstandingAction {};
 
             // TODO: refactor the code to honor the invariants of: the first request should always be an

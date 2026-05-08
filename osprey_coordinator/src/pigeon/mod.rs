@@ -256,6 +256,22 @@ impl Server {
         self
     }
 
+    /// Attach a [`HealthChecker`] to every gRPC service registered on this Server.
+    /// `grpc.health.v1.Health/Check` against any registered service name will
+    /// return SERVING only when every attached checker reports healthy. Requests
+    /// with an empty service name follow the liveness fast-path and always
+    /// return SERVING — callers that want readiness gating must pass an explicit
+    /// service name in the HealthCheckRequest.
+    pub fn with_health_checker<F>(mut self, checker: F) -> Self
+    where
+        F: Fn() -> bool + Clone + Send + Sync + 'static,
+    {
+        for (_, checks) in self.grpc_services.values_mut() {
+            checks.push(Box::new(checker.clone()));
+        }
+        self
+    }
+
     /// Starts the server and runs until the service stops or an interrupt
     /// signal is received.
     ///

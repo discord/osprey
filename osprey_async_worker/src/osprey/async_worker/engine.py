@@ -10,7 +10,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import time
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Type, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Type, TypeVar
 
 if TYPE_CHECKING:
     from osprey.worker.lib.data_exporters.validation_result_exporter import BaseValidationResultExporter
@@ -48,6 +48,15 @@ from osprey.worker.lib.singletons import CONFIG
 log = logging.getLogger(__name__)
 
 _DEFAULT_MAX_ASYNC_PER_EXECUTION = 12
+
+
+def _extract_source_snippet(span: Span) -> str:
+    """Three-line snippet around `span`. Mirrors osprey_engine.extract_source_snippet."""
+    src = span.source.contents
+    lines = src.splitlines()
+    start = max(span.start_line - 2, 0)
+    end = min(span.start_line + 1, len(lines))
+    return '\n'.join(lines[start:end])
 
 
 class AsyncOspreyEngine:
@@ -206,7 +215,23 @@ class AsyncOspreyEngine:
     def watch_config_subkey(self, model_class: Type[ModelT], update_callback: Callable[[ModelT], None]) -> None:
         self._config_subkey_handler.watch_config_subkey(model_class, update_callback)
 
-    def get_known_feature_locations(self) -> List:
+    def get_known_feature_locations(self) -> List[Dict[str, Any]]:
+        """Return locations of named identifiers that the rules engine extracts.
+
+        Mirrors osprey.worker.lib.osprey_engine.OspreyEngine.get_known_feature_locations:
+        filters the UniqueStoredNames result by the parent Assign node's
+        should_extract flag so only identifiers the engine actually extracts make
+        it into the result.
+
+        Returns dicts (not the gevent engine's FeatureLocation dataclass) to keep
+        the async engine free of additional shared types; consumers in
+        smite_ui_api already treat the entries as JSON-shaped.
+        """
+
+        def _should_extract(span: Span) -> bool:
+            maybe_assign = span.parent_ast_node()
+            return bool(maybe_assign.should_extract if isinstance(maybe_assign, Assign) else True)
+
         identifier_index: IdentifierIndex = self._execution_graph.validated_sources.get_validator_result(
             UniqueStoredNames
         )
@@ -215,8 +240,10 @@ class AsyncOspreyEngine:
                 'name': name,
                 'source_path': span.source.path,
                 'source_line': span.start_line,
+                'source_snippet': _extract_source_snippet(span),
             }
             for name, span in identifier_index.items()
+            if _should_extract(span)
         ]
 
     def get_known_action_names(self) -> Set[str]:

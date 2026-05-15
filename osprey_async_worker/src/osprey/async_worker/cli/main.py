@@ -43,7 +43,7 @@ def init_config() -> Config:
 def bootstrap_stdlib_engine(rules_path: str) -> Tuple[AsyncOspreyEngine, UDFHelpers]:
     """Bootstrap engine with only stdlib UDFs — no external plugins, no Postgres, no labels.
 
-    This avoids loading example_plugins or discord plugins that require database connections.
+    This avoids loading example_plugins or any third-party plugins that require database connections.
     """
     from osprey.worker._stdlibplugin.udf_register import register_udfs as stdlib_register_udfs
     from osprey.worker._stdlibplugin.validator_regsiter import register_ast_validators as stdlib_register_validators

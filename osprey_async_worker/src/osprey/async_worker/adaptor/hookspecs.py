@@ -13,7 +13,7 @@ doesn't use gevent.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Sequence, Type
+from typing import TYPE_CHECKING, Any, Sequence, Tuple, Type
 
 import pluggy
 from osprey.engine.ast_validator.base_validator import BaseValidator
@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from osprey.worker.lib.action_proto_deserializer import ActionProtoDeserializer
     from osprey.worker.lib.config import Config
     from osprey.worker.lib.data_exporters.validation_result_exporter import BaseValidationResultExporter
-    from osprey.worker.lib.storage.labels import LabelsServiceBase
 
 hookspec: pluggy.HookspecMarker = pluggy.HookspecMarker(OSPREY_ASYNC_ADAPTOR)
 
@@ -67,12 +66,19 @@ def register_action_proto_deserializer() -> 'ActionProtoDeserializer':
     raise NotImplementedError
 
 
-@hookspec(firstresult=True)
-def register_labels_service_or_provider(config: 'Config') -> 'LabelsServiceBase':
-    """Register a labels service for HasLabel/LabelAdd/LabelRemove UDFs.
+@hookspec
+def register_udf_helpers(config: 'Config') -> Sequence[Tuple[Type[UDFBase[Any, Any]], Any]]:
+    """Register `(udf_class, helper)` bindings for UDFs that need a runtime helper
+    not constructible from the UDF class alone (typically because the helper
+    depends on `config` or wraps an external service client).
 
-    Same interface as the sync worker's register_labels_service_or_provider.
-    Returns a LabelsServiceBase which will be wrapped in a LabelsProvider.
+    Plugins return a sequence of pairs; the framework calls
+    ``udf_helpers.set_udf_helper(udf_class, helper)`` for each. The plugin owns
+    the UDF-class import and the helper construction, so the framework never
+    needs to know about plugin-provided UDF types.
+
+    UDFs that extend :class:`HasHelper` are wired automatically and should not
+    appear here.
     """
     raise NotImplementedError
 

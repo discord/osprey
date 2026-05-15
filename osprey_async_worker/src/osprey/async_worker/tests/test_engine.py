@@ -113,3 +113,70 @@ async def test_handle_updated_sources_dispatches_config_after_swap():
         await engine._handle_updated_sources()
 
     engine._config_subkey_handler.dispatch_config.assert_called_once_with(new.validated_sources)
+
+
+@pytest.mark.asyncio
+async def test_handle_updated_sources_nulls_parents_on_old_graph():
+    """After swap, parent pointers on every AST node in the OLD graph must be
+    nulled so refcount reclaims the old graph without waiting for gen-2 GC.
+    The NEW graph's parents must be left intact."""
+    initial = MagicMock(name='initial_graph')
+    new = MagicMock(name='new_graph')
+
+    # Old graph: two mock sources, each with a fake ast_root whose iter_nodes
+    # walk yields three nodes carrying a `parent` attribute.
+    def make_nodes(n):
+        return [MagicMock(parent=MagicMock(name=f'parent_{i}')) for i in range(n)]
+
+    old_nodes_per_source = [make_nodes(3), make_nodes(4)]
+    new_nodes_per_source = [make_nodes(2)]
+
+    def fake_iter_nodes(root):
+        # The patched iter_nodes is called with source.ast_root; we look it up
+        # via the identity of the source it came from (mock attribute chain).
+        return iter(root._test_nodes)
+
+    def make_sources(nodes_per_source):
+        sources = []
+        for nodes in nodes_per_source:
+            src = MagicMock()
+            src.ast_root._test_nodes = nodes
+            sources.append(src)
+        validated = MagicMock()
+        validated.sources = sources
+        graph = MagicMock(validated_sources=validated)
+        return graph
+
+    old_graph = make_sources(old_nodes_per_source)
+    new_graph = make_sources(new_nodes_per_source)
+
+    engine = _make_engine_with_stub_compile(old_graph, new_graph)
+
+    with patch.object(engine, '_compile_execution_graph_sync', return_value=new_graph), \
+         patch('osprey.async_worker.engine.iter_nodes', side_effect=fake_iter_nodes):
+        await engine._handle_updated_sources()
+
+    # OLD graph nodes: every parent nulled.
+    for nodes in old_nodes_per_source:
+        for n in nodes:
+            assert n.parent is None, 'old-graph AST node still has a parent'
+
+    # NEW graph nodes: parents untouched.
+    for nodes in new_nodes_per_source:
+        for n in nodes:
+            assert n.parent is not None, 'new-graph AST node parent was wrongly nulled'
+
+
+@pytest.mark.asyncio
+async def test_handle_updated_sources_swallows_cycle_break_errors():
+    """If cycle-breaking raises, the swap must still have succeeded — the new
+    graph stays installed and the engine continues to function."""
+    initial = MagicMock(name='initial_graph')
+    new = MagicMock(name='new_graph')
+    engine = _make_engine_with_stub_compile(initial, new)
+
+    with patch.object(engine, '_compile_execution_graph_sync', return_value=new), \
+         patch('osprey.async_worker.engine.iter_nodes', side_effect=RuntimeError('walker boom')):
+        await engine._handle_updated_sources()
+
+    assert engine._execution_graph is new, 'swap must complete even if cycle-break raises'

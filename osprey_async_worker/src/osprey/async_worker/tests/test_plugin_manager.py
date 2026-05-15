@@ -89,3 +89,86 @@ def test_bootstrap_register_udfs_hook_emits_async_mx_lookup() -> None:
     for udfs in pm.plugin_manager.hook.register_udfs():
         flattened.extend(udfs)
     assert AsyncMXLookup in flattened
+
+
+class _StubUDF:
+    """A stand-in UDF class used to verify helper binding without depending on
+    any concrete UDFBase subclass. Helper binding only stores the class as a
+    dict key, so any hashable type works here."""
+
+
+class _UDFHelpersPlugin:
+    """A pluggy plugin that returns one (udf_class, helper) pair when
+    register_udf_helpers is called."""
+
+    def __init__(self, udf_class, helper, capture):
+        self._udf_class = udf_class
+        self._helper = helper
+        self._capture = capture
+
+    @pm.hookimpl_osprey_async
+    def register_udf_helpers(self, config):
+        self._capture.append(config)
+        return [(self._udf_class, self._helper)]
+
+
+def test_bootstrap_applies_register_udf_helpers_bindings() -> None:
+    """A plugin that implements register_udf_helpers should have its (udf, helper)
+    pair set on UDFHelpers during bootstrap. The framework must not need to
+    import the plugin's UDF class to bind the helper."""
+    helper = object()
+    captured: list = []
+    plugin = _UDFHelpersPlugin(_StubUDF, helper, captured)
+    pm.plugin_manager.register(plugin)
+    try:
+        fake_config = object()
+        _registry, helpers = pm.bootstrap_async_udfs(config=fake_config)  # type: ignore[arg-type]
+        assert captured == [fake_config], 'register_udf_helpers must receive the config'
+        # UDFHelpers.get_udf_helper expects an instance (it calls type()).
+        # Inspect the underlying dict directly since _StubUDF is not instantiable.
+        assert helpers._helpers[_StubUDF] is helper
+    finally:
+        pm.plugin_manager.unregister(plugin)
+
+
+def test_bootstrap_skips_helper_wiring_when_config_is_none() -> None:
+    """register_udf_helpers depends on `config`; if no config is supplied,
+    bootstrap must still succeed without invoking the hook."""
+    captured: list = []
+    plugin = _UDFHelpersPlugin(_StubUDF, object(), captured)
+    pm.plugin_manager.register(plugin)
+    try:
+        _registry, helpers = pm.bootstrap_async_udfs(config=None)
+        assert captured == [], 'hook must not be called when config is None'
+        assert _StubUDF not in helpers._helpers
+    finally:
+        pm.plugin_manager.unregister(plugin)
+
+
+def test_bootstrap_swallows_exceptions_from_register_udf_helpers() -> None:
+    """A misbehaving plugin must not take down bootstrap. The exception is
+    logged and other UDFs/helpers still load."""
+
+    class _BrokenPlugin:
+        @pm.hookimpl_osprey_async
+        def register_udf_helpers(self, config):
+            raise RuntimeError('plugin boom')
+
+    plugin = _BrokenPlugin()
+    pm.plugin_manager.register(plugin)
+    try:
+        fake_config = object()
+        registry, _helpers = pm.bootstrap_async_udfs(config=fake_config)  # type: ignore[arg-type]
+        # Standard UDFs still resolved despite the broken hook.
+        assert registry.get('JsonData') is JsonData
+    finally:
+        pm.plugin_manager.unregister(plugin)
+
+
+def test_no_residual_register_labels_service_or_provider_hookspec() -> None:
+    """The legacy labels-specific hookspec has been removed in favor of the
+    generic register_udf_helpers hook."""
+    pm.load_all_async_plugins()
+    assert not hasattr(pm.plugin_manager.hook, 'register_labels_service_or_provider'), (
+        'register_labels_service_or_provider should be removed in favor of register_udf_helpers'
+    )

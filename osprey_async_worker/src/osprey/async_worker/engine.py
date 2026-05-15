@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from osprey.worker.lib.data_exporters.validation_result_exporter import BaseValidationResultExporter
 
 from ddtrace.span import Span as TracerSpan
+from osprey.engine.ast.ast_utils import iter_nodes
 from osprey.engine.ast.grammar import Assign, Span
 from osprey.engine.ast.sources import Sources, SourcesConfig
 from osprey.engine.ast_validator import validate_sources
@@ -54,8 +55,8 @@ class FeatureLocation(TypedDict):
     """Where a stored-name identifier is declared in the rule sources.
 
     Returned by :meth:`AsyncOspreyEngine.get_known_feature_locations` so
-    consumers (e.g. smite_ui_api) can render the rules-engine feature
-    catalog without re-deriving these positions.
+    out-of-process consumers can render the rules-engine feature catalog
+    without re-deriving these positions.
     """
 
     name: str
@@ -170,18 +171,26 @@ class AsyncOspreyEngine:
         # Atomic swap. In-flight actions captured the old graph by reference at
         # rules_sink.classify_one start and continue to use it until they finish;
         # only newly-arriving actions read the new graph. Safe regardless of
-        # whether the input stream is paused. Reference counting reclaims the
-        # old graph + compile intermediates as their last reference drops.
+        # whether the input stream is paused.
         #
         # We deliberately do NOT call gc.collect() here. Forcing a full gen-2
         # collection promotes every surviving object in the process into gen 2,
         # which makes subsequent automatic collections during action processing
-        # measurably more expensive. With the previous gc.collect ×2 in place
-        # (added in cmttt/osprey#27) we observed sustained avg per-pod CPU
-        # 2.4× elevated for tens of minutes after each rule deploy. A pod
-        # rolling restart immediately recovered baseline CPU. The gevent
-        # engine does the swap without an explicit gc.collect and recovers
-        # cleanly; mirror that.
+        # measurably more expensive.
+        #
+        # The old graph contains refcycles between AST roots and their children
+        # via ASTNode.parent back-pointers (see osprey/engine/ast/grammar.py),
+        # so plain refcount alone cannot reclaim it. Without intervention the
+        # old graph persists until gen-2 GC catches the cycle, and across many
+        # rule recompiles the resulting GC pressure raises per-message CPU.
+        #
+        # Fix: after the swap, walk the OLD graph's AST and null `parent`
+        # pointers. That breaks the cycle so plain refcount reclaims the
+        # old graph as in-flight references drop. Parent pointers are
+        # consumed only by validators (compile-time) — the executor never
+        # reads them — so nulling them on the about-to-be-discarded graph
+        # is safe for in-flight tasks.
+        old_graph = self._execution_graph
         self._execution_graph = new_graph
 
         log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
@@ -192,6 +201,26 @@ class AsyncOspreyEngine:
                 self._validation_result_exporter.send(self._execution_graph.validated_sources)
             except Exception:
                 log.exception('Failed to export validation results')
+
+        self._break_old_graph_cycles(old_graph)
+
+    @staticmethod
+    def _break_old_graph_cycles(old_graph: ExecutionGraph) -> None:
+        """Null `parent` back-pointers on every AST node in the discarded graph
+        so plain refcount can reclaim it without waiting for gen-2 GC.
+
+        Best-effort: any exception here is logged and swallowed. A leaked old
+        graph is wasteful but not incorrect.
+        """
+        try:
+            count = 0
+            for source in old_graph.validated_sources.sources:
+                for node in iter_nodes(source.ast_root):
+                    node.parent = None
+                    count += 1
+            log.debug('broke parent pointers on %d AST nodes from old graph', count)
+        except Exception:
+            log.exception('failed to break cycles on old execution graph')
 
     @property
     def execution_graph(self) -> ExecutionGraph:

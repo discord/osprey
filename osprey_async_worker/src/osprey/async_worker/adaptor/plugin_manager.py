@@ -92,30 +92,31 @@ def bootstrap_async_udfs(config: 'Config | None' = None) -> tuple[UDFRegistry, U
         if issubclass(udf, HasHelper):
             udf_helpers.set_udf_helper(udf, udf.create_provider())
 
-    # Wire up labels service helper for AsyncHasLabel
-    labels_hook_result = _get_labels_hook_result(config)
-    if labels_hook_result:
-        from discord_smite.osprey_async_plugins.discord_osprey_async_plugins.udfs.async_has_label import (
-            HasLabel as AsyncHasLabel,
-        )
-
-        udf_helpers.set_udf_helper(AsyncHasLabel, labels_hook_result)
+    # Plugin-provided helper bindings for UDFs whose helper depends on `config`
+    # or wraps an external service. Each plugin returns `(udf_class, helper)`
+    # pairs; the framework binds them without needing to import the UDF class.
+    if config is not None:
+        for udf_class, helper in _iter_plugin_udf_helpers(config):
+            udf_helpers.set_udf_helper(udf_class, helper)
 
     udf_registry = UDFRegistry.with_udfs(*all_udfs)
     return udf_registry, udf_helpers
 
 
-def _get_labels_hook_result(config: 'Config | None') -> Any:
-    """Call the labels service/provider hook. Returns the raw result or None on failure."""
-    if config is None:
-        return None
-    if not hasattr(plugin_manager.hook, 'register_labels_service_or_provider'):
-        return None
+def _iter_plugin_udf_helpers(config: Config) -> List[tuple[Type[UDFBase[Any, Any]], Any]]:
+    """Collect `(udf_class, helper)` bindings from every plugin that implements
+    the `register_udf_helpers` hook. Failures are logged and skipped so one
+    broken plugin doesn't take down bootstrap.
+    """
+    pairs: List[tuple[Type[UDFBase[Any, Any]], Any]] = []
+    if not hasattr(plugin_manager.hook, 'register_udf_helpers'):
+        return pairs
     try:
-        return plugin_manager.hook.register_labels_service_or_provider(config=config)
+        for plugin_result in plugin_manager.hook.register_udf_helpers(config=config):
+            pairs.extend(plugin_result)
     except Exception:
-        logging.exception('Failed to register labels service/provider')
-        return None
+        logging.exception('Failed to collect UDF helpers from plugins')
+    return pairs
 
 
 def bootstrap_async_action_proto_deserializer() -> ActionProtoDeserializer | None:

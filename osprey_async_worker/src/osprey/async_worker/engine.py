@@ -55,8 +55,8 @@ class FeatureLocation(TypedDict):
     """Where a stored-name identifier is declared in the rule sources.
 
     Returned by :meth:`AsyncOspreyEngine.get_known_feature_locations` so
-    consumers (e.g. smite_ui_api) can render the rules-engine feature
-    catalog without re-deriving these positions.
+    out-of-process consumers can render the rules-engine feature catalog
+    without re-deriving these positions.
     """
 
     name: str
@@ -176,19 +176,13 @@ class AsyncOspreyEngine:
         # We deliberately do NOT call gc.collect() here. Forcing a full gen-2
         # collection promotes every surviving object in the process into gen 2,
         # which makes subsequent automatic collections during action processing
-        # measurably more expensive. With the previous gc.collect ×2 in place
-        # (added in cmttt/osprey#27) we observed sustained avg per-pod CPU
-        # 2.4× elevated for tens of minutes after each rule deploy. A pod
-        # rolling restart immediately recovered baseline CPU.
+        # measurably more expensive.
         #
-        # Without gc.collect, observation on 2026-05-15: across ~24h with 12
-        # rule-deploy recompiles, async pods accumulated ~25% extra CPU per
-        # message vs. a fresh-restart fleet, with matching ~30% extra rx
-        # bytes/pod (pubsub redelivery from GC-stalled modacks). Root cause:
-        # ASTNode.parent back-pointers (see osprey_worker/.../ast/grammar.py)
-        # form refcycles between AST roots and their children; the previous
-        # graph isn't reclaimable until gen-2 collection catches the cycle,
-        # which never quite happens fast enough to keep up with rule deploys.
+        # The old graph contains refcycles between AST roots and their children
+        # via ASTNode.parent back-pointers (see osprey/engine/ast/grammar.py),
+        # so plain refcount alone cannot reclaim it. Without intervention the
+        # old graph persists until gen-2 GC catches the cycle, and across many
+        # rule recompiles the resulting GC pressure raises per-message CPU.
         #
         # Fix: after the swap, walk the OLD graph's AST and null `parent`
         # pointers. That breaks the cycle so plain refcount reclaims the

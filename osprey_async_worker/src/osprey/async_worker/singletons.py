@@ -1,9 +1,8 @@
 """Singletons for the async worker.
 
-Mirrors osprey.worker.lib.singletons but for the async engine. The migrating
-gevent services (smite_ui_api, smite_rules_api, webhook_sink, bulk_label_sink)
-rely on a process-wide ENGINE.instance() accessor; this module supplies the
-async equivalent.
+Mirrors osprey.worker.lib.singletons but for the async engine. Services that
+migrate from the gevent engine to the async engine often rely on a process-wide
+ENGINE.instance() accessor; this module supplies the async equivalent.
 
 The gevent ENGINE singleton lives at osprey.worker.lib.singletons.ENGINE and
 holds an OspreyEngine. This module's ENGINE holds an AsyncOspreyEngine and is

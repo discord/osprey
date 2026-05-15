@@ -10,7 +10,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Type, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Type, TypedDict, TypeVar
 
 if TYPE_CHECKING:
     from osprey.worker.lib.data_exporters.validation_result_exporter import BaseValidationResultExporter
@@ -48,6 +48,20 @@ from osprey.worker.lib.singletons import CONFIG
 log = logging.getLogger(__name__)
 
 _DEFAULT_MAX_ASYNC_PER_EXECUTION = 12
+
+
+class FeatureLocation(TypedDict):
+    """Where a stored-name identifier is declared in the rule sources.
+
+    Returned by :meth:`AsyncOspreyEngine.get_known_feature_locations` so
+    consumers (e.g. smite_ui_api) can render the rules-engine feature
+    catalog without re-deriving these positions.
+    """
+
+    name: str
+    source_path: str
+    source_line: int
+    source_snippet: str
 
 
 def _extract_source_snippet(span: Span) -> str:
@@ -215,7 +229,7 @@ class AsyncOspreyEngine:
     def watch_config_subkey(self, model_class: Type[ModelT], update_callback: Callable[[ModelT], None]) -> None:
         self._config_subkey_handler.watch_config_subkey(model_class, update_callback)
 
-    def get_known_feature_locations(self) -> List[Dict[str, Any]]:
+    def get_known_feature_locations(self) -> List[FeatureLocation]:
         """Return locations of named identifiers that the rules engine extracts.
 
         Mirrors osprey.worker.lib.osprey_engine.OspreyEngine.get_known_feature_locations:
@@ -223,9 +237,9 @@ class AsyncOspreyEngine:
         should_extract flag so only identifiers the engine actually extracts make
         it into the result.
 
-        Returns dicts (not the gevent engine's FeatureLocation dataclass) to keep
-        the async engine free of additional shared types; consumers in
-        smite_ui_api already treat the entries as JSON-shaped.
+        Returns FeatureLocation TypedDicts (JSON-shaped) — the gevent engine
+        used a dataclass; this surface stays a plain dict so consumers can
+        serialize without conversion while still getting precise types.
         """
 
         def _should_extract(span: Span) -> bool:
@@ -236,12 +250,12 @@ class AsyncOspreyEngine:
             UniqueStoredNames
         )
         return [
-            {
-                'name': name,
-                'source_path': span.source.path,
-                'source_line': span.start_line,
-                'source_snippet': _extract_source_snippet(span),
-            }
+            FeatureLocation(
+                name=name,
+                source_path=span.source.path,
+                source_line=span.start_line,
+                source_snippet=_extract_source_snippet(span),
+            )
             for name, span in identifier_index.items()
             if _should_extract(span)
         ]

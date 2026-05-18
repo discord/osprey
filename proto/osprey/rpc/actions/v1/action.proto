@@ -28,6 +28,7 @@ message Action {
     HashMatcherIconMatched hash_matcher_icon_matched = 12;
     SafetyVisualPrediction safety_visual_prediction = 13;
     GuildBatchMLScore guild_batch_ml_score = 14;
+    GuildCondoDetected guild_condo_detected = 15;
   }
 }
 
@@ -86,6 +87,16 @@ message GuildBatchMLScore {
   double score = 6;
   BatchMLCluster cluster = 7;
   BatchMLSourceEvent source_event = 8;
+}
+
+message GuildCondoDetected {
+  google.protobuf.Timestamp timestamp = 1;
+  uint64 guild_id = 2;
+  string confidence = 3;
+  repeated string reasons = 4;
+  google.protobuf.StringValue raw_rationale = 5;
+  string model_version = 6;
+  OrchestrationJob orchestration_job = 7;
 }
 
 message OspreyAutoClusteringUser {

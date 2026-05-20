@@ -9,6 +9,7 @@ import logging
 from typing import List, Optional
 
 from google.cloud import pubsub_v1
+from osprey.worker.lib.instruments import metrics
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class AsyncPubSubPublisher:
         self._max_latency = max_latency_seconds
         self._flush_task: Optional[asyncio.Task[None]] = None
         self._started = False
+        self._metric_tags = [f'project:{project_id}', f'topic:{topic_id}']
 
     def _ensure_started(self) -> None:
         """Start the background flush task on first publish."""
@@ -46,7 +48,9 @@ class AsyncPubSubPublisher:
                 loop = asyncio.get_running_loop()
                 self._flush_task = loop.create_task(self._flush_loop())
             except RuntimeError:
-                pass  # No event loop — sync mode, flush immediately
+                # No event loop. Messages will be enqueued but never flushed —
+                # surface that explicitly so dashboards can catch it.
+                metrics.increment('async_pubsub_publisher.no_event_loop', tags=self._metric_tags)
 
     async def _flush_loop(self) -> None:
         """Background task that flushes the buffer periodically."""
@@ -95,12 +99,18 @@ class AsyncPubSubPublisher:
         """Synchronous batch publish."""
         futures = []
         for data in batch:
+            metrics.increment('async_pubsub_publisher.publish.attempt', tags=self._metric_tags)
             futures.append(self._client.publish(self._topic_path, data))
         for future in futures:
             try:
                 future.result(timeout=5)
-            except Exception:
+                metrics.increment('async_pubsub_publisher.publish.success', tags=self._metric_tags)
+            except Exception as e:
                 logger.exception('Failed to publish message')
+                metrics.increment(
+                    'async_pubsub_publisher.publish.failure',
+                    tags=self._metric_tags + [f'error:{e.__class__.__name__}'],
+                )
 
     def publish(self, data: BaseModel) -> None:
         """Queue a Pydantic model for async batched publishing."""
@@ -113,6 +123,7 @@ class AsyncPubSubPublisher:
             self._queue.put_nowait(data)
         except asyncio.QueueFull:
             logger.warning('Publisher queue full, dropping message')
+            metrics.increment('async_pubsub_publisher.queue_full', tags=self._metric_tags)
 
     async def stop(self) -> None:
         """Flush remaining messages and stop."""

@@ -4,6 +4,7 @@ import traceback
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -19,8 +20,6 @@ from typing import (
     TypeAlias,
     TypeVar,
 )
-
-from functools import lru_cache
 
 from google.protobuf.timestamp_pb2 import Timestamp
 
@@ -53,6 +52,8 @@ if TYPE_CHECKING:
 try:
     from osprey.async_worker.lib.external_service import (
         AsyncExternalService,
+    )
+    from osprey.async_worker.lib.external_service import (
         ExternalServiceAccessor as AsyncExternalServiceAccessor,
     )
 except ImportError:
@@ -64,6 +65,7 @@ from osprey.engine.language_types.effects import (
     EffectBase,
     EffectToCustomExtractedFeatureBase,
 )
+from osprey.engine.language_types.labels import LabelEffect, LabelStatus
 from osprey.engine.language_types.post_execution_convertible import PostExecutionConvertible
 from osprey.engine.language_types.verdicts import VerdictEffect
 from osprey.engine.utils.types import add_slots, cached_property
@@ -74,6 +76,22 @@ if TYPE_CHECKING:
     from osprey.engine.ast_validator.validation_context import ValidatedSources
 
 logger = logging.getLogger(__name__)
+
+
+def _label_effect_takes_effect(effect: LabelEffect) -> bool:
+    """True iff a LabelAdd effect would actually be applied for this action.
+
+    A LabelAdd is filtered out when it has status REMOVED, was suppressed
+    (e.g. an `apply_if` AST that failed to evaluate), or is gated by a
+    `dependent_rule` whose value is falsy. Filtered-out effects are not
+    surfaced to sync callers as entity verdicts.
+    """
+    return (
+        effect.status == LabelStatus.ADDED
+        and not effect.suppressed
+        and (effect.dependent_rule is None or effect.dependent_rule.value)
+    )
+
 
 NodeResult: TypeAlias = Result[object, None]
 
@@ -463,11 +481,19 @@ class ExecutionResult:
         """
         returns a pb2 protobuf of the verdicts declared by the action, along with some extra metadata~
         ╰(*°▽°*)╯
+
+        Also surfaces effective LabelAdd effects as entity verdicts of the form
+        "<entity.type>/<entity.id>/<label.name>", so sync callers reading
+        entity_has_label() see labels applied during the action.
         """
         return Verdicts(
             action_id=self.action.action_id,
             action_name=self.action.action_name,
-            verdicts=[v.verdict for v in self.verdicts],
+            verdicts=[v.verdict for v in self.verdicts] + [
+                f'{e.entity.type}/{e.entity.id}/{e.name}'
+                for e in self.effects.get(LabelEffect, [])
+                if _label_effect_takes_effect(e)
+            ],
             timestamp=self._get_timestamp_pb2_proto(),
         )
 

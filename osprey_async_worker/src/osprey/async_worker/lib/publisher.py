@@ -8,11 +8,21 @@ import asyncio
 import logging
 from typing import List, Optional
 
+from google.api_core.retry import Retry
 from google.cloud import pubsub_v1
 from osprey.worker.lib.instruments import metrics
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+# Retry policy passed to PublisherClient.publish().  Google's Retry already
+# classifies transient gRPC codes (UNAVAILABLE, DEADLINE_EXCEEDED,
+# RESOURCE_EXHAUSTED, ABORTED, INTERNAL) and TimeoutError as retryable.
+# The 30-second deadline gives the internal retry loop enough headroom for a
+# few backoff attempts before we give up.  The future.result() timeout below
+# is set slightly above deadline so the Retry loop, not the wall-clock cap,
+# decides when to stop.
+_PUBLISH_RETRY = Retry(initial=0.5, maximum=10.0, multiplier=2.0, deadline=30.0)
 
 
 class AsyncPubSubPublisher:
@@ -100,10 +110,12 @@ class AsyncPubSubPublisher:
         futures = []
         for data in batch:
             metrics.increment('async_pubsub_publisher.publish.attempt', tags=self._metric_tags)
-            futures.append(self._client.publish(self._topic_path, data))
+            futures.append(self._client.publish(self._topic_path, data, retry=_PUBLISH_RETRY))
         for future in futures:
             try:
-                future.result(timeout=5)
+                # deadline=30s above; 35s here ensures Retry's own deadline,
+                # not this wall-clock cap, is what terminates failed attempts.
+                future.result(timeout=35)
                 metrics.increment('async_pubsub_publisher.publish.success', tags=self._metric_tags)
             except Exception as e:
                 logger.exception('Failed to publish message')

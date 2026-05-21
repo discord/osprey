@@ -206,6 +206,26 @@ def test_count_over_with_and_filter(
     _assert_valid_count_over_sql(transformed_query)
 
 
+def test_count_over_custom_datasource_name(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """Callers can pass a real Druid datasource name (e.g. `smite.events`)
+    and get executable SQL with that name interpolated and quoted."""
+    validated_sources = parse_query_to_validated_ast(
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m', key=UserId) >= 10",
+        make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('UserId', "'123'")]),
+    )
+    transformed_query = DruidQueryTransformer(
+        validated_sources=validated_sources, datasource_name='smite.events'
+    ).transform()
+    sql = transformed_query['sql']
+    assert 'FROM "smite.events"' in sql
+    # Placeholder must not leak through when a real name was provided.
+    assert 'FROM "datasource"' not in sql
+    # Inner-subquery alias should still be present regardless of datasource name.
+    assert ') AS __inner WHERE' in sql
+
+
 def _assert_valid_count_over_sql(transformed_query: Any) -> None:
     """Assert the transformed query contains valid CountOver SQL.
 
@@ -227,7 +247,11 @@ def _assert_valid_count_over_sql(transformed_query: Any) -> None:
     # Not: SELECT * FROM (SELECT *, LAG(...) FROM __default FROM datasource WHERE ...) WHERE ...
     # So we look for the doubling pattern specifically
     assert ' FROM __default FROM ' not in sql.upper(), f"Found doubled FROM clause (FROM __default FROM). SQL: {sql}"
-    assert 'FROM datasource' in sql, f"Expected 'FROM datasource' in SQL. SQL: {sql}"
+    # The translator emits the datasource name double-quoted (`FROM "<name>"`)
+    # so that names containing `.` parse under Calcite. The default placeholder
+    # `"datasource"` shows up here; callers passing a real name get e.g.
+    # `FROM "smite.events"`.
+    assert 'FROM "datasource"' in sql, f"Expected 'FROM \"datasource\"' in SQL. SQL: {sql}"
 
     # Check for f-string bug (Critical 2) - literal {operand_str}
     assert '{operand_str}' not in sql, f"Found literal {{operand_str}} in SQL (f-string bug). SQL: {sql}"

@@ -18,9 +18,16 @@ class DruidQueryTransformException(Exception):
 
 
 class DruidQueryTransformer:
-    """Given a osprey_ast node tree, transform it into a Druid query"""
+    """Given a osprey_ast node tree, transform it into a Druid query.
 
-    def __init__(self, validated_sources: ValidatedSources):
+    For CountOver lowering, `datasource_name` is interpolated into the emitted
+    SQL's `FROM` clause. The default `'datasource'` preserves the historical
+    behavior where callers substitute the placeholder themselves; pass a real
+    Druid datasource name (e.g. `'smite.events'`) to get executable SQL.
+    The name is quoted in the SQL output to support names containing `.`.
+    """
+
+    def __init__(self, validated_sources: ValidatedSources, datasource_name: str = 'datasource'):
         try:
             self._udf_node_mapping = validated_sources.get_validator_result(ValidateCallKwargs)
         except KeyError:
@@ -29,6 +36,7 @@ class DruidQueryTransformer:
         assign_node = validated_sources.sources.get_entry_point().ast_root.statements[0]
         assert isinstance(assign_node, grammar.Assign)
         self._root = assign_node.value
+        self._datasource_name = datasource_name
 
     def transform(self) -> Dict[str, Any]:
         """Transform AST to Druid query.
@@ -218,15 +226,21 @@ class DruidQueryTransformer:
 
         lag_select = ', '.join(lag_columns)
 
-        # Build the inner SELECT (with LAG columns)
-        # datasource is a placeholder that Smite-side will rewrite to the actual datasource name
-        inner_select = f"SELECT *, {lag_select} FROM datasource WHERE {where_clause}"
+        # Build the inner SELECT (with LAG columns).
+        # `datasource_name` defaults to a literal `datasource` placeholder so
+        # legacy callers that substitute it themselves keep working; callers
+        # that pass a real name get executable SQL directly. The name is
+        # double-quoted in case it contains `.` (Druid datasources commonly
+        # do, e.g. `smite.events`).
+        quoted_datasource = f'"{self._datasource_name}"'
+        inner_select = f"SELECT *, {lag_select} FROM {quoted_datasource} WHERE {where_clause}"
 
         # Build the post-filter SQL
         post_filter = metadata.post_filter_template.format(window_seconds=window_seconds)
 
-        # Combine into outer SELECT
-        sql = f"SELECT * FROM ({inner_select}) WHERE {post_filter}"
+        # Combine into outer SELECT. Druid's Calcite parser requires every
+        # FROM-clause subquery to be aliased — `AS __inner` satisfies that.
+        sql = f"SELECT * FROM ({inner_select}) AS __inner WHERE {post_filter}"
 
         return sql
 

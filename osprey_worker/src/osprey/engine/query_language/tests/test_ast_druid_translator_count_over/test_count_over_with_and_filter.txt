@@ -1,4 +1,4 @@
 {
-    "sql": "SELECT * FROM (SELECT *, LAG(__time, 9) OVER (PARTITION BY UserId ORDER BY __time) AS pt1 FROM datasource WHERE UserLoginIp = '1.1.1.1' AND Country != 'US') WHERE pt1 IS NOT NULL AND __time - pt1 <= 600",
+    "sql": "SELECT * FROM (SELECT *, LAG(__time, 9) OVER (PARTITION BY UserId ORDER BY __time) AS pt1 FROM \"datasource\" WHERE UserLoginIp = '1.1.1.1' AND Country != 'US') AS __inner WHERE pt1 IS NOT NULL AND __time - pt1 <= 600",
     "type": "sql"
 }

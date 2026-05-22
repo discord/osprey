@@ -414,6 +414,101 @@ def test_count_over_self_join_engine_all_operators(
         assert f'HAVING COUNT(*) {expected_op} {threshold}' in sql, f'{query_tail}: {sql}'
 
 
+def test_count_over_top_n_window_engine(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """`output_mode='top_n'` (window engine) wraps the LAG-based inner SQL
+    with `GROUP BY <dim> ORDER BY COUNT(*) DESC LIMIT N` for "top dimensions
+    by burst count" queries."""
+    from datetime import datetime, timezone
+
+    validated_sources = parse_query_to_validated_ast(
+        "CountOver(predicate=UserIp == '1.1.1.1', window='5m', key=UserId) == 3",
+        make_rules_sources([('UserIp', "'1.1.1.1'"), ('UserId', "'u1'")]),
+    )
+    start = datetime(2026, 5, 21, 11, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 21, 13, 0, 0, tzinfo=timezone.utc)
+
+    sql = DruidQueryTransformer(
+        validated_sources=validated_sources,
+        datasource_name='smite.events',
+        output_mode='top_n',
+        time_bounds=(start, end),
+        topn_dimension='UserId',
+        topn_limit=100,
+    ).transform()['sql']
+
+    assert 'UserId AS __dim' in sql
+    assert 'COUNT(*) AS cnt' in sql
+    assert 'GROUP BY UserId' in sql
+    assert 'ORDER BY cnt DESC' in sql
+    assert 'LIMIT 100' in sql
+
+
+def test_count_over_top_n_self_join_engine(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """`output_mode='top_n'` on the self-join engine projects the dimension
+    through the inner self-join, then aggregates and orders at the outer level."""
+    from datetime import datetime, timezone
+
+    validated_sources = parse_query_to_validated_ast(
+        "CountOver(predicate=UserIp == '1.1.1.1', window='5m', key=UserId) == 3",
+        make_rules_sources([('UserIp', "'1.1.1.1'"), ('UserId', "'u1'")]),
+    )
+    start = datetime(2026, 5, 21, 11, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 21, 13, 0, 0, tzinfo=timezone.utc)
+
+    sql = DruidQueryTransformer(
+        validated_sources=validated_sources,
+        datasource_name='smite.events',
+        sql_engine='self_join',
+        output_mode='top_n',
+        time_bounds=(start, end),
+        topn_dimension='UserId',
+        topn_limit=100,
+    ).transform()['sql']
+
+    # Inner: self-join + HAVING + dimension projected
+    assert 't1.UserId AS __dim' in sql
+    assert 'GROUP BY t1.__time, t1.UserId' in sql
+    assert 'HAVING COUNT(*) = 3' in sql
+    # Outer: TopN aggregation + ordering + limit
+    assert 'GROUP BY __dim' in sql
+    assert 'ORDER BY cnt DESC' in sql
+    assert 'LIMIT 100' in sql
+
+
+def test_count_over_top_n_requires_dimension_and_limit(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """Constructor validates that `output_mode='top_n'` is paired with both
+    `topn_dimension` and `topn_limit`."""
+    from datetime import datetime, timezone
+
+    validated_sources = parse_query_to_validated_ast(
+        "CountOver(predicate=UserIp == '1.1.1.1', window='5m') >= 10",
+        make_rules_sources([('UserIp', "'1.1.1.1'")]),
+    )
+    start = datetime(2026, 5, 21, 11, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 21, 13, 0, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match='topn_dimension'):
+        DruidQueryTransformer(
+            validated_sources=validated_sources,
+            output_mode='top_n',
+            time_bounds=(start, end),
+            topn_limit=100,
+        )
+    with pytest.raises(ValueError, match='topn'):
+        DruidQueryTransformer(
+            validated_sources=validated_sources,
+            output_mode='top_n',
+            time_bounds=(start, end),
+            topn_dimension='UserId',
+        )
+
+
 def test_count_over_engine_validation(
     make_rules_sources: MakeRulesSourcesFunction,
 ) -> None:

@@ -20,7 +20,13 @@ from osprey.engine.query_language.udfs.count_over import (
 COUNT_OVER_OUTPUT_INNER = 'inner'
 COUNT_OVER_OUTPUT_SCAN = 'scan'
 COUNT_OVER_OUTPUT_TIMESERIES = 'timeseries'
-_COUNT_OVER_OUTPUT_MODES = (COUNT_OVER_OUTPUT_INNER, COUNT_OVER_OUTPUT_SCAN, COUNT_OVER_OUTPUT_TIMESERIES)
+COUNT_OVER_OUTPUT_TOP_N = 'top_n'
+_COUNT_OVER_OUTPUT_MODES = (
+    COUNT_OVER_OUTPUT_INNER,
+    COUNT_OVER_OUTPUT_SCAN,
+    COUNT_OVER_OUTPUT_TIMESERIES,
+    COUNT_OVER_OUTPUT_TOP_N,
+)
 
 # SQL engines for the CountOver lowering. The default 'window' uses SQL window
 # functions (LAG over PARTITION BY/ORDER BY) and requires Druid 31+ for reliable
@@ -88,6 +94,8 @@ class DruidQueryTransformer:
         time_bounds: Optional[Tuple[datetime, datetime]] = None,
         granularity_period: Optional[str] = None,
         sql_engine: str = COUNT_OVER_ENGINE_WINDOW,
+        topn_dimension: Optional[str] = None,
+        topn_limit: Optional[int] = None,
     ):
         if output_mode not in _COUNT_OVER_OUTPUT_MODES:
             raise ValueError(
@@ -97,6 +105,8 @@ class DruidQueryTransformer:
             raise ValueError(f'output_mode={output_mode!r} requires time_bounds')
         if output_mode == COUNT_OVER_OUTPUT_TIMESERIES and not granularity_period:
             raise ValueError("output_mode='timeseries' requires granularity_period (ISO 8601, e.g. 'PT1H')")
+        if output_mode == COUNT_OVER_OUTPUT_TOP_N and (not topn_dimension or topn_limit is None):
+            raise ValueError("output_mode='top_n' requires topn_dimension and topn_limit")
         if sql_engine not in _COUNT_OVER_ENGINES:
             raise ValueError(f'sql_engine must be one of {_COUNT_OVER_ENGINES}; got {sql_engine!r}')
 
@@ -113,6 +123,8 @@ class DruidQueryTransformer:
         self._time_bounds = time_bounds
         self._granularity_period = granularity_period
         self._sql_engine = sql_engine
+        self._topn_dimension = topn_dimension
+        self._topn_limit = topn_limit
 
     def transform(self) -> Dict[str, Any]:
         """Transform AST to Druid query.
@@ -163,16 +175,31 @@ class DruidQueryTransformer:
             # requires `AS __t` on the outer FROM subquery.
             return f"SELECT * FROM ({inner_sql}) AS __t WHERE {time_where}"
 
-        # TIMESERIES: bucket by TIME_FLOOR and count. The native timeseries
-        # consumer expects `[{timestamp, result: {count}}, ...]`; we emit
-        # rows of `{bucket, cnt}` which the caller can adapt.
-        assert self._granularity_period is not None  # validated in __init__
+        if self._output_mode == COUNT_OVER_OUTPUT_TIMESERIES:
+            # TIMESERIES: bucket by TIME_FLOOR and count. The native timeseries
+            # consumer expects `[{timestamp, result: {count}}, ...]`; we emit
+            # rows of `{bucket, cnt}` which the caller can adapt.
+            assert self._granularity_period is not None  # validated in __init__
+            return (
+                f"SELECT TIME_FLOOR(__time, '{self._granularity_period}') AS bucket, "
+                f"COUNT(*) AS cnt "
+                f"FROM ({inner_sql}) AS __t "
+                f"WHERE {time_where} "
+                f"GROUP BY 1 ORDER BY 1"
+            )
+
+        # TOP_N: group the burst events by the requested dimension, ordered by
+        # count desc, top K. Emits rows of `{__dim, cnt}` which the caller can
+        # adapt to the native TopN response shape.
+        assert self._output_mode == COUNT_OVER_OUTPUT_TOP_N
+        assert self._topn_dimension is not None and self._topn_limit is not None
         return (
-            f"SELECT TIME_FLOOR(__time, '{self._granularity_period}') AS bucket, "
-            f"COUNT(*) AS cnt "
+            f'SELECT {self._topn_dimension} AS __dim, COUNT(*) AS cnt '
             f"FROM ({inner_sql}) AS __t "
-            f"WHERE {time_where} "
-            f"GROUP BY 1 ORDER BY 1"
+            f'WHERE {time_where} '
+            f'GROUP BY {self._topn_dimension} '
+            f'ORDER BY cnt DESC '
+            f'LIMIT {self._topn_limit}'
         )
 
     def _detect_count_over(
@@ -448,6 +475,28 @@ class DruidQueryTransformer:
                 f"WHERE __time >= TIMESTAMP '{start_lit}' "
                 f"AND __time < TIMESTAMP '{end_lit}' "
                 f"GROUP BY 1 ORDER BY 1"
+            )
+
+        if self._output_mode == COUNT_OVER_OUTPUT_TOP_N:
+            assert self._time_bounds is not None
+            assert self._topn_dimension is not None and self._topn_limit is not None
+            start, end = self._time_bounds
+            start_lit = _format_druid_timestamp_literal(start)
+            end_lit = _format_druid_timestamp_literal(end)
+            # Inner: same self-join + HAVING, but also project the dimension
+            # column from t1 so the outer GROUP BY can aggregate by it.
+            # Outer: GROUP BY dimension, ORDER BY count DESC, LIMIT K.
+            return (
+                f'SELECT __dim, COUNT(*) AS cnt FROM ('
+                f'SELECT t1.__time AS __time, t1.{self._topn_dimension} AS __dim '
+                f'FROM {t1_subq} INNER JOIN {t2_subq} ON {join_on} '
+                f'WHERE {time_window_where} '
+                f'GROUP BY t1.__time, t1.{self._topn_dimension} '
+                f'HAVING COUNT(*) {op} {threshold}'
+                f') AS __t '
+                f"WHERE __time >= TIMESTAMP '{start_lit}' "
+                f"AND __time < TIMESTAMP '{end_lit}' "
+                f'GROUP BY __dim ORDER BY cnt DESC LIMIT {self._topn_limit}'
             )
 
         # SCAN or INNER: project (__action_id, __time) of each qualifying

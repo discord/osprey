@@ -24,7 +24,7 @@ class OperatorMetadata:
         lag_offsets: Ordered list of LAG offset values (typically 1 or 2 elements).
                      Element 0 maps to pt1, element 1 (if present) maps to pt2.
         post_filter_template: SQL fragment using placeholders like {window_seconds}.
-                             Example: "pt1 IS NOT NULL AND __time - pt1 <= {window_seconds}"
+                             Example: "pt1 IS NOT NULL AND TIMESTAMPDIFF(SECOND, pt1, __time) <= {window_seconds}"
     """
     lag_offsets: List[int]
     post_filter_template: str
@@ -50,13 +50,13 @@ def operator_metadata_for(comparator_type: Type[object], threshold: int) -> Oper
         # >= N: LAG(__time, N-1) AS pt1 + check pt1 exists within window
         return OperatorMetadata(
             lag_offsets=[threshold - 1],
-            post_filter_template="pt1 IS NOT NULL AND __time - pt1 <= {window_seconds}",
+            post_filter_template="pt1 IS NOT NULL AND TIMESTAMPDIFF(SECOND, pt1, __time) <= {window_seconds}",
         )
     elif comparator_type == grammar.GreaterThan:
         # > N: LAG(__time, N) AS pt1 + check pt1 exists within window
         return OperatorMetadata(
             lag_offsets=[threshold],
-            post_filter_template="pt1 IS NOT NULL AND __time - pt1 <= {window_seconds}",
+            post_filter_template="pt1 IS NOT NULL AND TIMESTAMPDIFF(SECOND, pt1, __time) <= {window_seconds}",
         )
     elif comparator_type == grammar.Equals:
         # == N: LAG(__time, N-1) AS pt1, LAG(__time, N) AS pt2
@@ -64,8 +64,8 @@ def operator_metadata_for(comparator_type: Type[object], threshold: int) -> Oper
         return OperatorMetadata(
             lag_offsets=[threshold - 1, threshold],
             post_filter_template=(
-                "pt1 IS NOT NULL AND __time - pt1 <= {window_seconds} AND "
-                "(pt2 IS NULL OR __time - pt2 > {window_seconds})"
+                "pt1 IS NOT NULL AND TIMESTAMPDIFF(SECOND, pt1, __time) <= {window_seconds} AND "
+                "(pt2 IS NULL OR TIMESTAMPDIFF(SECOND, pt2, __time) > {window_seconds})"
             ),
         )
     elif comparator_type == grammar.NotEquals:
@@ -73,21 +73,21 @@ def operator_metadata_for(comparator_type: Type[object], threshold: int) -> Oper
         return OperatorMetadata(
             lag_offsets=[threshold - 1, threshold],
             post_filter_template=(
-                "NOT (pt1 IS NOT NULL AND __time - pt1 <= {window_seconds} AND "
-                "(pt2 IS NULL OR __time - pt2 > {window_seconds}))"
+                "NOT (pt1 IS NOT NULL AND TIMESTAMPDIFF(SECOND, pt1, __time) <= {window_seconds} AND "
+                "(pt2 IS NULL OR TIMESTAMPDIFF(SECOND, pt2, __time) > {window_seconds}))"
             ),
         )
     elif comparator_type == grammar.LessThanEquals:
         # <= N: LAG(__time, N) AS pt1 + check pt1 absent or outside window
         return OperatorMetadata(
             lag_offsets=[threshold],
-            post_filter_template="pt1 IS NULL OR __time - pt1 > {window_seconds}",
+            post_filter_template="pt1 IS NULL OR TIMESTAMPDIFF(SECOND, pt1, __time) > {window_seconds}",
         )
     elif comparator_type == grammar.LessThan:
         # < N: equivalent to <= N-1, so LAG(__time, N-1) AS pt1
         return OperatorMetadata(
             lag_offsets=[threshold - 1],
-            post_filter_template="pt1 IS NULL OR __time - pt1 > {window_seconds}",
+            post_filter_template="pt1 IS NULL OR TIMESTAMPDIFF(SECOND, pt1, __time) > {window_seconds}",
         )
     else:
         raise ValueError(

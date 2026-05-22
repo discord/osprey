@@ -7,6 +7,20 @@ from osprey.engine.udf.arguments import ArgumentsBase, ConstExpr
 from osprey.engine.udf.base import QueryUdfBase
 
 
+# SQL operator strings keyed by AST comparator class. Used by the self-join
+# CountOver lowering, which translates each operator directly into a
+# `HAVING COUNT(*) <op> N` clause — simpler than the LAG approach (no need
+# for double-LAG to express `== N` / `!= N`).
+SELF_JOIN_COMPARATOR_OPS: Dict[Type[object], str] = {
+    grammar.GreaterThanEquals: '>=',
+    grammar.GreaterThan: '>',
+    grammar.Equals: '=',
+    grammar.NotEquals: '<>',
+    grammar.LessThanEquals: '<=',
+    grammar.LessThan: '<',
+}
+
+
 class Arguments(ArgumentsBase):
     predicate: bool
     window: ConstExpr[str]

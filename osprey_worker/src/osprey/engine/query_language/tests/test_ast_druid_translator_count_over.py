@@ -287,6 +287,145 @@ def test_count_over_timeseries_output_wraps_with_time_floor(
     assert "__time < TIMESTAMP '2026-05-20 02:00:00'" in sql
 
 
+def test_count_over_self_join_engine_with_key(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """`sql_engine='self_join'` emits self-join + GROUP BY + HAVING SQL that
+    works on Druid 27+ where window functions are unavailable/buggy."""
+    from datetime import datetime, timezone
+
+    validated_sources = parse_query_to_validated_ast(
+        "CountOver(predicate=UserIp == '1.1.1.1', window='5m', key=UserId) >= 10",
+        make_rules_sources([('UserIp', "'1.1.1.1'"), ('UserId', "'u1'")]),
+    )
+    start = datetime(2026, 5, 21, 11, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 21, 13, 0, 0, tzinfo=timezone.utc)
+
+    transformed = DruidQueryTransformer(
+        validated_sources=validated_sources,
+        datasource_name='smite.events',
+        sql_engine='self_join',
+        output_mode='scan',
+        time_bounds=(start, end),
+    ).transform()
+    sql = transformed['sql']
+
+    # Shape: pre-filtered subquery per side, equi-join on the key, time-window
+    # WHERE, GROUP BY + HAVING.
+    assert 'INNER JOIN' in sql
+    assert 't1.UserId = t2.UserId' in sql
+    assert 't2.__time <= t1.__time' in sql
+    assert 'TIMESTAMPADD(SECOND, -300, t1.__time)' in sql
+    assert 'GROUP BY t1.__action_id, t1.__time' in sql
+    assert 'HAVING COUNT(*) >= 10' in sql
+    # Outer SCAN wrap with the request's time bound.
+    assert ') AS __t' in sql
+    assert "__time >= TIMESTAMP '2026-05-21 11:00:00'" in sql
+
+
+def test_count_over_self_join_engine_no_key(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """No-key CountOver uses a synthetic constant join key so the planner sees
+    an equi-join instead of a bare cross-join."""
+    from datetime import datetime, timezone
+
+    validated_sources = parse_query_to_validated_ast(
+        "CountOver(predicate=UserIp == '1.1.1.1', window='5m') == 10",
+        make_rules_sources([('UserIp', "'1.1.1.1'")]),
+    )
+    start = datetime(2026, 5, 21, 11, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 21, 13, 0, 0, tzinfo=timezone.utc)
+
+    sql = DruidQueryTransformer(
+        validated_sources=validated_sources,
+        datasource_name='smite.events',
+        sql_engine='self_join',
+        output_mode='scan',
+        time_bounds=(start, end),
+    ).transform()['sql']
+
+    assert '1 AS __k' in sql
+    assert 't1.__k = t2.__k' in sql
+    assert 'HAVING COUNT(*) = 10' in sql
+
+
+def test_count_over_self_join_engine_timeseries(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """For TIMESERIES output, the self-join engine wraps the qualifying __time
+    values with TIME_FLOOR + COUNT GROUP BY."""
+    from datetime import datetime, timezone
+
+    validated_sources = parse_query_to_validated_ast(
+        "CountOver(predicate=UserIp == '1.1.1.1', window='5m', key=UserId) >= 10",
+        make_rules_sources([('UserIp', "'1.1.1.1'"), ('UserId', "'u1'")]),
+    )
+    start = datetime(2026, 5, 21, 11, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 21, 13, 0, 0, tzinfo=timezone.utc)
+
+    sql = DruidQueryTransformer(
+        validated_sources=validated_sources,
+        datasource_name='smite.events',
+        sql_engine='self_join',
+        output_mode='timeseries',
+        time_bounds=(start, end),
+        granularity_period='PT1H',
+    ).transform()['sql']
+
+    # Outer TIMESERIES wrap
+    assert "TIME_FLOOR(__time, 'PT1H')" in sql
+    assert 'COUNT(*) AS cnt' in sql
+    assert 'GROUP BY 1 ORDER BY 1' in sql
+    # Inner is the self-join HAVING
+    assert 'INNER JOIN' in sql
+    assert 'HAVING COUNT(*) >= 10' in sql
+
+
+def test_count_over_self_join_engine_all_operators(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """Each of the six CountOver comparators maps to the right HAVING op."""
+    from datetime import datetime, timezone
+
+    start = datetime(2026, 5, 21, 11, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 21, 13, 0, 0, tzinfo=timezone.utc)
+    cases = [
+        ('>= 10', '>='),
+        ('> 5', '>'),
+        ('== 10', '='),
+        ('!= 10', '<>'),
+        ('<= 3', '<='),
+        ('< 3', '<'),
+    ]
+    for query_tail, expected_op in cases:
+        validated_sources = parse_query_to_validated_ast(
+            f"CountOver(predicate=UserIp == '1.1.1.1', window='5m') {query_tail}",
+            make_rules_sources([('UserIp', "'1.1.1.1'")]),
+        )
+        sql = DruidQueryTransformer(
+            validated_sources=validated_sources,
+            datasource_name='smite.events',
+            sql_engine='self_join',
+            output_mode='scan',
+            time_bounds=(start, end),
+        ).transform()['sql']
+        threshold = query_tail.split()[-1]
+        assert f'HAVING COUNT(*) {expected_op} {threshold}' in sql, f'{query_tail}: {sql}'
+
+
+def test_count_over_engine_validation(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """Constructor rejects unknown `sql_engine` values."""
+    validated_sources = parse_query_to_validated_ast(
+        "CountOver(predicate=UserIp == '1.1.1.1', window='5m') >= 10",
+        make_rules_sources([('UserIp', "'1.1.1.1'")]),
+    )
+    with pytest.raises(ValueError, match='sql_engine'):
+        DruidQueryTransformer(validated_sources=validated_sources, sql_engine='bogus')
+
+
 def test_count_over_output_mode_validation(
     make_rules_sources: MakeRulesSourcesFunction,
 ) -> None:

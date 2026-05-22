@@ -7,7 +7,11 @@ from osprey.engine.ast_validator.validation_context import ValidatedSources
 from osprey.engine.ast_validator.validators.validate_call_kwargs import ValidateCallKwargs
 from osprey.engine.udf.base import QueryUdfBase
 from osprey.engine.utils.osprey_unary_executor import OspreyUnaryExecutor
-from osprey.engine.query_language.udfs.count_over import operator_metadata_for, CountOver
+from osprey.engine.query_language.udfs.count_over import (
+    SELF_JOIN_COMPARATOR_OPS,
+    CountOver,
+    operator_metadata_for,
+)
 
 
 # Output modes for `DruidQueryTransformer.transform()` when lowering CountOver
@@ -17,6 +21,14 @@ COUNT_OVER_OUTPUT_INNER = 'inner'
 COUNT_OVER_OUTPUT_SCAN = 'scan'
 COUNT_OVER_OUTPUT_TIMESERIES = 'timeseries'
 _COUNT_OVER_OUTPUT_MODES = (COUNT_OVER_OUTPUT_INNER, COUNT_OVER_OUTPUT_SCAN, COUNT_OVER_OUTPUT_TIMESERIES)
+
+# SQL engines for the CountOver lowering. The default 'window' uses SQL window
+# functions (LAG over PARTITION BY/ORDER BY) and requires Druid 31+ for reliable
+# execution. The 'self_join' engine emits a self-join + GROUP BY + HAVING SQL
+# that works on Druid 27+ where window functions are unavailable or buggy.
+COUNT_OVER_ENGINE_WINDOW = 'window'
+COUNT_OVER_ENGINE_SELF_JOIN = 'self_join'
+_COUNT_OVER_ENGINES = (COUNT_OVER_ENGINE_WINDOW, COUNT_OVER_ENGINE_SELF_JOIN)
 
 
 def _format_druid_timestamp_literal(dt: datetime) -> str:
@@ -47,19 +59,25 @@ class DruidQueryTransformer:
     Druid datasource name (e.g. `'smite.events'`) to get executable SQL.
     The name is quoted in the SQL output to support names containing `.`.
 
+    `sql_engine` selects the CountOver lowering strategy:
+    - `'window'` (default) — emits LAG over PARTITION BY/ORDER BY. Requires
+      Druid 31+ for reliable execution (window function GA cutoff).
+    - `'self_join'` — emits self-join + GROUP BY + HAVING. Works on Druid 27+
+      where SQL window functions are unavailable or buggy. SCAN-mode output
+      is projected to `(__action_id, __time)` — the Smite event-row contract;
+      datasources without `__action_id` must use a different engine or output
+      mode.
+
     Output-shape parameters control whether the emitted SQL is ready to run
     against Druid or just the inner CountOver shape:
 
-    - `output_mode='inner'` (default) emits `SELECT * FROM (<lag-subquery>) AS
-      __inner WHERE <post>` — the original CountOver shape. Callers wrap it
-      themselves.
-    - `output_mode='scan'` requires `time_bounds`. Emits a SCAN-style outer
-      wrap: `SELECT * FROM (<inner>) AS __t WHERE __time >= TIMESTAMP '<start>'
-      AND __time < TIMESTAMP '<end>'`.
+    - `output_mode='inner'` (default) emits the inner CountOver shape (no
+      outer time bound or projection). Callers wrap it themselves.
+    - `output_mode='scan'` requires `time_bounds`. Emits a SCAN-style result.
     - `output_mode='timeseries'` requires `time_bounds` and
       `granularity_period` (ISO 8601 period like `'PT1H'`). Emits
-      `SELECT TIME_FLOOR(__time, '<period>') AS bucket, COUNT(*) AS cnt
-      FROM (<inner>) AS __t WHERE <time-bound> GROUP BY 1 ORDER BY 1`.
+      `SELECT TIME_FLOOR(__time, '<period>') AS bucket, COUNT(*) AS cnt ...
+      GROUP BY 1 ORDER BY 1` over the inner result.
     """
 
     def __init__(
@@ -69,6 +87,7 @@ class DruidQueryTransformer:
         output_mode: str = COUNT_OVER_OUTPUT_INNER,
         time_bounds: Optional[Tuple[datetime, datetime]] = None,
         granularity_period: Optional[str] = None,
+        sql_engine: str = COUNT_OVER_ENGINE_WINDOW,
     ):
         if output_mode not in _COUNT_OVER_OUTPUT_MODES:
             raise ValueError(
@@ -78,6 +97,8 @@ class DruidQueryTransformer:
             raise ValueError(f'output_mode={output_mode!r} requires time_bounds')
         if output_mode == COUNT_OVER_OUTPUT_TIMESERIES and not granularity_period:
             raise ValueError("output_mode='timeseries' requires granularity_period (ISO 8601, e.g. 'PT1H')")
+        if sql_engine not in _COUNT_OVER_ENGINES:
+            raise ValueError(f'sql_engine must be one of {_COUNT_OVER_ENGINES}; got {sql_engine!r}')
 
         try:
             self._udf_node_mapping = validated_sources.get_validator_result(ValidateCallKwargs)
@@ -91,6 +112,7 @@ class DruidQueryTransformer:
         self._output_mode = output_mode
         self._time_bounds = time_bounds
         self._granularity_period = granularity_period
+        self._sql_engine = sql_engine
 
     def transform(self) -> Dict[str, Any]:
         """Transform AST to Druid query.
@@ -102,17 +124,27 @@ class DruidQueryTransformer:
         count_over_info = self._detect_count_over(self._root)
         if count_over_info:
             predicate, window_seconds, key, comparator_type, threshold, other_conjuncts = count_over_info
-            inner_sql = self._compose_count_over_sql(
-                predicate, window_seconds, key, comparator_type, threshold, other_conjuncts
-            )
-            sql = self._apply_output_wrap(inner_sql)
+            if self._sql_engine == COUNT_OVER_ENGINE_SELF_JOIN:
+                sql = self._compose_count_over_sql_self_join(
+                    predicate, window_seconds, key, comparator_type, threshold, other_conjuncts
+                )
+            else:
+                inner_sql = self._compose_count_over_sql(
+                    predicate, window_seconds, key, comparator_type, threshold, other_conjuncts
+                )
+                sql = self._apply_output_wrap(inner_sql)
             return {'type': 'sql', 'sql': sql}
 
         # Fall through to native query transformation
         return {'type': 'native', 'filter': self._transform(self._root)}
 
     def _apply_output_wrap(self, inner_sql: str) -> str:
-        """Wrap the inner CountOver SQL according to `self._output_mode`."""
+        """Wrap the inner CountOver SQL according to `self._output_mode`.
+
+        Used by the window-function engine. The self-join engine builds its
+        output shape directly in `_compose_count_over_sql_self_join` because
+        GROUP BY semantics make it hard to do a generic outer wrap.
+        """
         if self._output_mode == COUNT_OVER_OUTPUT_INNER:
             return inner_sql
 
@@ -332,6 +364,114 @@ class DruidQueryTransformer:
         sql = f"SELECT * FROM ({inner_select}) AS __inner WHERE {post_filter}"
 
         return sql
+
+    def _compose_count_over_sql_self_join(
+        self,
+        predicate: grammar.ASTNode,
+        window_seconds: int,
+        key: Optional[str],
+        comparator_type: type,
+        threshold: int,
+        other_conjuncts: List[grammar.ASTNode],
+    ) -> str:
+        """Compose CountOver SQL as a self-join + GROUP BY + HAVING.
+
+        Pattern (for `CountOver(predicate=P, window=W, key=K) <op> N`):
+
+            SELECT t1.__action_id, t1.__time
+            FROM (SELECT * FROM <ds> WHERE P) t1
+            INNER JOIN (SELECT * FROM <ds> WHERE P) t2
+              ON t1.K = t2.K              -- or 1=1 (synthetic constant) if no key
+            WHERE t2.__time <= t1.__time
+              AND t2.__time >= TIMESTAMPADD(SECOND, -W, t1.__time)
+            GROUP BY t1.__action_id, t1.__time
+            HAVING COUNT(*) <op> N
+
+        Notes / constraints:
+        - Druid 27+ supports this shape (verified against Druid 27.0.0 broker).
+        - For SCAN output we project `(t1.__action_id, t1.__time)` rather than
+          `t1.*` because GROUP BY otherwise needs to list every column on the
+          datasource. `__action_id` is the canonical event-id column on
+          smite/osprey datasources.
+        - For TIMESERIES output we only need `t1.__time` for bucketing.
+        - For the no-key case we synthesize a constant join key (`1 AS __k`) so
+          the join is still equi-joined — bare cross-join works too but is less
+          friendly to Druid's planner.
+        """
+        op = SELF_JOIN_COMPARATOR_OPS.get(comparator_type)
+        if op is None:
+            raise ValueError(
+                f'self_join engine: unsupported comparator {comparator_type.__name__}'
+            )
+
+        # WHERE clause applied to BOTH sides of the join — t1 and t2 must
+        # satisfy the same predicate (only matching events count toward the
+        # window).
+        predicate_sql = self._predicate_to_sql(predicate)
+        other_sqls = [self._predicate_to_sql(c) for c in other_conjuncts]
+        where_clause = ' AND '.join([predicate_sql] + other_sqls)
+
+        quoted_ds = f'"{self._datasource_name}"'
+
+        # Synthesize a constant key for no-key CountOver so the planner sees an
+        # equi-join rather than a bare cross-join.
+        if key:
+            t1_subq = f'(SELECT * FROM {quoted_ds} WHERE {where_clause}) t1'
+            t2_subq = f'(SELECT * FROM {quoted_ds} WHERE {where_clause}) t2'
+            join_on = f't1.{key} = t2.{key}'
+        else:
+            t1_subq = f'(SELECT *, 1 AS __k FROM {quoted_ds} WHERE {where_clause}) t1'
+            t2_subq = f'(SELECT *, 1 AS __k FROM {quoted_ds} WHERE {where_clause}) t2'
+            join_on = 't1.__k = t2.__k'
+
+        time_window_where = (
+            f't2.__time <= t1.__time '
+            f'AND t2.__time >= TIMESTAMPADD(SECOND, -{window_seconds}, t1.__time)'
+        )
+
+        if self._output_mode == COUNT_OVER_OUTPUT_TIMESERIES:
+            assert self._time_bounds is not None and self._granularity_period is not None
+            start, end = self._time_bounds
+            start_lit = _format_druid_timestamp_literal(start)
+            end_lit = _format_druid_timestamp_literal(end)
+            # Inner: identify the qualifying __time values via self-join + HAVING.
+            # Outer: bucket those by TIME_FLOOR and count, applying the request's
+            # time bound to restrict the histogram window.
+            return (
+                f"SELECT TIME_FLOOR(__time, '{self._granularity_period}') AS bucket, "
+                f"COUNT(*) AS cnt FROM ("
+                f"SELECT t1.__time AS __time "
+                f"FROM {t1_subq} INNER JOIN {t2_subq} ON {join_on} "
+                f"WHERE {time_window_where} "
+                f"GROUP BY t1.__time HAVING COUNT(*) {op} {threshold}"
+                f") AS __t "
+                f"WHERE __time >= TIMESTAMP '{start_lit}' "
+                f"AND __time < TIMESTAMP '{end_lit}' "
+                f"GROUP BY 1 ORDER BY 1"
+            )
+
+        # SCAN or INNER: project (__action_id, __time) of each qualifying
+        # burst-end event. SCAN additionally filters by the request's time
+        # bound; INNER returns the unwrapped result so the caller can wrap.
+        scan_core = (
+            f'SELECT t1.__action_id, t1.__time '
+            f'FROM {t1_subq} INNER JOIN {t2_subq} ON {join_on} '
+            f'WHERE {time_window_where} '
+            f'GROUP BY t1.__action_id, t1.__time '
+            f'HAVING COUNT(*) {op} {threshold}'
+        )
+        if self._output_mode == COUNT_OVER_OUTPUT_INNER:
+            return scan_core
+        assert self._output_mode == COUNT_OVER_OUTPUT_SCAN
+        assert self._time_bounds is not None
+        start, end = self._time_bounds
+        start_lit = _format_druid_timestamp_literal(start)
+        end_lit = _format_druid_timestamp_literal(end)
+        return (
+            f"SELECT * FROM ({scan_core}) AS __t "
+            f"WHERE __time >= TIMESTAMP '{start_lit}' "
+            f"AND __time < TIMESTAMP '{end_lit}'"
+        )
 
     def _predicate_to_sql(self, node: grammar.ASTNode) -> str:
         """Convert a predicate AST node to SQL WHERE clause fragment.

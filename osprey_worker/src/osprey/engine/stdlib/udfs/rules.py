@@ -10,7 +10,7 @@ from osprey.engine.language_types.rules import RuleT
 from osprey.engine.udf.type_helpers import validate_kwarg_node_type
 from osprey.worker.lib.instruments import metrics
 
-from ._prelude import ArgumentsBase, ExecutionContext, UDFBase, ValidationContext
+from ._prelude import ArgumentsBase, ConstExpr, ExecutionContext, UDFBase, ValidationContext
 from .categories import UdfCategories
 
 _HAS_FORMAT_STRING_RE = re.compile(r'\{([^\d\W]\w*)\}')
@@ -120,7 +120,7 @@ class WhenRulesArguments(ArgumentsBase):
     rules_any: List[RuleT]
     # TODO - Should we require this be non-empty?
     then: List[EffectBase]
-    tier: str = "legacy"
+    tier: ConstExpr[str] = ConstExpr.for_default('tier', 'legacy')
     """Execution tier for this WhenRules block.
 
     Allowed values:
@@ -128,9 +128,7 @@ class WhenRulesArguments(ArgumentsBase):
     - "async": fires only when execution_mode == "async"
     - "both": fires in both modes (state-mutating effects forbidden — see Phase 3 validator)
     - "legacy" (default): fires regardless of execution_mode; preserves pre-tier-system behavior
-
-    Phase 2 only validates the tier value at compile time. Runtime filtering ships in
-    Task 2.3."""
+    """
 
 
 class WhenRules(UDFBase[WhenRulesArguments, None]):
@@ -221,6 +219,34 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
         )
 
     def execute(self, execution_context: ExecutionContext, arguments: WhenRulesArguments) -> None:
+        # --- Tier filtering (Phase 2 Task 2.3) ---
+        # Skip this block when its declared tier doesn't match the execution mode.
+        # "legacy" (default) and "both" tiers always fire — no filtering.
+        # "unspecified" execution mode bypasses filtering for back-compat with older
+        # coordinator binaries that don't stamp mode.
+        tier = arguments.tier.value
+        if tier not in ('legacy', 'both'):
+            mode = execution_context.get_execution_mode()
+            if mode != 'unspecified' and mode != tier:
+                execution_context.add_rule_audit_entry(WhenRulesAuditEntry(
+                    rules_evaluated=[rule.name for rule in arguments.rules_any],
+                    rules_matched=[],
+                    rules_failed=[],
+                    effects_emitted=[],
+                    effects_failed=0,
+                    is_degraded=False,
+                    skipped_by_tier=True,
+                ))
+                metrics.increment(
+                    'osprey.when_rules_tier_skipped',
+                    tags=[
+                        f'action:{execution_context.get_action_name()}',
+                        f'tier:{tier}',
+                        f'mode:{mode}',
+                    ],
+                )
+                return
+
         all_rule_names = [rule.name for rule in arguments.rules_any]
         passing_rules = [rule for rule in arguments.rules_any if rule.value]
         passing_names = [rule.name for rule in passing_rules]

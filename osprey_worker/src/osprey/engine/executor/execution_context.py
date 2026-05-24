@@ -124,6 +124,9 @@ class WhenRulesAuditEntry:
     effects_emitted: List[str]
     effects_failed: int
     is_degraded: bool
+    skipped_by_tier: bool = False
+    """True if this WhenRules block was skipped because its tier did not match
+    the execution mode. When True, effects_emitted is empty."""
 
 
 class ExecutionContext:

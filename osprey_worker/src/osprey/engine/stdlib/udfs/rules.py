@@ -1,4 +1,3 @@
-import logging
 import re
 from typing import List, Optional, cast
 
@@ -132,9 +131,6 @@ class WhenRulesArguments(ArgumentsBase):
     """
 
 
-_logger = logging.getLogger(__name__)
-
-
 class WhenRules(UDFBase[WhenRulesArguments, None]):
     """Binds rules to effects. When any of the referenced rules fire, the then= effects are applied."""
 
@@ -223,23 +219,13 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
         )
 
     def execute(self, execution_context: ExecutionContext, arguments: WhenRulesArguments) -> None:
-        # --- Tier filtering (Phase 2 Task 2.3) ---
-        # Skip this block when its declared tier doesn't match the execution mode.
-        # "legacy" (default) and "both" tiers always fire — no filtering.
-        # "unspecified" execution mode bypasses filtering for back-compat with older
-        # coordinator binaries that don't stamp mode.
+        # Tier filtering: skip when the declared tier doesn't match the execution mode.
+        # "legacy" (default) and "both" always fire. "unspecified" execution mode (older
+        # coordinator binaries that don't stamp mode) bypasses filtering for back-compat.
         tier = arguments.tier.value
         if tier not in ('legacy', 'both'):
             mode = execution_context.get_execution_mode()
-            will_skip = mode != 'unspecified' and mode != tier
-            _logger.debug(
-                'tier_filter_check action=%s tier=%s mode=%s will_skip=%s',
-                execution_context.get_action_name(),
-                tier,
-                mode,
-                will_skip,
-            )
-            if will_skip:
+            if mode != 'unspecified' and mode != tier:
                 execution_context.add_rule_audit_entry(WhenRulesAuditEntry(
                     rules_evaluated=[rule.name for rule in arguments.rules_any],
                     rules_matched=[],

@@ -45,9 +45,7 @@ class FakeMutatingArguments(ArgumentsBase):
 
 
 class FakeMutatingEffect(EffectBase):
-    """Test-only state-mutating effect."""
-
-    mutates_state: ClassVar[bool] = True
+    """Test-only effect emitted by FakeMutatingUDF."""
 
 
 class FakeMutatingUDF(UDFBase[FakeMutatingArguments, EffectBase]):
@@ -205,3 +203,42 @@ def test_existing_rules_without_tier_pass_validator(run_validation: RunValidatio
         MyRule = Rule(when_all=[Flag], description="existing")
         WhenRules(rules_any=[MyRule], then=[FakeMutatingUDF()])
     """)
+
+
+def test_slow_udf_buried_in_then_kwarg_fails(run_validation: RunValidationFunction) -> None:
+    """SLOW UDFs are caught when nested inside an Effect's arguments in then=,
+    not only when referenced via rules_any. Without walking then=, a SLOW UDF
+    smuggled in as a nested argument would slip past constraint 1."""
+    with pytest.raises(ValidationFailed) as exc_info:
+        run_validation("""
+            Flag: bool = JsonData(path='$.flag')
+            MyRule = Rule(when_all=[Flag], description="trivial")
+            WhenRules(
+                rules_any=[MyRule],
+                then=[DeclareVerdict(verdict=FakeSlowUDF())],
+                tier="sync",
+            )
+        """)
+    rendered = exc_info.value.rendered()
+    assert "FakeSlowUDF" in rendered
+    assert "tier=`sync`" in rendered
+
+
+def test_mutating_effect_via_name_reference_in_both_fails(run_validation: RunValidationFunction) -> None:
+    """tier=`both` catches state-mutating effects even when they're referenced
+    through a Name. then=[Helper] where Helper = FakeMutatingUDF() still fires
+    the constraint."""
+    with pytest.raises(ValidationFailed) as exc_info:
+        run_validation("""
+            Flag: bool = JsonData(path='$.flag')
+            MyRule = Rule(when_all=[Flag], description="trivial")
+            Helper = FakeMutatingUDF()
+            WhenRules(
+                rules_any=[MyRule],
+                then=[Helper],
+                tier="both",
+            )
+        """)
+    rendered = exc_info.value.rendered()
+    assert "FakeMutatingUDF" in rendered
+    assert "tier=`both`" in rendered

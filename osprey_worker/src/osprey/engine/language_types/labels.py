@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, ClassVar, List, Optional, Self, cast
+from typing import Any, List, Optional, Self, cast
 
 from osprey.engine.executor.custom_extracted_features import CustomExtractedFeature
 from osprey.engine.language_types.effects import EffectToCustomExtractedFeatureBase
@@ -19,8 +19,6 @@ from .rules import RuleT, add_slots
 class LabelEffect(EffectToCustomExtractedFeatureBase[List[str]]):
     """Stores a label effect of a WhenRules(...) invocation, which stores the label mutations that should occur once
     a given action has finished classification."""
-
-    mutates_state: ClassVar[bool] = True
 
     entity: EntityT[Any]
     """The entity that the effect will be applied on."""

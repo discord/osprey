@@ -54,31 +54,38 @@ class ValidateTierConstraints(SourceValidator):
         tier = self._get_tier(call)
 
         # Constraint 1: SLOW UDFs forbidden in sync/both/legacy.
+        # Walk BOTH `rules_any` and `then` — a SLOW UDF can appear as a direct
+        # effect or buried inside a Rule's expression graph.
         if tier in _SLOW_FORBIDDEN_TIERS:
-            rules_any_kw = call.find_argument("rules_any")
-            if rules_any_kw is not None:
-                slow_hits: List[Tuple[str, object]] = []
-                seen: Set[int] = set()
-                self._collect_slow_udfs(rules_any_kw.value, name_to_assign, slow_hits, seen)
-                for udf_name, span in slow_hits:
-                    self.context.add_error(
-                        message=f"tier=`{tier}` WhenRules references SLOW UDF `{udf_name}`",
-                        span=span,  # type: ignore[arg-type]
-                        hint=(
-                            f"`{udf_name}` is declared latency_tier=`slow`, but tier=`{tier}` "
-                            "WhenRules run on the sync-latency-budget code path\n"
-                            "either:\n"
-                            "  - change this WhenRules to tier=`async`, or\n"
-                            "  - move the slow UDF reference behind a Require() gated on async mode"
-                        ),
-                    )
+            slow_hits: List[Tuple[str, object]] = []
+            seen: Set[int] = set()
+            for kwarg_name in ("rules_any", "then"):
+                kw = call.find_argument(kwarg_name)
+                if kw is not None:
+                    self._collect_slow_udfs(kw.value, name_to_assign, slow_hits, seen)
+            for udf_name, span in slow_hits:
+                self.context.add_error(
+                    message=f"tier=`{tier}` WhenRules references SLOW UDF `{udf_name}`",
+                    span=span,  # type: ignore[arg-type]
+                    hint=(
+                        f"`{udf_name}` is declared latency_tier=`slow`, but tier=`{tier}` "
+                        "WhenRules run on the sync-latency-budget code path\n"
+                        "either:\n"
+                        "  - change this WhenRules to tier=`async`, or\n"
+                        "  - move the slow UDF reference behind a Require() gated on async mode"
+                    ),
+                )
 
         # Constraint 2: state-mutating effects forbidden in tier=both.
+        # Follow Name references the same way `_collect_slow_udfs` does, so
+        # `then=[HelperEffect]` where HelperEffect = LabelAdd(...) still trips
+        # the check.
         if tier == "both":
             then_kw = call.find_argument("then")
             if then_kw is not None:
                 mutating_hits: List[Tuple[str, object]] = []
-                self._collect_mutating_effects(then_kw.value, mutating_hits)
+                seen_mut: Set[int] = set()
+                self._collect_mutating_effects(then_kw.value, name_to_assign, mutating_hits, seen_mut)
                 for udf_name, span in mutating_hits:
                     self.context.add_error(
                         message=f"tier=`both` WhenRules emits state-mutating effect `{udf_name}`",
@@ -147,16 +154,32 @@ class ValidateTierConstraints(SourceValidator):
     def _collect_mutating_effects(
         self,
         node: object,
+        name_to_assign: Dict[str, Assign],
         out: List[Tuple[str, object]],
+        seen: Set[int],
     ) -> None:
-        """Walk the `then` argument value, finding Calls to UDFs that have
-        mutates_state=True."""
-        if isinstance(node, ASTList):
+        """Walk the `then` argument value recursively, finding Calls to UDFs
+        with mutates_state=True. Follows Name references so `then=[Helper]`
+        where `Helper = LabelAdd(...)` is also caught."""
+        node_id = id(node)
+        if node_id in seen:
+            return
+        seen.add(node_id)
+
+        if isinstance(node, Call):
+            if isinstance(node.func, Name):
+                udf_cls = self.context.udf_registry.get(node.func.identifier)
+                if udf_cls is not None and getattr(udf_cls, "mutates_state", False):
+                    out.append((node.func.identifier, node.span))
+        elif isinstance(node, Name):
+            if isinstance(node.context, Store):
+                return
+            assign = name_to_assign.get(node.identifier)
+            if assign is not None:
+                self._collect_mutating_effects(assign.value, name_to_assign, out, seen)
+        elif isinstance(node, ASTList):
             for item in node.items:
-                if isinstance(item, Call) and isinstance(item.func, Name):
-                    udf_cls = self.context.udf_registry.get(item.func.identifier)
-                    if udf_cls is not None and getattr(udf_cls, "mutates_state", False):
-                        out.append((item.func.identifier, item.span))
+                self._collect_mutating_effects(item, name_to_assign, out, seen)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -171,12 +194,15 @@ class ValidateTierConstraints(SourceValidator):
 
     def _build_name_index(self, source: Source) -> Dict[str, Assign]:
         """Build a mapping of identifier → Assign node for all top-level assignments
-        in this source, so that Name references can be resolved one level deep."""
+        in this source, so that Name references can be resolved one level deep.
+
+        Cross-source references (Name defined in a Require()d file) are NOT
+        followed — the SLOW UDF check is source-local. A SLOW UDF buried behind
+        a cross-source name will not be caught by this validator; rely on the
+        file-level Require(require_if=ExecutionMode()=='async') gating pattern
+        for those cases."""
         index: Dict[str, Assign] = {}
         for assign in filter_nodes(source.ast_root, Assign):
             if isinstance(assign.target, Name):
-                # Use identifier (not identifier_key) — WhenRules author doesn't use
-                # local (_-prefixed) variables for rules, but be safe and use
-                # identifier_key for locals, plain identifier for globals.
                 index[assign.target.identifier] = assign
         return index

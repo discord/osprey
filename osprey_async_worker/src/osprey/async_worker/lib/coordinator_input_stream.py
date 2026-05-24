@@ -428,12 +428,6 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
                 raise ValueError('action name must never be empty')
 
             execution_mode = _proto_mode_to_str(osprey_coordinator_action.mode)
-            logger.info(
-                'received osprey action: action_id=%s action_name=%s execution_mode=%s',
-                osprey_coordinator_action.action_id,
-                osprey_coordinator_action.action_name,
-                execution_mode,
-            )
             return OspreyEngineAction(
                 action_id=osprey_coordinator_action.action_id,
                 action_name=osprey_coordinator_action.action_name,

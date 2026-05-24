@@ -395,6 +395,8 @@ class Action:
     timestamp: datetime
     secret_data: Dict[str, Any] = field(default_factory=dict)
     encoding: str = 'unknown'
+    execution_mode: str = 'unspecified'
+    """Execution mode for tier filtering: 'sync', 'async', or 'unspecified' (no filtering)."""
 
     @classmethod
     def from_dict(cls: Type[_ActionT], d: Dict[str, Any]) -> '_ActionT':
@@ -404,6 +406,7 @@ class Action:
             data=d['data'],
             secret_data=d.get('secret', {}),
             timestamp=datetime.fromisoformat(d['timestamp']),
+            execution_mode=d.get('execution_mode', 'unspecified'),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -413,6 +416,7 @@ class Action:
             'action_name': self.action_name,
             'data': self.data,
             'timestamp': self.timestamp.isoformat(),
+            'execution_mode': self.execution_mode,
         }
 
     @cached_property

@@ -36,6 +36,25 @@ logger = get_logger()
 MIN_SECONDS_BEFORE_RECONNECT = 60
 SECONDS_BEFORE_RECONNECT_JITTER = 60
 
+# Map proto ExecutionMode int → string for Action.execution_mode.
+# Defaulting unknown values to 'unspecified' ensures we apply no tier filtering
+# on future enum variants we don't know about yet.
+_PROTO_MODE_TO_STR = {
+    0: 'unspecified',  # EXECUTION_MODE_UNSPECIFIED
+    1: 'sync',         # EXECUTION_MODE_SYNC
+    2: 'async',        # EXECUTION_MODE_ASYNC
+}
+
+
+def _proto_mode_to_str(mode: int) -> str:
+    """Translate a proto ExecutionMode integer to the string used in Action.execution_mode.
+
+    Returns 'unspecified' for any value not in the known set (including 0).
+    This makes the worker resilient to future enum variants — unknown values
+    silently disable tier filtering rather than risking a wrong filter.
+    """
+    return _PROTO_MODE_TO_STR.get(mode, 'unspecified')
+
 
 class AsyncVerdictsAckingContext(VerdictsAckingContext[OspreyEngineAction]):
     """Async-compatible verdicts acking context that sends ack/nack back through the bidirectional stream.
@@ -415,6 +434,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
                 secret_data=secret_data,
                 timestamp=osprey_coordinator_action.timestamp.ToDatetime(tzinfo=pytz.utc),
                 encoding=encoding,
+                execution_mode=_proto_mode_to_str(osprey_coordinator_action.mode),
             )
         except Exception:
             logger.exception('Error while generating input message')

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import Any, Optional, Sequence
+from typing import Any, ClassVar, Optional, Sequence
 
 from osprey.engine.executor.udf_execution_helpers import HasHelperInternal
 from osprey.engine.language_types.effects import (
@@ -71,6 +71,7 @@ class LabelAdd(UDFBase[LabelArguments, EffectBase]):
     """Adds a label to the provided Entity."""
 
     category = UdfCategories.ENGINE
+    mutates_state: ClassVar[bool] = True
 
     def execute(self, execution_context: ExecutionContext, arguments: LabelArguments) -> EffectBase:
         return synthesize_effect(status=LabelStatus.ADDED, arguments=arguments)
@@ -80,6 +81,7 @@ class LabelRemove(UDFBase[LabelArguments, EffectBase]):
     """Removes a label from the provided Entity."""
 
     category = UdfCategories.ENGINE
+    mutates_state: ClassVar[bool] = True
 
     def execute(self, execution_context: ExecutionContext, arguments: LabelArguments) -> EffectBase:
         return synthesize_effect(status=LabelStatus.REMOVED, arguments=arguments)

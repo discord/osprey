@@ -12,8 +12,8 @@ constraint 1) and inspects the effects list (for constraint 2).
 """
 from typing import Dict, List, Optional, Set, Tuple, Type
 
-from osprey.engine.ast.ast_utils import filter_nodes
-from osprey.engine.ast.grammar import Assign, Call, List as ASTList, Name, Source, String, Store
+from osprey.engine.ast.ast_utils import filter_nodes, iter_field_values
+from osprey.engine.ast.grammar import ASTNode, Assign, Call, List as ASTList, Name, Source, String, Store
 
 from ..base_validator import SourceValidator
 
@@ -131,9 +131,6 @@ class ValidateTierConstraints(SourceValidator):
                 self._collect_slow_udfs(item, name_to_assign, out, seen)
         else:
             # For any other node, walk its AST children via iter_field_values.
-            from osprey.engine.ast.ast_utils import iter_field_values
-            from osprey.engine.ast.grammar import ASTNode
-
             if isinstance(node, ASTNode):
                 for _field, value in iter_field_values(node):
                     if isinstance(value, ASTNode):

@@ -32,9 +32,14 @@ class EffectBase:
 
     mutates_state: ClassVar[bool] = False
     """True if this effect type writes to persistent state (label store, classification
-    record, Safety Signal pubsub, intervention queue, etc.). Used by the Phase 3
-    tier-constraint validator to forbid state-mutating effects in tier='both' WhenRules
-    (where they would emit on both sync and async paths, causing duplicate writes).
+    record, Safety Signal pubsub, intervention queue, etc.).
+
+    Note: ValidateTierConstraints currently reads `mutates_state` from the *UDF* class
+    (e.g. LabelAdd, Classify, EmitSignal), not from the Effect class. The Effect-side
+    declarations are documentation of intent and a forward-compatibility hook for
+    future code paths that may want to dedupe or gate based on the emitted effect
+    (e.g. a sink-time dedup pass). Keep both in sync when adding new state-mutating
+    effects.
 
     Set True on:
     - LabelEffect / RemoveLabelEffect / LabelEffectWithExpiry

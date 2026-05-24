@@ -112,7 +112,24 @@ class AsyncRulesRunner:
 
 
 class AsyncRulesSink:
-    """Async rules sink — iterates an async input stream, executes rules, pushes to output sinks."""
+    """Async rules sink — iterates an async input stream, executes rules, pushes to output sinks.
+
+    The sink supports two operating modes:
+
+    * ``max_in_flight=1`` (default): strict sequential — each action's ``classify_one``
+      completes (including the ack inside ``message_context.__exit__``) before the next
+      stream item is pulled. Preserves the protocol semantics of the
+      coordinator bidi stream (one un-acked action per stream).
+
+    * ``max_in_flight > 1``: classify_one runs as a Task, gated by a semaphore.
+      The stream-read loop awaits the semaphore before pulling the next action, so
+      input backpressure is preserved. Useful for input streams that do *not*
+      enforce one-in-flight-per-stream upstream (e.g. file/static streams, or a
+      future bidi protocol that permits multiple un-acked actions). For the
+      coordinator bidi stream specifically, raising ``max_in_flight`` is a no-op
+      until the coordinator side is extended — its protocol still sends one
+      action per ack.
+    """
 
     def __init__(
         self,
@@ -121,48 +138,108 @@ class AsyncRulesSink:
         output_sink: AsyncBaseOutputSink,
         udf_helpers: UDFHelpers,
         max_concurrent_udfs: int = 12,
+        max_in_flight: int = 1,
     ):
+        if max_in_flight < 1:
+            raise ValueError(f'max_in_flight must be >= 1, got {max_in_flight}')
         self._input_stream = input_stream
         self._rules_runner = AsyncRulesRunner(engine, output_sink, udf_helpers, max_concurrent_udfs)
+        self._max_in_flight = max_in_flight
+        self._in_flight_count = 0
+        self._peak_in_flight = 0
+
+    @property
+    def in_flight(self) -> int:
+        """Current number of actions being classified concurrently in this sink."""
+        return self._in_flight_count
+
+    @property
+    def peak_in_flight(self) -> int:
+        """High-water mark of concurrent in-flight actions since sink start."""
+        return self._peak_in_flight
 
     async def run(self) -> None:
+        if self._max_in_flight == 1:
+            await self._run_sequential()
+        else:
+            await self._run_parallel()
+
+    async def _run_sequential(self) -> None:
         async for message_context in self._input_stream:
             try:
-                with message_context as action:
-                    action_tags = [f'action:{action.action_name}']
-                    metrics.increment('rules_sink.input_action_received', tags=action_tags)
-
-                    if action.data.get('osprey_skip_async', False):
-                        metrics.increment('rules_sink.skipped', tags=action_tags)
-                        continue
-
-                    with tracer.start_span('osprey.async.classify_one', child_of=None) as span:
-                        tracer.context_provider.activate(span.context)
-
-                        if not action.action_id and action.action_id != 0:
-                            action.action_id = generate_snowflake(retries=3).to_int()
-
-                        info_log_osprey_action(action.action_id, action.action_name, 'beginning async classify_one')
-                        result = await self._rules_runner.classify_one(
-                            action,
-                            tag='sink:async-rules-sink',
-                            parent_tracer_span=span,
-                        )
-
-                        if isinstance(message_context, VerdictsAckingContext):
-                            if result is None:
-                                metrics.increment('rules_sink.missing_result')
-                            else:
-                                message_context.set_verdicts(result.get_verdicts_pb2_proto())
-                                metrics.increment('rules_sink.captured_verdicts')
-
-                        info_log_osprey_action(action.action_id, action.action_name, 'async classify_one complete')
+                await self._process_one(message_context)
             except asyncio.CancelledError:
                 return
             except Exception as e:
                 logging.exception('Unexpected error in async rules sink')
                 metrics.increment('rules_sink.unexpected_error', tags=[f'err:{e.__class__.__name__}'])
                 sentry_sdk.capture_exception(e)
+
+    async def _run_parallel(self) -> None:
+        semaphore = asyncio.Semaphore(self._max_in_flight)
+        tasks: set = set()
+
+        async def _wrapper(ctx: BaseAckingContext[Action]) -> None:
+            try:
+                self._in_flight_count += 1
+                if self._in_flight_count > self._peak_in_flight:
+                    self._peak_in_flight = self._in_flight_count
+                metrics.gauge('rules_sink.in_flight_actions', self._in_flight_count)
+                await self._process_one(ctx)
+            except Exception as e:
+                logging.exception('Unexpected error in parallel sink task')
+                metrics.increment('rules_sink.unexpected_error', tags=[f'err:{e.__class__.__name__}'])
+                sentry_sdk.capture_exception(e)
+            finally:
+                self._in_flight_count -= 1
+                metrics.gauge('rules_sink.in_flight_actions', self._in_flight_count)
+                semaphore.release()
+
+        try:
+            async for message_context in self._input_stream:
+                # Block here when at capacity — provides upstream backpressure.
+                await semaphore.acquire()
+                task = asyncio.create_task(_wrapper(message_context))
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # Drain in-flight tasks before returning so acks complete and we don't
+            # cancel mid-classify_one (which would leave actions un-acked).
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _process_one(self, message_context: BaseAckingContext[Action]) -> None:
+        with message_context as action:
+            action_tags = [f'action:{action.action_name}']
+            metrics.increment('rules_sink.input_action_received', tags=action_tags)
+
+            if action.data.get('osprey_skip_async', False):
+                metrics.increment('rules_sink.skipped', tags=action_tags)
+                return
+
+            with tracer.start_span('osprey.async.classify_one', child_of=None) as span:
+                tracer.context_provider.activate(span.context)
+
+                if not action.action_id and action.action_id != 0:
+                    action.action_id = generate_snowflake(retries=3).to_int()
+
+                info_log_osprey_action(action.action_id, action.action_name, 'beginning async classify_one')
+                result = await self._rules_runner.classify_one(
+                    action,
+                    tag='sink:async-rules-sink',
+                    parent_tracer_span=span,
+                )
+
+                if isinstance(message_context, VerdictsAckingContext):
+                    if result is None:
+                        metrics.increment('rules_sink.missing_result')
+                    else:
+                        message_context.set_verdicts(result.get_verdicts_pb2_proto())
+                        metrics.increment('rules_sink.captured_verdicts')
+
+                info_log_osprey_action(action.action_id, action.action_name, 'async classify_one complete')
 
     async def stop(self) -> None:
         await self._input_stream.stop()

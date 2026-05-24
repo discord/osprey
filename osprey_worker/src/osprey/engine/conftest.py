@@ -260,6 +260,7 @@ class ExecuteWithResultFunction(Protocol):
         udf_helpers: Optional[UDFHelpers] = None,
         async_pool: Optional[gevent.pool.Pool] = ...,
         action_time: Optional[datetime] = ...,
+        execution_mode: str = ...,
     ) -> ExecutionResult: ...
 
 
@@ -275,6 +276,7 @@ class ExecuteFunction(Protocol):
         async_pool: Optional[gevent.pool.Pool] = ...,
         action_time: Optional[datetime] = ...,
         allow_errors: bool = ...,
+        execution_mode: str = ...,
     ) -> Dict[str, object]: ...
 
 
@@ -291,6 +293,7 @@ def execute_with_result(udf_registry: UDFRegistry) -> ExecuteWithResultFunction:
         udf_helpers: Optional[UDFHelpers] = None,
         async_pool: Optional[gevent.pool.Pool] = None,
         action_time: Optional[datetime] = None,
+        execution_mode: str = 'unspecified',
     ) -> ExecutionResult:
         sources = into_sources(sources_dict)
 
@@ -317,6 +320,7 @@ def execute_with_result(udf_registry: UDFRegistry) -> ExecuteWithResultFunction:
             secret_data=secret_data or {},
             action_name=action_name,
             timestamp=action_time or datetime.utcnow(),
+            execution_mode=execution_mode,
         )
         return osprey_execute(execution_graph, udf_helpers or UDFHelpers(), action, async_pool)
 
@@ -342,6 +346,7 @@ def execute(execute_with_result: ExecuteWithResultFunction) -> ExecuteFunction:
         async_pool: Optional[gevent.pool.Pool] = None,
         action_time: Optional[datetime] = None,
         allow_errors: bool = False,
+        execution_mode: str = 'unspecified',
     ) -> Dict[str, object]:
         result = execute_with_result(
             sources_dict=sources_dict,
@@ -352,6 +357,7 @@ def execute(execute_with_result: ExecuteWithResultFunction) -> ExecuteFunction:
             udf_helpers=udf_helpers,
             async_pool=async_pool,
             action_time=action_time,
+            execution_mode=execution_mode,
         )
         if not allow_errors and len(result.error_infos) > 0:
             # Raise the first error, that should help track it down more easily.

@@ -5,6 +5,7 @@ from osprey.engine.stdlib.udfs.domain_tld import DomainTld
 from osprey.engine.stdlib.udfs.email_domain import EmailDomain, EmailSubdomain
 from osprey.engine.stdlib.udfs.email_local_part import EmailLocalPart
 from osprey.engine.stdlib.udfs.entity import Entity, EntityJson
+from osprey.engine.stdlib.udfs.execution_mode import ExecutionMode
 from osprey.engine.stdlib.udfs.experiments import (
     Experiment,
     ExperimentsBucketAssignment,
@@ -80,6 +81,7 @@ def register_udfs() -> Sequence[Type[UDFBase[Any, Any]]]:
         EmailLocalPart,
         Entity,
         EntityJson,
+        ExecutionMode,
         Experiment,
         ExperimentWhen,
         ExperimentsBucketAssignment,

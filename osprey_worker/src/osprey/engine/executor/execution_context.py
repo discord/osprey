@@ -237,6 +237,14 @@ class ExecutionContext:
         """Returns the action name that the execution context is currently being invoked upon."""
         return self._action.action_name
 
+    def get_execution_mode(self) -> str:
+        """Returns the execution mode of the current action: 'sync', 'async', or 'unspecified'.
+
+        'unspecified' indicates the producer did not stamp a mode (older coordinator binary).
+        Tier filtering by WhenRules treats 'unspecified' as a no-op — all WhenRules fire
+        regardless of their tier annotation. This preserves pre-tier-system behavior."""
+        return self._action.execution_mode
+
     def get_action_time(self) -> datetime:
         """Returns the time of the action that the execution context is currently being invoked upon."""
         return self._action.timestamp

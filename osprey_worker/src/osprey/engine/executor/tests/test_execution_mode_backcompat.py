@@ -157,3 +157,45 @@ def test_create_osprey_engine_action_unspecified_for_legacy_messages():
 
     assert action is not None
     assert action.execution_mode == 'unspecified'
+
+
+# ---------------------------------------------------------------------------
+# Task 1.6 — ExecutionContext.get_execution_mode() accessor
+# ---------------------------------------------------------------------------
+
+def _build_execution_context_via_new(execution_mode: str = 'unspecified'):
+    """Build a minimal ExecutionContext using __new__ to bypass constructor complexity.
+
+    ExecutionContext.__init__ requires a fully compiled ExecutionGraph (which
+    requires ValidatedSources, conftest fixtures, etc.). For the accessor test
+    we only need _action to be set, so we bypass __init__ and set the one slot
+    directly — matching the pattern used in test_execution_mode_backcompat for
+    OspreyCoordinatorInputStream."""
+    from datetime import datetime
+    from osprey.engine.executor.execution_context import Action, ExecutionContext
+
+    action = Action(
+        action_id=1,
+        action_name='TEST_ACTION',
+        data={},
+        timestamp=datetime(2026, 1, 1),
+        execution_mode=execution_mode,
+    )
+    ctx = ExecutionContext.__new__(ExecutionContext)
+    ctx._action = action
+    return ctx
+
+
+def test_execution_context_exposes_execution_mode_sync():
+    ctx = _build_execution_context_via_new(execution_mode='sync')
+    assert ctx.get_execution_mode() == 'sync'
+
+
+def test_execution_context_exposes_execution_mode_async():
+    ctx = _build_execution_context_via_new(execution_mode='async')
+    assert ctx.get_execution_mode() == 'async'
+
+
+def test_execution_context_defaults_to_unspecified():
+    ctx = _build_execution_context_via_new()
+    assert ctx.get_execution_mode() == 'unspecified'

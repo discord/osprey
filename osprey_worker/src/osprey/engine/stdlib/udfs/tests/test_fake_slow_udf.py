@@ -1,4 +1,4 @@
-"""Tests for FakeSlowClassifier — used in Phase 4 worked example."""
+"""Tests for FakeSlowClassifier — the test-only SLOW UDF used in tier-routing tests."""
 from typing import Any, Callable, List
 
 import pytest

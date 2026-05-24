@@ -1,4 +1,4 @@
-"""Tests for the tier kwarg on WhenRules (Task 2.2 — compile-time validation, Task 2.3 — runtime filter)."""
+"""Tests for the tier kwarg on WhenRules — compile-time validation + runtime filter."""
 from typing import Any, Callable, List
 
 import pytest
@@ -86,7 +86,7 @@ def test_when_rules_rejects_tier_typo(
         ''')
 
 
-# --- Runtime tier filtering matrix (Task 2.3) ---
+# --- Runtime tier filtering matrix ---
 
 
 @pytest.mark.parametrize(

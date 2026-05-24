@@ -1,4 +1,4 @@
-"""Back-compat tests for Action.execution_mode plumbing (Task 1.5)."""
+"""Back-compat tests for Action.execution_mode plumbing."""
 from datetime import datetime
 from unittest.mock import MagicMock
 
@@ -160,7 +160,7 @@ def test_create_osprey_engine_action_unspecified_for_legacy_messages():
 
 
 # ---------------------------------------------------------------------------
-# Task 1.6 — ExecutionContext.get_execution_mode() accessor
+# ExecutionContext.get_execution_mode() accessor
 # ---------------------------------------------------------------------------
 
 def _build_execution_context_via_new(execution_mode: str = 'unspecified'):

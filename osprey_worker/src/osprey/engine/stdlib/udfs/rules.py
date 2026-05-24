@@ -125,7 +125,7 @@ class WhenRulesArguments(ArgumentsBase):
     Allowed values:
     - "sync": fires only when execution_mode == "sync"
     - "async": fires only when execution_mode == "async"
-    - "both": fires in both modes (state-mutating effects forbidden — see Phase 3 validator)
+    - "both": fires in both modes (state-mutating effects forbidden — see ValidateTierConstraints)
     - "legacy" (default): fires regardless of execution_mode; preserves pre-tier-system behavior
     """
 

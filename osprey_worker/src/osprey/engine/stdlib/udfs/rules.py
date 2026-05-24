@@ -12,10 +12,9 @@ from osprey.worker.lib.instruments import metrics
 
 from ._prelude import ArgumentsBase, ConstExpr, ExecutionContext, UDFBase, ValidationContext
 from .categories import UdfCategories
+from .tier_constants import ALWAYS_FIRES, UNSPECIFIED_MODE, VALID_TIERS
 
 _HAS_FORMAT_STRING_RE = re.compile(r'\{([^\d\W]\w*)\}')
-
-_VALID_TIERS = {"sync", "async", "both", "legacy"}
 
 
 class RuleArguments(ArgumentsBase):
@@ -143,8 +142,8 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
         if arguments.has_argument_ast('tier'):
             tier_ast = arguments.get_argument_ast('tier')
             if isinstance(tier_ast, grammar.String):
-                if tier_ast.value not in _VALID_TIERS:
-                    valid_tiers_str = ', '.join(f'`{t}`' for t in sorted(_VALID_TIERS))
+                if tier_ast.value not in VALID_TIERS:
+                    valid_tiers_str = ', '.join(f'`{t}`' for t in sorted(VALID_TIERS))
                     validation_context.add_error(
                         message=f'invalid tier value: `{tier_ast.value}`',
                         span=tier_ast.span,
@@ -223,9 +222,9 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
         # "legacy" (default) and "both" always fire. "unspecified" execution mode (older
         # coordinator binaries that don't stamp mode) bypasses filtering for back-compat.
         tier = arguments.tier.value
-        if tier not in ('legacy', 'both'):
+        if tier not in ALWAYS_FIRES:
             mode = execution_context.get_execution_mode()
-            if mode != 'unspecified' and mode != tier:
+            if mode != UNSPECIFIED_MODE and mode != tier:
                 execution_context.add_rule_audit_entry(WhenRulesAuditEntry(
                     rules_evaluated=[rule.name for rule in arguments.rules_any],
                     rules_matched=[],

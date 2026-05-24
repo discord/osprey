@@ -13,8 +13,16 @@ class ExecutionMode(UDFBase[Arguments, str]):
         Require(rule='slow_classifiers.sml', require_if=ExecutionMode() == 'async')
 
     'unspecified' indicates older messages without a stamped mode (a coordinator
-    that predates the Phase 1 proto change). Rule files using this UDF should
-    treat 'unspecified' as a no-op (no filtering) rather than as a third tier."""
+    that predates the proto change). Rule authors should test for the
+    AFFIRMATIVE case (e.g. `== 'async'`) — an explicit equality check against
+    'sync' or 'async' will evaluate to False on 'unspecified', matching the
+    legacy behavior where the file was never gated.
+
+    Note: this is distinct from the WhenRules `tier` filter, which DOES treat
+    'unspecified' as a bypass (all tier-tagged blocks fire). The asymmetry is
+    intentional: rule authors need a falsy ExecutionMode comparison for older
+    messages, but tier-tagged blocks should still fire on older messages to
+    avoid silently disabling enforcement during a rollback."""
 
     category = UdfCategories.ENGINE
 

@@ -10,14 +10,13 @@ causing duplicate writes to labels-service, Safety Record, etc.
 The validator walks each WhenRules call's transitive UDF dependency graph (for
 constraint 1) and inspects the effects list (for constraint 2).
 """
-from typing import Dict, List, Optional, Set, Tuple, Type
+from typing import Dict, List, Set, Tuple
 
 from osprey.engine.ast.ast_utils import filter_nodes, iter_field_values
 from osprey.engine.ast.grammar import ASTNode, Assign, Call, List as ASTList, Name, Source, String, Store
+from osprey.engine.stdlib.udfs.tier_constants import SLOW_FORBIDDEN
 
 from ..base_validator import SourceValidator
-
-_SLOW_FORBIDDEN_TIERS = frozenset({"sync", "both", "legacy"})
 
 # Name of the WhenRules UDF — compare by name to avoid a circular import.
 _WHEN_RULES_NAME = "WhenRules"
@@ -56,7 +55,7 @@ class ValidateTierConstraints(SourceValidator):
         # Constraint 1: SLOW UDFs forbidden in sync/both/legacy.
         # Walk BOTH `rules_any` and `then` — a SLOW UDF can appear as a direct
         # effect or buried inside a Rule's expression graph.
-        if tier in _SLOW_FORBIDDEN_TIERS:
+        if tier in SLOW_FORBIDDEN:
             slow_hits: List[Tuple[str, object]] = []
             seen: Set[int] = set()
             for kwarg_name in ("rules_any", "then"):
@@ -160,7 +159,13 @@ class ValidateTierConstraints(SourceValidator):
     ) -> None:
         """Walk the `then` argument value recursively, finding Calls to UDFs
         with mutates_state=True. Follows Name references so `then=[Helper]`
-        where `Helper = LabelAdd(...)` is also caught."""
+        where `Helper = LabelAdd(...)` is also caught.
+
+        Unlike `_collect_slow_udfs` this does NOT recurse into Call arguments
+        — only the top-level entries of `then=[...]` actually emit effects.
+        A mutating UDF buried as a sub-argument is computed but never added
+        to the execution context's effect set, so it can't cause duplicate
+        writes."""
         node_id = id(node)
         if node_id in seen:
             return

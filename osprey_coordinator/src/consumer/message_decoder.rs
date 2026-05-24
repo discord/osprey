@@ -10,7 +10,7 @@ use crate::{
     metrics::counters::StaticCounter,
     proto::{
         self, osprey_coordinator_action::ActionData, osprey_coordinator_action::SecretData,
-        Action as OspreyProtoAction,
+        Action as OspreyProtoAction, ExecutionMode,
     },
     snowflake_client::SnowflakeClient,
 };
@@ -41,7 +41,7 @@ pub async fn decode_proto_message(
         action_data: Some(ActionData::ProtoActionData(message_data.into())),
         secret_data: None,
         timestamp: Some(message_timestamp),
-        mode: 0, // EXECUTION_MODE_UNSPECIFIED; set by coordinator when tier is known
+        mode: ExecutionMode::Async as i32,
     })
 }
 
@@ -87,6 +87,80 @@ pub async fn decode_msgpack_json_message(
         action_data: Some(ActionData::JsonActionData(serde_json_vec)),
         secret_data: optional_secret_data,
         timestamp: Some(message_timestamp),
-        mode: 0, // EXECUTION_MODE_UNSPECIFIED; set by coordinator when tier is known
+        mode: ExecutionMode::Async as i32,
     })
+}
+
+#[cfg(test)]
+mod async_ingest_mode_tests {
+    use super::*;
+    use crate::proto::{action, ExecutionMode, GuildCreated};
+    use prost::Message as ProstMessage;
+
+    fn make_metrics() -> std::sync::Arc<OspreyCoordinatorMetrics> {
+        OspreyCoordinatorMetrics::new()
+    }
+
+    fn make_snowflake() -> SnowflakeClient {
+        // new() only stores the endpoint string — no network connection until generate_id()
+        SnowflakeClient::new("http://localhost:8088".to_string())
+    }
+
+    #[tokio::test]
+    async fn proto_ingest_stamps_mode_async() {
+        // Build a minimal proto Action with a non-zero id so the snowflake
+        // network call is skipped.
+        let action = OspreyProtoAction {
+            id: 42,
+            data: Some(action::Data::GuildCreated(GuildCreated::default())),
+        };
+        let encoded = action.encode_to_vec();
+
+        let result = decode_proto_message(
+            &encoded,
+            /*ack_id=*/ 1,
+            Timestamp::default(),
+            &make_snowflake(),
+            &make_metrics(),
+        )
+        .await
+        .expect("decode_proto_message should succeed");
+
+        assert_eq!(
+            result.mode,
+            ExecutionMode::Async as i32,
+            "pubsub proto-ingest must stamp ExecutionMode::Async"
+        );
+        assert_eq!(result.action_id, 42);
+    }
+
+    #[tokio::test]
+    async fn msgpack_ingest_stamps_mode_async() {
+        use msgpack_simple::MsgPack;
+
+        // Construct a msgpack-encoded action as discord-api's submit_async() publishes it.
+        let action_json = serde_json::json!({
+            "id": "999000111000222000",
+            "name": "GUILD_JOINED",
+            "data": {"user_id": "999000111000222001", "guild_id": "888777666555444333"},
+        });
+        let encoded = MsgPack::String(action_json.to_string()).encode();
+
+        let result = decode_msgpack_json_message(
+            &encoded,
+            /*ack_id=*/ 2,
+            Timestamp::default(),
+            &make_snowflake(),
+            &make_metrics(),
+        )
+        .await
+        .expect("decode_msgpack_json_message should succeed");
+
+        assert_eq!(
+            result.mode,
+            ExecutionMode::Async as i32,
+            "pubsub msgpack-ingest must stamp ExecutionMode::Async"
+        );
+        assert_eq!(result.action_name, "GUILD_JOINED");
+    }
 }

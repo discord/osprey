@@ -10,7 +10,7 @@ causing duplicate writes to downstream stores.
 The validator walks each WhenRules call's transitive UDF dependency graph (for
 constraint 1) and inspects the effects list (for constraint 2).
 """
-from typing import Dict, List, Set, Tuple
+from typing import Callable, Dict, List, Set, Tuple
 
 from osprey.engine.ast.ast_utils import filter_nodes, iter_field_values
 from osprey.engine.ast.grammar import ASTNode, Assign, Call, List as ASTList, Name, Source, String, Store
@@ -61,7 +61,11 @@ class ValidateTierConstraints(SourceValidator):
             for kwarg_name in ("rules_any", "then"):
                 kw = call.find_argument(kwarg_name)
                 if kw is not None:
-                    self._collect_slow_udfs(kw.value, name_to_assign, slow_hits, seen)
+                    self._collect_matching_udfs(
+                        kw.value, name_to_assign, slow_hits, seen,
+                        predicate=lambda cls: getattr(cls, "latency_tier", "fast") == "slow",
+                        recurse_into_call_args=True,
+                    )
             for udf_name, span in slow_hits:
                 self.context.add_error(
                     message=f"tier=`{tier}` WhenRules references SLOW UDF `{udf_name}`",
@@ -84,7 +88,11 @@ class ValidateTierConstraints(SourceValidator):
             if then_kw is not None:
                 mutating_hits: List[Tuple[str, object]] = []
                 seen_mut: Set[int] = set()
-                self._collect_mutating_effects(then_kw.value, name_to_assign, mutating_hits, seen_mut)
+                self._collect_matching_udfs(
+                    then_kw.value, name_to_assign, mutating_hits, seen_mut,
+                    predicate=lambda cls: getattr(cls, "mutates_state", False),
+                    recurse_into_call_args=False,
+                )
                 for udf_name, span in mutating_hits:
                     self.context.add_error(
                         message=f"tier=`both` WhenRules emits state-mutating effect `{udf_name}`",
@@ -100,18 +108,29 @@ class ValidateTierConstraints(SourceValidator):
                     )
 
     # ------------------------------------------------------------------
-    # Constraint 1: transitive SLOW UDF detection
+    # Constraint walkers
     # ------------------------------------------------------------------
 
-    def _collect_slow_udfs(
+    def _collect_matching_udfs(
         self,
         node: object,
         name_to_assign: Dict[str, Assign],
         out: List[Tuple[str, object]],
         seen: Set[int],
+        predicate: Callable[[type], bool],
+        recurse_into_call_args: bool,
     ) -> None:
-        """Walk the AST node recursively, collecting (udf_name, span) for every
-        Call to a UDF that has latency_tier='slow'."""
+        """Walk the AST recursively, collecting (udf_name, span) for every Call
+        whose UDF class matches `predicate`. Follows Name → Assign references
+        one level deep so `Score = SlowUDF()` then `Rule(when_all=[Score > 0.5])`
+        catches `SlowUDF`.
+
+        `recurse_into_call_args` controls whether sub-arguments of a Call are
+        walked. For SLOW UDF detection we recurse (a slow UDF buried in a Rule's
+        expression graph is still scheduled). For state-mutating effects we do
+        NOT recurse — only top-level entries of `then=[...]` actually emit
+        effects, so a mutating UDF buried as a sub-argument is computed but
+        never added to the execution context."""
         node_id = id(node)
         if node_id in seen:
             return
@@ -120,71 +139,40 @@ class ValidateTierConstraints(SourceValidator):
         if isinstance(node, Call):
             if isinstance(node.func, Name):
                 udf_cls = self.context.udf_registry.get(node.func.identifier)
-                if udf_cls is not None and getattr(udf_cls, "latency_tier", "fast") == "slow":
+                if udf_cls is not None and predicate(udf_cls):
                     out.append((node.func.identifier, node.span))
-                # Always recurse into the call's arguments to catch nested references.
-                for kw in node.arguments:
-                    self._collect_slow_udfs(kw.value, name_to_assign, out, seen)
-        elif isinstance(node, Name):
-            # Resolve this name to its defining Assign and recurse into the value.
-            if isinstance(node.context, Store):
-                return
-            assign = name_to_assign.get(node.identifier)
-            if assign is not None:
-                self._collect_slow_udfs(assign.value, name_to_assign, out, seen)
-        elif isinstance(node, ASTList):
-            for item in node.items:
-                self._collect_slow_udfs(item, name_to_assign, out, seen)
-        else:
-            # For any other node, walk its AST children via iter_field_values.
-            if isinstance(node, ASTNode):
-                for _field, value in iter_field_values(node):
-                    if isinstance(value, ASTNode):
-                        self._collect_slow_udfs(value, name_to_assign, out, seen)
-                    elif isinstance(value, list):
-                        for item in value:
-                            if isinstance(item, ASTNode):
-                                self._collect_slow_udfs(item, name_to_assign, out, seen)
-
-    # ------------------------------------------------------------------
-    # Constraint 2: state-mutating effect detection
-    # ------------------------------------------------------------------
-
-    def _collect_mutating_effects(
-        self,
-        node: object,
-        name_to_assign: Dict[str, Assign],
-        out: List[Tuple[str, object]],
-        seen: Set[int],
-    ) -> None:
-        """Walk the `then` argument value recursively, finding Calls to UDFs
-        with mutates_state=True. Follows Name references so `then=[Helper]`
-        where `Helper = LabelAdd(...)` is also caught.
-
-        Unlike `_collect_slow_udfs` this does NOT recurse into Call arguments
-        — only the top-level entries of `then=[...]` actually emit effects.
-        A mutating UDF buried as a sub-argument is computed but never added
-        to the execution context's effect set, so it can't cause duplicate
-        writes."""
-        node_id = id(node)
-        if node_id in seen:
-            return
-        seen.add(node_id)
-
-        if isinstance(node, Call):
-            if isinstance(node.func, Name):
-                udf_cls = self.context.udf_registry.get(node.func.identifier)
-                if udf_cls is not None and getattr(udf_cls, "mutates_state", False):
-                    out.append((node.func.identifier, node.span))
+                if recurse_into_call_args:
+                    for kw in node.arguments:
+                        self._collect_matching_udfs(
+                            kw.value, name_to_assign, out, seen, predicate, recurse_into_call_args
+                        )
         elif isinstance(node, Name):
             if isinstance(node.context, Store):
                 return
             assign = name_to_assign.get(node.identifier)
             if assign is not None:
-                self._collect_mutating_effects(assign.value, name_to_assign, out, seen)
+                self._collect_matching_udfs(
+                    assign.value, name_to_assign, out, seen, predicate, recurse_into_call_args
+                )
         elif isinstance(node, ASTList):
             for item in node.items:
-                self._collect_mutating_effects(item, name_to_assign, out, seen)
+                self._collect_matching_udfs(
+                    item, name_to_assign, out, seen, predicate, recurse_into_call_args
+                )
+        elif recurse_into_call_args and isinstance(node, ASTNode):
+            # Walk arbitrary AST children (e.g. BinaryOp's left/right) so SLOW
+            # UDFs nested in rule expressions are caught.
+            for _field, value in iter_field_values(node):
+                if isinstance(value, ASTNode):
+                    self._collect_matching_udfs(
+                        value, name_to_assign, out, seen, predicate, recurse_into_call_args
+                    )
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, ASTNode):
+                            self._collect_matching_udfs(
+                                item, name_to_assign, out, seen, predicate, recurse_into_call_args
+                            )
 
     # ------------------------------------------------------------------
     # Helpers

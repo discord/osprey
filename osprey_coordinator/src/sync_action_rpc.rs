@@ -5,7 +5,7 @@ use crate::{
     coordinator_metrics::OspreyCoordinatorMetrics,
     priority_queue::AckableAction,
     priority_queue::{AckOrNack, PriorityQueueSender},
-    proto::{self, osprey_coordinator_sync_action},
+    proto::{self, osprey_coordinator_sync_action, ExecutionMode},
 };
 use anyhow::{anyhow, Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,7 +73,7 @@ async fn create_osprey_coordinator_action(
                 .context("`timestamp` not found")?
                 .clone(),
         ),
-        mode: 0, // EXECUTION_MODE_UNSPECIFIED; set by coordinator when tier is known
+        mode: ExecutionMode::Sync as i32,
     };
 
     Ok(osprey_coordinator_action)
@@ -198,5 +198,44 @@ impl OspreyCoordinatorSyncActionService for SyncActionServer {
                 self.try_process_action(ack_id, &action_request).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_action_mode_tests {
+    use super::*;
+    use crate::proto::ExecutionMode;
+
+    #[tokio::test]
+    async fn sync_rpc_stamps_mode_sync() {
+        // Use a non-zero action_id so the helper skips the snowflake network call.
+        let req = ProcessActionRequest {
+            action_id: Some(123_u64),
+            action_name: "USER_REGISTER_ATTEMPTED".to_string(),
+            action_data_json: r#"{"foo":"bar"}"#.to_string(),
+            timestamp: Some(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            }),
+        };
+
+        // SnowflakeClient::new only stores the endpoint string — no network
+        // connection is made until generate_id() is called, which won't happen
+        // here because action_id is non-zero.
+        let snowflake = crate::snowflake_client::SnowflakeClient::new(
+            "http://localhost:8088".to_string(),
+        );
+
+        let action = create_osprey_coordinator_action(999_u64, &req, &snowflake)
+            .await
+            .expect("create_osprey_coordinator_action should succeed");
+
+        assert_eq!(
+            action.mode,
+            ExecutionMode::Sync as i32,
+            "sync RPC must stamp ExecutionMode::Sync on the bidi-stream action"
+        );
+        assert_eq!(action.action_name, "USER_REGISTER_ATTEMPTED");
+        assert_eq!(action.ack_id, 999);
     }
 }

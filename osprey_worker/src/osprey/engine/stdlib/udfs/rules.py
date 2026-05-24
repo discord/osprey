@@ -1,3 +1,4 @@
+import logging
 import re
 from typing import List, Optional, cast
 
@@ -131,6 +132,9 @@ class WhenRulesArguments(ArgumentsBase):
     """
 
 
+_logger = logging.getLogger(__name__)
+
+
 class WhenRules(UDFBase[WhenRulesArguments, None]):
     """Binds rules to effects. When any of the referenced rules fire, the then= effects are applied."""
 
@@ -227,7 +231,15 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
         tier = arguments.tier.value
         if tier not in ('legacy', 'both'):
             mode = execution_context.get_execution_mode()
-            if mode != 'unspecified' and mode != tier:
+            will_skip = mode != 'unspecified' and mode != tier
+            _logger.debug(
+                'tier_filter_check action=%s tier=%s mode=%s will_skip=%s',
+                execution_context.get_action_name(),
+                tier,
+                mode,
+                will_skip,
+            )
+            if will_skip:
                 execution_context.add_rule_audit_entry(WhenRulesAuditEntry(
                     rules_evaluated=[rule.name for rule in arguments.rules_any],
                     rules_matched=[],

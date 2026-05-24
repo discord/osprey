@@ -1,0 +1,6 @@
+error: invalid tier value: `nonsense`
+--> main.sml:7:9
+     |
+   7 |     tier="nonsense",
+     |          ^ allowed tiers are: `async`, `both`, `legacy`, `sync`
+                | omit the kwarg to default to `legacy` behavior

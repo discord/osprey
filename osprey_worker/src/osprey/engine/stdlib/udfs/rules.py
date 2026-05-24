@@ -15,6 +15,8 @@ from .categories import UdfCategories
 
 _HAS_FORMAT_STRING_RE = re.compile(r'\{([^\d\W]\w*)\}')
 
+_VALID_TIERS = {"sync", "async", "both", "legacy"}
+
 
 class RuleArguments(ArgumentsBase):
     # TODO - Should we require that this is a list literal? If so, should we require it be non-empty?
@@ -118,12 +120,47 @@ class WhenRulesArguments(ArgumentsBase):
     rules_any: List[RuleT]
     # TODO - Should we require this be non-empty?
     then: List[EffectBase]
+    tier: str = "legacy"
+    """Execution tier for this WhenRules block.
+
+    Allowed values:
+    - "sync": fires only when execution_mode == "sync"
+    - "async": fires only when execution_mode == "async"
+    - "both": fires in both modes (state-mutating effects forbidden — see Phase 3 validator)
+    - "legacy" (default): fires regardless of execution_mode; preserves pre-tier-system behavior
+
+    Phase 2 only validates the tier value at compile time. Runtime filtering ships in
+    Task 2.3."""
 
 
 class WhenRules(UDFBase[WhenRulesArguments, None]):
     """Binds rules to effects. When any of the referenced rules fire, the then= effects are applied."""
 
     category = UdfCategories.ENGINE
+
+    def __init__(self, validation_context: ValidationContext, arguments: WhenRulesArguments) -> None:
+        super().__init__(validation_context, arguments)
+
+        # Validate tier value at compile time — only when explicitly supplied by the author.
+        if arguments.has_argument_ast('tier'):
+            tier_ast = arguments.get_argument_ast('tier')
+            if isinstance(tier_ast, grammar.String):
+                if tier_ast.value not in _VALID_TIERS:
+                    valid_tiers_str = ', '.join(f'`{t}`' for t in sorted(_VALID_TIERS))
+                    validation_context.add_error(
+                        message=f'invalid tier value: `{tier_ast.value}`',
+                        span=tier_ast.span,
+                        hint=(
+                            f'allowed tiers are: {valid_tiers_str}'
+                            '\nomit the kwarg to default to `legacy` behavior'
+                        ),
+                    )
+            else:
+                validation_context.add_error(
+                    message='`tier` must be a string literal',
+                    span=tier_ast.span,
+                    hint='example: `WhenRules(rules_any=[...], then=[...], tier=`async`)`',
+                )
 
     def resolve_arguments(self, execution_context: ExecutionContext, call_executor: CallExecutor) -> WhenRulesArguments:
         # WhenRules has some custom resolve logic, in order to tolerate a failure in the `rules_any` dependency chain.

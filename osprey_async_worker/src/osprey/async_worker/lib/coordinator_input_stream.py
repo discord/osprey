@@ -60,7 +60,13 @@ class AsyncVerdictsAckingContext(VerdictsAckingContext[OspreyEngineAction]):
     """Async-compatible verdicts acking context that sends ack/nack back through the bidirectional stream.
 
     Holds a reference to the stream and ack_id so the rules sink can use it as a normal
-    context manager, and the ack is sent when the context exits.
+    context manager, and the ack is sent when the context exits (i.e. when classify_one
+    completes). This ensures verdicts are populated before the ack is sent, which is required
+    for parallel mode where the consumer dispatches classify_one as a Task and returns to
+    the generator before the task completes.
+
+    The _already_acked guard prevents double-send: the graceful disconnect paths in _gen
+    check this flag and skip re-acking with the same ack_id.
     """
 
     def __init__(
@@ -72,6 +78,14 @@ class AsyncVerdictsAckingContext(VerdictsAckingContext[OspreyEngineAction]):
         super().__init__(item)
         self._stream = stream
         self._ack_id = ack_id
+        self._already_acked: bool = False
+
+    def _ack(self) -> None:
+        """Send ack with populated verdicts. No-op if already acked (e.g. graceful disconnect sent first)."""
+        if self._already_acked:
+            return
+        self._already_acked = True
+        self._stream.send_ack_or_nack(self._ack_id, verdicts=self.get_verdicts())
 
 
 class GrpcConnectionDiscoveryPool:
@@ -204,8 +218,9 @@ class OspreyCoordinatorBiDirectionalStream:
 
     HEARTBEAT_INTERVAL_SECONDS = 30
 
-    def __init__(self, client_id: str, channel: grpc.aio.Channel, service: Service) -> None:
+    def __init__(self, client_id: str, channel: grpc.aio.Channel, service: Service, max_unacked: int = 1) -> None:
         self._client_id = client_id
+        self._max_unacked = max_unacked
         self._outgoing_queue: asyncio.Queue[Optional[Request]] = asyncio.Queue()
         self._stub = OspreyCoordinatorServiceStub(channel=channel)
         self._tags = [f'coordinator_connection_address:{service.connection_address}']
@@ -243,6 +258,22 @@ class OspreyCoordinatorBiDirectionalStream:
         await self._outgoing_queue.put(Request(disconnect=Disconnect(ack_or_nack=ack_or_nack)))
         await self._enqueue_stop_signal()
 
+    async def send_graceful_disconnect_no_ack(self) -> None:
+        """Send a graceful disconnect without an embedded ack/nack.
+
+        Used when the context's _ack() has already sent the ack_id via a normal
+        ActionRequest, and we only need to tell the coordinator we're going away.
+        Sending a Disconnect with no ack_or_nack avoids a duplicate-ack for the
+        last in-flight action_id.
+        # TODO(chunk-C): coordinator Rust side should handle Disconnect.ack_or_nack
+        # being absent (proto3 default) gracefully. Current OutstandingActionState
+        # pattern likely already ignores unknown ack_ids, but verify in chunk C.
+        """
+        metrics.increment('ack_or_nack.disconnect', tags=['ack:disconnect_only', 'verdicts:False'])
+        logger.debug('submitting disconnect-only (no ack)')
+        await self._outgoing_queue.put(Request(disconnect=Disconnect()))
+        await self._enqueue_stop_signal()
+
     def send_ack_or_nack(self, ack_id: int, ack: bool = True, verdicts: Optional[Verdicts] = None) -> None:
         """Fire-and-forget ack — uses put_nowait to match gevent's non-blocking Queue.put()."""
         ack_or_nack = (
@@ -272,7 +303,7 @@ class OspreyCoordinatorBiDirectionalStream:
             self._tags,
             self._client_id,
         )
-        await self._send(Request(action_request=ActionRequest(initial=ClientDetails(id=self._client_id))))
+        await self._send(Request(action_request=ActionRequest(initial=ClientDetails(id=self._client_id, max_unacked=self._max_unacked))))
         self._last_action_request_time = time.time()
         self._connect_time = time.time()
         metrics.increment('osprey_coordinator_input_stream.connect', tags=self._tags)
@@ -313,8 +344,10 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         client_id: str,
         coordinator_service_name: str = 'osprey_coordinator',
         input_stream_ready_signaler: Optional[AsyncInputStreamReadySignaler] = None,
+        max_unacked: int = 1,
     ) -> None:
         self._client_id = client_id
+        self._max_unacked = max_unacked
         self._channel_pool = GrpcConnectionDiscoveryPool(coordinator_service_name)
         self._shutdown_event = asyncio.Event()
         self._current_execution_result: Optional[ExecutionResult] = None
@@ -327,6 +360,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         address: str,
         service_name: str = 'osprey_coordinator',
         input_stream_ready_signaler: Optional[AsyncInputStreamReadySignaler] = None,
+        max_unacked: int = 1,
     ) -> 'OspreyCoordinatorInputStream':
         """Create an input stream connected directly to a coordinator address.
 
@@ -334,6 +368,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         """
         instance = object.__new__(cls)
         instance._client_id = client_id
+        instance._max_unacked = max_unacked
         instance._shutdown_event = asyncio.Event()
         instance._current_execution_result = None
         instance._channel_pool = GrpcConnectionDiscoveryPool.from_static(address, service_name)
@@ -346,6 +381,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         client_id: str,
         service_name: str = 'osprey_coordinator',
         input_stream_ready_signaler: Optional[AsyncInputStreamReadySignaler] = None,
+        max_unacked: int = 1,
     ) -> 'OspreyCoordinatorInputStream':
         """Create an input stream using async etcd discovery (no gevent).
 
@@ -354,6 +390,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         """
         instance = object.__new__(cls)
         instance._client_id = client_id
+        instance._max_unacked = max_unacked
         instance._shutdown_event = asyncio.Event()
         instance._current_execution_result = None
         instance._channel_pool = GrpcConnectionDiscoveryPool.from_async_discovery(service_name)
@@ -452,7 +489,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         while not self._shutdown_event.is_set():
             channel, service = await self._channel_pool.get_connection()
             bidirectional_stream = OspreyCoordinatorBiDirectionalStream(
-                client_id=self._client_id, channel=channel, service=service
+                client_id=self._client_id, channel=channel, service=service, max_unacked=self._max_unacked
             )
             max_uptime_allowed = MIN_SECONDS_BEFORE_RECONNECT + random.uniform(0, SECONDS_BEFORE_RECONNECT_JITTER)
             actions_handled = 0
@@ -481,9 +518,17 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
                 ):
                     yield context
 
-                # Prioritize shutdown so we can ack the last action and disconnect gracefully
+                # Prioritize shutdown so we can disconnect gracefully.
+                # context.__exit__ (called when the sink's with-block exits) already sent
+                # the ack via _ack(). Use send_graceful_disconnect_no_ack so we don't
+                # re-send the same ack_id in the Disconnect message.
                 if self._shutdown_event.is_set():
-                    await bidirectional_stream.send_graceful_disconnect(ack_id, verdicts=context.get_verdicts())
+                    if context._already_acked:
+                        await bidirectional_stream.send_graceful_disconnect_no_ack()
+                    else:
+                        # Parallel mode: task not yet complete, context hasn't exited yet.
+                        # Send ack+disconnect together so coordinator isn't left hanging.
+                        await bidirectional_stream.send_graceful_disconnect(ack_id, verdicts=context.get_verdicts())
                     break
 
                 # Pause-and-rotate on rule reload. Mirrors the gevent equivalent at
@@ -495,7 +540,10 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
                     and self._input_stream_ready_signaler.should_pause_input_stream()
                 ):
                     logger.info('Disconnecting due to input stream ready signaler')
-                    await bidirectional_stream.send_graceful_disconnect(ack_id, verdicts=context.get_verdicts())
+                    if context._already_acked:
+                        await bidirectional_stream.send_graceful_disconnect_no_ack()
+                    else:
+                        await bidirectional_stream.send_graceful_disconnect(ack_id, verdicts=context.get_verdicts())
                     await self._input_stream_ready_signaler.wait_until_resume()
                     break
 
@@ -503,12 +551,14 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
                 uptime = bidirectional_stream.get_uptime()
                 if uptime > max_uptime_allowed:
                     logger.debug(f'Reconnecting because {uptime} seconds have passed')
-                    await bidirectional_stream.send_graceful_disconnect(ack_id, verdicts=context.get_verdicts())
+                    if context._already_acked:
+                        await bidirectional_stream.send_graceful_disconnect_no_ack()
+                    else:
+                        await bidirectional_stream.send_graceful_disconnect(ack_id, verdicts=context.get_verdicts())
                     break
 
-                # Normal path: ack the last action and request the next one
-                bidirectional_stream.send_ack_or_nack(ack_id, verdicts=context.get_verdicts())
-
+                # Normal path: context.__exit__ already sent the ack via _ack().
+                # No explicit send_ack_or_nack needed here.
                 info_log_osprey_action(
                     osprey_coordinator_action.action_id, osprey_coordinator_action.action_name, 'acking'
                 )

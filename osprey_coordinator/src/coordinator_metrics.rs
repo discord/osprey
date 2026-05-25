@@ -69,4 +69,12 @@ define_metrics!(OspreyCoordinatorMetrics, [
     // Bidi stream dispatch counters (for throughput investigation)
     bidi_actions_sent => StaticCounter("bidi_stream.actions_sent"),
     bidi_acks_received => StaticCounter("bidi_stream.acks_received"),
+
+    // Parallel dispatch metrics (chunk C)
+    // Current in-flight action count sampled at each dispatch (histogram for distribution).
+    bidi_stream_in_flight_actions => StaticHistogram("bidi_stream.in_flight_actions"),
+    // Distribution of max_unacked values reported by workers on handshake.
+    bidi_stream_max_unacked_observed => StaticHistogram("bidi_stream.max_unacked_observed"),
+    // Count of acks received for ack_ids that are not in the in-flight map (stale/duplicate).
+    bidi_stream_unknown_ack_id => StaticCounter("bidi_stream.unknown_ack_id"),
 ]);

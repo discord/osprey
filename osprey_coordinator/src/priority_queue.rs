@@ -165,6 +165,28 @@ impl PriorityQueueReceiver {
             async_receiver,
         }
     }
+    /// Non-blocking receive: returns `Some` if an action is immediately available, `None` if
+    /// the queue is empty. Skips expired actions (closed oneshot sender) the same way `recv`
+    /// does.  Does NOT record async-queue dwell time (no metrics needed for the try path).
+    pub fn try_recv(&self) -> Option<AckableAction> {
+        loop {
+            // Prefer sync over async, mirroring the biased select! in `recv`.
+            let candidate = self
+                .sync_receiver
+                .try_recv()
+                .or_else(|_| self.async_receiver.try_recv());
+            match candidate {
+                Ok(ackable_action) => {
+                    if ackable_action.acking_oneshot_sender.is_closed() {
+                        continue; // skip expired, try next
+                    }
+                    return Some(ackable_action);
+                }
+                Err(_) => return None, // queue empty
+            }
+        }
+    }
+
     pub async fn recv(
         &self,
         metrics: Arc<OspreyCoordinatorMetrics>,

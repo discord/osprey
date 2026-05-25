@@ -49,6 +49,12 @@ message Request {
 
 message ClientDetails {
   string id = 1;
+
+  // Maximum number of un-acked actions per stream. The coordinator will dispatch
+  // up to this many actions before requiring an ack. Default 0 → treated as 1
+  // (today's strict-serial behavior). Raising this lifts per-stream throughput
+  // for slow async UDFs; see osprey_async_worker docs.
+  uint32 max_unacked = 2;
 }
 
 message Disconnect {

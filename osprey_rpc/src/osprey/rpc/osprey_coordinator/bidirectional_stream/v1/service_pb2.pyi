@@ -111,13 +111,21 @@ class ClientDetails(google.protobuf.message.Message):
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
     ID_FIELD_NUMBER: builtins.int
+    MAX_UNACKED_FIELD_NUMBER: builtins.int
     id: builtins.str
+    max_unacked: builtins.int
+    """Maximum number of un-acked actions per stream. The coordinator will dispatch
+    up to this many actions before requiring an ack. Default 0 → treated as 1
+    (today's strict-serial behavior). Raising this lifts per-stream throughput
+    for slow async UDFs; see osprey_async_worker docs.
+    """
     def __init__(
         self,
         *,
         id: builtins.str = ...,
+        max_unacked: builtins.int = ...,
     ) -> None: ...
-    def ClearField(self, field_name: typing.Literal["id", b"id"]) -> None: ...
+    def ClearField(self, field_name: typing.Literal["id", b"id", "max_unacked", b"max_unacked"]) -> None: ...
 
 global___ClientDetails = ClientDetails
 

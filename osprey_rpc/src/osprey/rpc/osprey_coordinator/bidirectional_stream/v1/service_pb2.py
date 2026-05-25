@@ -16,31 +16,31 @@ from osprey.rpc.common.v1 import verdicts_pb2 as osprey_dot_rpc_dot_common_dot_v
 from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\nCosprey/rpc/osprey_coordinator/bidirectional_stream/v1/service.proto\x12\x35osprey.rpc.osprey_coordinator.bidirectional_stream.v1\x1a+osprey/rpc/common/v1/execution_result.proto\x1a#osprey/rpc/common/v1/verdicts.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc7\x02\n\x17OspreyCoordinatorAction\x12\x0e\n\x06\x61\x63k_id\x18\x01 \x01(\x04\x12\x11\n\taction_id\x18\x02 \x01(\x04\x12\x13\n\x0b\x61\x63tion_name\x18\x03 \x01(\t\x12\x1a\n\x10json_action_data\x18\x04 \x01(\x0cH\x00\x12\x1b\n\x11proto_action_data\x18\x05 \x01(\x0cH\x00\x12\x1a\n\x10json_secret_data\x18\x07 \x01(\x0cH\x01\x12-\n\ttimestamp\x18\x06 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12R\n\x04mode\x18\x08 \x01(\x0e\x32\x44.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.ExecutionModeB\r\n\x0b\x61\x63tion_dataB\r\n\x0bsecret_data\"\xcd\x01\n\x07Request\x12^\n\x0e\x61\x63tion_request\x18\x01 \x01(\x0b\x32\x44.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.ActionRequestH\x00\x12W\n\ndisconnect\x18\x02 \x01(\x0b\x32\x41.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.DisconnectH\x00\x42\t\n\x07request\"\x1b\n\rClientDetails\x12\n\n\x02id\x18\x01 \x01(\t\"c\n\nDisconnect\x12U\n\x0b\x61\x63k_or_nack\x18\x01 \x01(\x0b\x32@.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.AckOrNack\"\xd3\x01\n\rActionRequest\x12W\n\x07initial\x18\x01 \x01(\x0b\x32\x44.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.ClientDetailsH\x00\x12W\n\x0b\x61\x63k_or_nack\x18\x02 \x01(\x0b\x32@.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.AckOrNackH\x00\x42\x10\n\x0e\x61\x63tion_request\"x\n\x03\x41\x63k\x12?\n\x10\x65xecution_result\x18\x01 \x01(\x0b\x32%.osprey.rpc.common.v1.ExecutionResult\x12\x30\n\x08verdicts\x18\x02 \x01(\x0b\x32\x1e.osprey.rpc.common.v1.Verdicts\"\x06\n\x04Nack\"\xc2\x01\n\tAckOrNack\x12\x0e\n\x06\x61\x63k_id\x18\x01 \x01(\x04\x12I\n\x03\x61\x63k\x18\x02 \x01(\x0b\x32:.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.AckH\x00\x12K\n\x04nack\x18\x03 \x01(\x0b\x32;.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.NackH\x00\x42\r\n\x0b\x61\x63k_or_nack*b\n\rExecutionMode\x12\x1e\n\x1a\x45XECUTION_MODE_UNSPECIFIED\x10\x00\x12\x17\n\x13\x45XECUTION_MODE_SYNC\x10\x01\x12\x18\n\x14\x45XECUTION_MODE_ASYNC\x10\x02\x32\xcc\x01\n\x18OspreyCoordinatorService\x12\xaf\x01\n\x19OspreyBidirectionalStream\x12>.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.Request\x1aN.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.OspreyCoordinatorAction(\x01\x30\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\nCosprey/rpc/osprey_coordinator/bidirectional_stream/v1/service.proto\x12\x35osprey.rpc.osprey_coordinator.bidirectional_stream.v1\x1a+osprey/rpc/common/v1/execution_result.proto\x1a#osprey/rpc/common/v1/verdicts.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc7\x02\n\x17OspreyCoordinatorAction\x12\x0e\n\x06\x61\x63k_id\x18\x01 \x01(\x04\x12\x11\n\taction_id\x18\x02 \x01(\x04\x12\x13\n\x0b\x61\x63tion_name\x18\x03 \x01(\t\x12\x1a\n\x10json_action_data\x18\x04 \x01(\x0cH\x00\x12\x1b\n\x11proto_action_data\x18\x05 \x01(\x0cH\x00\x12\x1a\n\x10json_secret_data\x18\x07 \x01(\x0cH\x01\x12-\n\ttimestamp\x18\x06 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12R\n\x04mode\x18\x08 \x01(\x0e\x32\x44.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.ExecutionModeB\r\n\x0b\x61\x63tion_dataB\r\n\x0bsecret_data\"\xcd\x01\n\x07Request\x12^\n\x0e\x61\x63tion_request\x18\x01 \x01(\x0b\x32\x44.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.ActionRequestH\x00\x12W\n\ndisconnect\x18\x02 \x01(\x0b\x32\x41.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.DisconnectH\x00\x42\t\n\x07request\"0\n\rClientDetails\x12\n\n\x02id\x18\x01 \x01(\t\x12\x13\n\x0bmax_unacked\x18\x02 \x01(\r\"c\n\nDisconnect\x12U\n\x0b\x61\x63k_or_nack\x18\x01 \x01(\x0b\x32@.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.AckOrNack\"\xd3\x01\n\rActionRequest\x12W\n\x07initial\x18\x01 \x01(\x0b\x32\x44.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.ClientDetailsH\x00\x12W\n\x0b\x61\x63k_or_nack\x18\x02 \x01(\x0b\x32@.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.AckOrNackH\x00\x42\x10\n\x0e\x61\x63tion_request\"x\n\x03\x41\x63k\x12?\n\x10\x65xecution_result\x18\x01 \x01(\x0b\x32%.osprey.rpc.common.v1.ExecutionResult\x12\x30\n\x08verdicts\x18\x02 \x01(\x0b\x32\x1e.osprey.rpc.common.v1.Verdicts\"\x06\n\x04Nack\"\xc2\x01\n\tAckOrNack\x12\x0e\n\x06\x61\x63k_id\x18\x01 \x01(\x04\x12I\n\x03\x61\x63k\x18\x02 \x01(\x0b\x32:.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.AckH\x00\x12K\n\x04nack\x18\x03 \x01(\x0b\x32;.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.NackH\x00\x42\r\n\x0b\x61\x63k_or_nack*b\n\rExecutionMode\x12\x1e\n\x1a\x45XECUTION_MODE_UNSPECIFIED\x10\x00\x12\x17\n\x13\x45XECUTION_MODE_SYNC\x10\x01\x12\x18\n\x14\x45XECUTION_MODE_ASYNC\x10\x02\x32\xcc\x01\n\x18OspreyCoordinatorService\x12\xaf\x01\n\x19OspreyBidirectionalStream\x12>.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.Request\x1aN.osprey.rpc.osprey_coordinator.bidirectional_stream.v1.OspreyCoordinatorAction(\x01\x30\x01\x62\x06proto3')
 
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, globals())
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'osprey.rpc.osprey_coordinator.bidirectional_stream.v1.service_pb2', globals())
 if _descriptor._USE_C_DESCRIPTORS == False:
 
   DESCRIPTOR._options = None
-  _EXECUTIONMODE._serialized_start=1450
-  _EXECUTIONMODE._serialized_end=1548
+  _EXECUTIONMODE._serialized_start=1471
+  _EXECUTIONMODE._serialized_end=1569
   _OSPREYCOORDINATORACTION._serialized_start=242
   _OSPREYCOORDINATORACTION._serialized_end=569
   _REQUEST._serialized_start=572
   _REQUEST._serialized_end=777
   _CLIENTDETAILS._serialized_start=779
-  _CLIENTDETAILS._serialized_end=806
-  _DISCONNECT._serialized_start=808
-  _DISCONNECT._serialized_end=907
-  _ACTIONREQUEST._serialized_start=910
-  _ACTIONREQUEST._serialized_end=1121
-  _ACK._serialized_start=1123
-  _ACK._serialized_end=1243
-  _NACK._serialized_start=1245
-  _NACK._serialized_end=1251
-  _ACKORNACK._serialized_start=1254
-  _ACKORNACK._serialized_end=1448
-  _OSPREYCOORDINATORSERVICE._serialized_start=1551
-  _OSPREYCOORDINATORSERVICE._serialized_end=1755
+  _CLIENTDETAILS._serialized_end=827
+  _DISCONNECT._serialized_start=829
+  _DISCONNECT._serialized_end=928
+  _ACTIONREQUEST._serialized_start=931
+  _ACTIONREQUEST._serialized_end=1142
+  _ACK._serialized_start=1144
+  _ACK._serialized_end=1264
+  _NACK._serialized_start=1266
+  _NACK._serialized_end=1272
+  _ACKORNACK._serialized_start=1275
+  _ACKORNACK._serialized_end=1469
+  _OSPREYCOORDINATORSERVICE._serialized_start=1572
+  _OSPREYCOORDINATORSERVICE._serialized_end=1776
 # @@protoc_insertion_point(module_scope)

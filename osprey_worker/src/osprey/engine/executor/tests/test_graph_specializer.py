@@ -34,7 +34,16 @@ from osprey.engine.stdlib.udfs.json_data import JsonData
 from osprey.engine.stdlib.udfs.require import Require
 from osprey.engine.stdlib.udfs.resolve_optional import ResolveOptional
 from osprey.engine.stdlib.udfs.rules import Rule
+from osprey.engine.ast_validator.validators.imports_must_not_have_cycles import ImportsMustNotHaveCycles
+from osprey.engine.ast_validator.validators.unique_stored_names import UniqueStoredNames
+from osprey.engine.ast_validator.validators.validate_call_kwargs import ValidateCallKwargs
+from osprey.engine.ast_validator.validators.validate_dynamic_calls_have_annotated_rvalue import (
+    ValidateDynamicCallsHaveAnnotatedRValue,
+)
+from osprey.engine.ast_validator.validators.validate_static_types import ValidateStaticTypes
+from osprey.engine.ast_validator.validators.variables_must_be_defined import VariablesMustBeDefined
 from osprey.engine.udf.registry import UDFRegistry
+
 # Minimal UDF registry without postgres-backed UDFs (no POSTGRES_HOSTS needed)
 _TEST_REGISTRY = UDFRegistry.with_udfs(
     JsonData, EntityJson, Import, Require, GetActionName, ResolveOptional, Rule
@@ -47,15 +56,6 @@ def _compile(sources_dict: Dict[str, str]):
     Uses a standard validator registry that includes ValidateCallKwargs and other
     required validators for proper compilation.
     """
-    from osprey.engine.ast_validator.validators.validate_call_kwargs import ValidateCallKwargs
-    from osprey.engine.ast_validator.validators.validate_dynamic_calls_have_annotated_rvalue import (
-        ValidateDynamicCallsHaveAnnotatedRValue,
-    )
-    from osprey.engine.ast_validator.validators.imports_must_not_have_cycles import ImportsMustNotHaveCycles
-    from osprey.engine.ast_validator.validators.unique_stored_names import UniqueStoredNames
-    from osprey.engine.ast_validator.validators.variables_must_be_defined import VariablesMustBeDefined
-    from osprey.engine.ast_validator.validators.validate_static_types import ValidateStaticTypes
-
     sources = Sources.from_dict({k: dedent(v) for k, v in sources_dict.items()})
 
     # Use a targeted registry with required validators
@@ -199,9 +199,11 @@ def test_resolve_optional_with_default_not_pruned() -> None:
         absent=["target_user"],
     )
     specialized = specialize_graph(graph, schema)
-    # Just assert no crash — the specializer should handle ResolveOptional with default
     result = _run_graph(specialized, {"user": {"id": 1}})
     assert isinstance(result, dict)
+    # The default_value path must fire: _TargetId is pruned (absent group), so
+    # ResolveOptional should return the default (0) rather than raise.
+    assert result.get("TargetIdOrZero") == 0
 
 
 # ---------------------------------------------------------------------------
@@ -315,13 +317,16 @@ def test_conservative_when_all_prunes_rule_when_any_dep_pruned() -> None:
 # ---------------------------------------------------------------------------
 
 def test_specialized_graphs_cleared_on_source_reload() -> None:
-    """Verify that _handle_updated_sources clears _specialized_graphs.
+    """Verify that OspreyEngine._handle_updated_sources clears _specialized_graphs.
 
-    Uses a lightweight mock of OspreyEngine to avoid requiring etcd/gevent deps.
-    The key invariant: after a source reload, any previously registered
-    specialized graph (which references the old full_graph) must be evicted so
-    that execute() uses the freshly compiled graph.
+    Exercises the real _handle_updated_sources implementation via a partial mock
+    that stubs out etcd/gevent compilation but leaves the dict-clearing logic
+    intact. The key invariant: after a successful source reload, any previously
+    registered specialized graph must be evicted so that execute() uses the
+    freshly compiled graph instead of a stale one backed by the old full_graph.
     """
+    from unittest.mock import MagicMock, patch
+
     _, graph = _compile(
         {
             "main.sml": """
@@ -332,12 +337,21 @@ def test_specialized_graphs_cleared_on_source_reload() -> None:
     schema = _make_schema(absent=["target_user"])
     specialized = specialize_graph(graph, schema)
 
-    # Simulate the _specialized_graphs dict on OspreyEngine
-    specialized_graphs: Dict[str, Any] = {"test_action": specialized}
+    # Build a minimal mock OspreyEngine that has the real _handle_updated_sources
+    # bound to it, with _compile_execution_graph stubbed to return our graph.
+    from osprey.worker.lib.osprey_engine import OspreyEngine
 
-    # Simulate what _handle_updated_sources does on success
-    specialized_graphs.clear()
+    engine = MagicMock(spec=OspreyEngine)
+    engine._specialized_graphs = {"test_action": specialized}
+    engine._compile_execution_graph = MagicMock(return_value=graph)
+    engine._config_subkey_handler = MagicMock()
+    engine._validation_result_exporter = MagicMock()
+    engine._sources_provider = MagicMock()
+    engine._sources_provider.get_current_sources.return_value.hash.return_value = "test_hash"
 
-    assert len(specialized_graphs) == 0, (
-        "_specialized_graphs must be empty after source reload"
+    # Call the real method, bound to our mock instance
+    OspreyEngine._handle_updated_sources(engine)
+
+    assert len(engine._specialized_graphs) == 0, (
+        "_specialized_graphs must be empty after a successful source reload"
     )

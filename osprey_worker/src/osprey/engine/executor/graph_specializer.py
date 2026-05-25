@@ -24,19 +24,16 @@ Stable node identity: NodeKey = Tuple[str, int, int, str]
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 from osprey.engine.ast.grammar import IsConstant, Source
-from osprey.engine.ast.grammar import List as GrammarList
 from osprey.engine.ast.grammar import String
 from osprey.engine.executor.dependency_chain import DependencyChain
 from osprey.engine.executor.execution_graph import ExecutionGraph
 from osprey.engine.executor.node_executor.call_executor import CallExecutor
 from osprey.engine.stdlib.udfs.resolve_optional import ResolveOptional
-from osprey.engine.stdlib.udfs.rules import Rule
 
 if TYPE_CHECKING:
-    from osprey.engine.ast_validator.validators.collect_json_data_paths import FieldDeclaration
     from osprey.engine.schema.schema_loader import ActionSchema
 
 log = logging.getLogger(__name__)
@@ -111,34 +108,6 @@ def _resolve_optional_has_default(chain: DependencyChain) -> bool:
         return False
 
 
-def _is_rule_chain(chain: DependencyChain) -> bool:
-    """Return True if this chain's UDF is a Rule (which has when_all)."""
-    udf = _chain_udf(chain)
-    return isinstance(udf, Rule)
-
-
-def _get_when_all_dep_keys(chain: DependencyChain) -> List[NodeKey]:
-    """Return node keys for the when_all argument dependencies of a Rule chain."""
-    if not isinstance(chain.executor, CallExecutor):
-        return []
-    try:
-        dep_dict = chain.executor.unresolved_arguments.get_dependent_node_dict()
-        keys = []
-        for arg_name, node in dep_dict.items():
-            if arg_name == "when_all" or (isinstance(arg_name, str) and "when_all" in arg_name):
-                # The when_all node is a List; each item in the list is a dep
-                if isinstance(node, GrammarList):
-                    for item in node.items:
-                        span = item.span
-                        keys.append((span.source.path, span.start_line, span.start_pos, type(item).__name__))
-                else:
-                    span = node.span
-                    keys.append((span.source.path, span.start_line, span.start_pos, type(node).__name__))
-        return keys
-    except Exception:
-        return []
-
-
 def _get_all_sorted_chains(graph: ExecutionGraph) -> List[DependencyChain]:
     """Gather all sorted dependency chains from all sources in the graph."""
     chains: List[DependencyChain] = []
@@ -187,15 +156,9 @@ def specialize_graph(
     """
     absent_groups: FrozenSet[str] = schema.absent_groups
 
-    # Step 1 — collect all chains and build key maps
+    # Step 1 — collect all chains
     all_top_level_chains = _get_all_sorted_chains(full_graph)
     all_chains = _collect_all_chains_recursive(all_top_level_chains)
-
-    # Map NodeKey -> chain for propagation
-    key_to_chain: Dict[NodeKey, DependencyChain] = {}
-    for chain in all_chains:
-        key = _node_key_from_chain(chain)
-        key_to_chain[key] = chain
 
     # Step 2 — seed pruned set with absent extractors
     pruned: Set[NodeKey] = set()
@@ -212,11 +175,9 @@ def specialize_graph(
     #
     # Rule (a) — conservative when_all pruning — is intentionally omitted.
     # It was designed to prune Rule nodes when any when_all dep is pruned, but
-    # _get_when_all_dep_keys builds keys from raw GrammarList items (Name AST
-    # nodes) while `pruned` is keyed on Assign-chain nodes. The mismatch means
-    # rule (a) never matched anything and its effect was already covered by
-    # rule (c), which correctly propagates via chain.dependent_on. Removing it
-    # simplifies the code without changing observed behavior.
+    # the key mismatch (Name AST nodes vs Assign-chain keys) meant it never
+    # matched anything. Its effect is fully covered by rule (c), which correctly
+    # propagates via chain.dependent_on.
     changed = True
     while changed:
         changed = False

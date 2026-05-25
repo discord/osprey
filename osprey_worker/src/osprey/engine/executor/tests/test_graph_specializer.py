@@ -325,7 +325,7 @@ def test_specialized_graphs_cleared_on_source_reload() -> None:
     registered specialized graph must be evicted so that execute() uses the
     freshly compiled graph instead of a stale one backed by the old full_graph.
     """
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import MagicMock
 
     _, graph = _compile(
         {

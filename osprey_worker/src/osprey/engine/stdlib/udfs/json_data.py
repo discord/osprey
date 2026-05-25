@@ -1,6 +1,7 @@
 from typing import Any
 
 from osprey.engine.stdlib.udfs import json_utils
+from osprey.engine.udf.markers import JsonExtractUDFMixin
 from osprey.engine.udf.rvalue_type_checker import ExtractSecretTypeChecker, SecretTypeChecker
 
 from ._prelude import ArgumentsBase, ConstExpr, ExecutionContext, UDFBase, ValidationContext
@@ -30,7 +31,7 @@ class Arguments(ArgumentsBase):
     """
 
 
-class JsonData(UDFBase[Arguments, Any]):
+class JsonData(JsonExtractUDFMixin, UDFBase[Arguments, Any]):
     """Extract a piece of data from the action's JSON.
 
     Has a dynamic return type, so the result must be stored into a type-annotated feature.

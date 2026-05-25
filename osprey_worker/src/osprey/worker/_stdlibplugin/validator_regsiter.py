@@ -1,6 +1,7 @@
 from typing import Sequence, Type
 
 from osprey.engine.ast_validator.base_validator import BaseValidator
+from osprey.engine.ast_validator.validators.collect_json_data_paths import CollectJsonDataPaths
 from osprey.engine.ast_validator.validators.feature_name_to_entity_type_mapping import FeatureNameToEntityTypeMapping
 from osprey.engine.ast_validator.validators.imports_must_not_have_cycles import ImportsMustNotHaveCycles
 from osprey.engine.ast_validator.validators.no_unused_locals import NoUnusedLocals
@@ -33,4 +34,5 @@ def register_ast_validators() -> Sequence[Type[BaseValidator]]:
         UniqueStoredNames,
         VariablesMustBeDefined,
         ValidateDynamicCallsHaveAnnotatedRValue,
+        CollectJsonDataPaths,
     ]

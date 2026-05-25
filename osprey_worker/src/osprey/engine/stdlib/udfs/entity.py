@@ -2,6 +2,7 @@ from typing import TypeVar
 
 from osprey.engine.language_types.entities import EntityT
 from osprey.engine.language_types.osprey_invariant_generic import OspreyInvariantGeneric
+from osprey.engine.udf.markers import JsonExtractUDFMixin
 from osprey.engine.udf.rvalue_type_checker import EntityTypeChecker, RValueTypeChecker
 from osprey.engine.utils.types import cached_property
 
@@ -36,7 +37,7 @@ class EntityJsonArguments(EntityArgumentsBase, json_data.Arguments):
     pass
 
 
-class EntityJson(OspreyInvariantGeneric[_T], UDFBase[EntityJsonArguments, EntityT[_T]]):
+class EntityJson(JsonExtractUDFMixin, OspreyInvariantGeneric[_T], UDFBase[EntityJsonArguments, EntityT[_T]]):
     """
     Create an Entity based on the data located at `path`.
     """

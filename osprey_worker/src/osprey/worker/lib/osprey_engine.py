@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import time
 from typing import Callable, Dict, Generic, List, Optional, Set, Tuple, Type, TypeVar
@@ -92,6 +92,9 @@ class OspreyEngine:
         self._sources_provider.set_sources_watcher(self._handle_updated_sources)
         self._config_subkey_handler = ConfigSubkeyHandler(config_registry, self._execution_graph.validated_sources)
         self._validation_result_exporter = validation_exporter
+        # Specialized graphs for typed action contracts (§4.5 runtime dispatch)
+        # Maps action_name -> SpecializedExecutionGraph. Populated via register_specialized_graph().
+        self._specialized_graphs: Dict[str, ExecutionGraph] = {}
 
     def _compile_execution_graph(self, disable_periodic_yield: bool = False) -> ExecutionGraph:
         def _do_compile_execution_graph() -> ExecutionGraph:
@@ -203,6 +206,15 @@ class OspreyEngine:
         """Returns a mapping from 'rule name' -> 'rule description' for each feature that is a rule declaration."""
         return self._execution_graph.validated_sources.get_validator_result(RuleNameToDescriptionMapping)
 
+    def register_specialized_graph(self, action_name: str, graph: ExecutionGraph) -> None:
+        """Register a specialized execution graph for a given action name.
+
+        When execute() is called for this action_name, the specialized graph will
+        be used instead of the default graph (§4.5 runtime dispatch).
+        """
+        self._specialized_graphs[action_name] = graph
+        log.info("Registered specialized graph for action %r", action_name)
+
     def execute(
         self,
         udf_helpers: UDFHelpers,
@@ -210,9 +222,15 @@ class OspreyEngine:
         sample_rate: int = 100,
         parent_tracer_span: Optional[TracerSpan] = None,
     ) -> ExecutionResult:
-        """Given input action, execute it against the execution engine and return the result."""
+        """Given input action, execute it against the execution engine and return the result.
+
+        If a specialized graph is registered for this action (via register_specialized_graph),
+        that graph is used. Otherwise the default full graph is used (§4.5 runtime dispatch).
+        Schema-less actions incur zero overhead — dict.get is O(1).
+        """
+        graph = self._specialized_graphs.get(action.action_name, self._execution_graph)
         return execute(
-            self._execution_graph,
+            graph,
             udf_helpers,
             action,
             gevent.pool.Pool(_DEFAULT_MAX_ASYNC_PER_EXECUTION),

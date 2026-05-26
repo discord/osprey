@@ -139,6 +139,52 @@ class TestSchemaLoader:
         with pytest.raises(SchemaLoadError, match="escapes schemas directory"):
             load_schema(path, schemas_dir=tmp_path)
 
+    def test_scalar_group_flattens_to_bare_key(self, tmp_path: Path) -> None:
+        """A provides entry {"_scalar": "<type>"} must flatten to the bare group name."""
+        schema_data = dict(_VALID_SCHEMA)
+        schema_data["provides"] = {
+            "user": {"id": "int", "username": "str"},
+            "request_name": {"_scalar": "str"},
+        }
+        path = _write_schema(tmp_path, schema_data)
+        schema = load_schema(path)
+
+        # Scalar group: bare key, not dotted
+        assert schema.provides_field_types["request_name"] == "str"
+        # No dotted variant must exist
+        assert "request_name._scalar" not in schema.provides_field_types
+        # Regular group still works
+        assert schema.provides_field_types["user.id"] == "int"
+        # Group name still appears in provides_groups
+        assert "request_name" in schema.provides_groups
+
+    def test_scalar_group_in_cross_check_does_not_produce_false_unknown_field(
+        self, tmp_path: Path
+    ) -> None:
+        """A path_key of 'request_name' must match provides_field_types['request_name'].
+
+        This is a unit-level regression guard: after _scalar flattening, Check 3 in
+        CollectJsonDataPaths must NOT fire a false "unknown field" warning for scalar
+        groups.  The lookup path_key = path.removeprefix('$.') == 'request_name' must
+        find provides_field_types['request_name'], not 'request_name._scalar'.
+        """
+        schema_data = dict(_VALID_SCHEMA)
+        schema_data["provides"] = {
+            "user": {"id": "int"},
+            "request_name": {"_scalar": "str"},
+        }
+        path = _write_schema(tmp_path, schema_data)
+        schema = load_schema(path)
+
+        # Simulate what _cross_check_types does: path_key = "$.request_name".removeprefix("$.")
+        path_key = "$.request_name".removeprefix("$.")
+        declared = schema.provides_field_types.get(path_key)
+        assert declared == "str", (
+            f"Check 2 lookup for path_key={path_key!r} returned {declared!r}; "
+            "expected 'str'. Without _scalar flattening this returns None, which "
+            "would cause Check 3 to fire a false 'unknown field' warning."
+        )
+
     def test_schema_with_no_provides_and_no_absent(self, tmp_path: Path) -> None:
         minimal = {
             "$schema": "https://discord.dev/smite/action-schema/v1",

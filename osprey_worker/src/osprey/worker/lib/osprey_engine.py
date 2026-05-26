@@ -162,28 +162,39 @@ class OspreyEngine:
             log.info("Loaded %d specialized graphs from %s", loaded, schemas_dir)
 
     def _handle_updated_sources(self) -> None:
-        # noinspection PyBroadException
         try:
-            self._execution_graph = self._compile_execution_graph()
-            log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
+            new_graph = self._compile_execution_graph()
         except Exception:
             log.exception(
                 f'Failed to compile execution graph for sources={self._sources_provider.get_current_sources().hash()}'
             )
-        else:
-            # Clear stale specialized graphs — they reference the old full_graph.
-            # Must happen before any other side effects so a concurrent execute()
-            # call sees a consistent view: either the old graph or the new one,
-            # never a specialized graph backed by the replaced full graph.
-            self._specialized_graphs.clear()
-            # Reload schemas for the new graph.
-            self._load_and_register_schemas()
-            # Only do this if no exception occurred above
-            self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
-            # Confirm to the provider which sources are now live so it dedups no-op
-            # re-deliveries against what we applied; the except branch above leaves
-            # it unmarked, so a failed compile retries on the next re-delivery.
-            self._sources_provider.mark_sources_applied(self._execution_graph.validated_sources.sources.hash())
+            return  # Leave existing graph + specialized graphs intact
+
+        # Maintain dispatch-observable consistency across the graph swap.
+        # Invariant: _specialized_graphs always contains graphs backed by the
+        # CURRENT _execution_graph, or is empty.  Empty is always safe because
+        # execute() falls back to _execution_graph.
+        #
+        # Observable state transitions (sequential, no intermediate inconsistency):
+        #   (old_graph, old_specialized)   — before reload
+        #   (old_graph, {})                — after clear, before assign
+        #   (new_graph, {})                — after assign, before reload
+        #   (new_graph, new_specialized)   — after reload
+        #
+        # A concurrent execute() that sees (old_graph, {}) runs the full old graph —
+        # correct.  A concurrent execute() that sees (new_graph, {}) runs the full
+        # new graph — also correct.  The previous ordering (assign then clear) could
+        # expose (new_graph, old_specialized), which is never correct.
+        self._specialized_graphs.clear()
+        self._execution_graph = new_graph
+        log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
+
+        self._load_and_register_schemas()
+        self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
+        # Confirm to the provider which sources are now live so it dedups no-op
+        # re-deliveries against what we applied; the early return above leaves
+        # it unmarked, so a failed compile retries on the next re-delivery.
+        self._sources_provider.mark_sources_applied(self._execution_graph.validated_sources.sources.hash())
 
         # noinspection PyBroadException
         # try to send validation results, should not block osprey_engine if this fails

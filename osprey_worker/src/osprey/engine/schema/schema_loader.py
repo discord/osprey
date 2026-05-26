@@ -122,9 +122,18 @@ def load_schema(schema_path: Path, schemas_dir: Optional[Path] = None) -> Action
                 pass
 
     # Flatten provides to dot-notation field types: "user.id" -> "int"
+    # Scalar-only groups use the convention {"_scalar": "<type>"} to represent a
+    # top-level field with no sub-fields (e.g. request_name: str rather than
+    # request_name.field: str). Flatten these to the bare group name so that a
+    # JsonData extraction of "$.request_name" matches "request_name" in
+    # provides_field_types rather than the non-existent "request_name._scalar".
     provides_field_types: Dict[str, str] = {}
     for group, fields in resolved_provides.items():
         if isinstance(fields, dict):
+            if list(fields.keys()) == ["_scalar"] and isinstance(fields["_scalar"], str):
+                # Scalar group: flatten to bare group name
+                provides_field_types[group] = fields["_scalar"]
+                continue
             for field_name, field_type in fields.items():
                 if isinstance(field_type, str):
                     provides_field_types[f"{group}.{field_name}"] = field_type

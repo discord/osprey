@@ -444,6 +444,62 @@ def test_specialized_graphs_cleared_on_source_reload() -> None:
     )
 
 
+def test_specialized_graphs_cleared_before_execution_graph_assigned() -> None:
+    """Regression: _specialized_graphs must be cleared BEFORE _execution_graph is updated.
+
+    Invariant: at every observable state, _specialized_graphs either contains
+    graphs backed by the CURRENT _execution_graph, or is empty.  Empty is always
+    safe (execute() falls back to _execution_graph).
+
+    If the assign happens before the clear, a concurrent execute() could observe
+    (new_graph, old_specialized) — a specialized graph backed by the old full
+    graph, which is inconsistent.
+
+    This test captures the operation ordering sequentially by recording the value
+    of _execution_graph at the moment _specialized_graphs.clear() is called and
+    asserting it still equals the OLD graph (i.e., the clear happened before the
+    swap, not after).
+    """
+    from unittest.mock import MagicMock, call
+    from osprey.worker.lib.osprey_engine import OspreyEngine
+
+    _, old_graph = _compile({"main.sml": "UserId: int = JsonData(path='$.user.id')\n"})
+    _, new_graph = _compile({"main.sml": "UserId: int = JsonData(path='$.user.id')\n"})
+
+    engine = MagicMock(spec=OspreyEngine)
+    engine._execution_graph = old_graph
+    engine._specialized_graphs = {"test_action": MagicMock()}
+    engine._compile_execution_graph = MagicMock(return_value=new_graph)
+    engine._config_subkey_handler = MagicMock()
+    engine._validation_result_exporter = MagicMock()
+    engine._sources_provider = MagicMock()
+    engine._sources_provider.get_current_sources.return_value.hash.return_value = "h"
+
+    # Capture the value of _execution_graph at the moment clear() is called.
+    graph_at_clear_time: list = []
+    real_dict = engine._specialized_graphs
+
+    class _TrackingDict(dict):
+        def clear(self):
+            graph_at_clear_time.append(engine._execution_graph)
+            super().clear()
+
+    engine._specialized_graphs = _TrackingDict({"test_action": MagicMock()})
+
+    OspreyEngine._handle_updated_sources(engine)
+
+    assert len(graph_at_clear_time) == 1, "clear() must be called exactly once"
+    assert graph_at_clear_time[0] is old_graph, (
+        "clear() must be called while _execution_graph is still the OLD graph "
+        "(i.e., clear before assign). "
+        f"Got {graph_at_clear_time[0]!r} expected old_graph={old_graph!r}"
+    )
+    # After the call, _execution_graph must be the new graph
+    assert engine._execution_graph is new_graph, (
+        "_execution_graph must be updated to new_graph after _handle_updated_sources"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test: OSPREY_SCHEMAS_DIR bootstrap populates _specialized_graphs
 # ---------------------------------------------------------------------------

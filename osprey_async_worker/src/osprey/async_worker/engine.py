@@ -8,6 +8,7 @@ Provides async execute() that calls the async executor directly.
 import asyncio
 import gc
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import time
@@ -38,7 +39,9 @@ from osprey.engine.ast_validator.validators.validate_static_types import (
 from osprey.engine.config.config_subkey_handler import ConfigSubkeyHandler, ModelT
 from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execution_graph
+from osprey.engine.executor.graph_specializer import specialize_graph
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
+from osprey.engine.schema.schema_loader import SchemaLoadError, load_schema_for_action
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.worker.lib.instruments import metrics
@@ -104,7 +107,14 @@ class AsyncOspreyEngine:
         self._sources_provider.set_sources_watcher(self._handle_updated_sources)
         self._config_subkey_handler = ConfigSubkeyHandler(config_registry, self._execution_graph.validated_sources)
         self._validation_result_exporter = validation_exporter
+        # Specialized graphs for typed action contracts (§4.5 runtime dispatch).
+        # Maps action_name -> SpecializedExecutionGraph.  Populated via
+        # register_specialized_graph() during init + every source reload.
+        self._specialized_graphs: Dict[str, ExecutionGraph] = {}
+        self._load_and_register_schemas()
         # Freeze the boot graph out of gen-2 GC (see _freeze_resident_graph).
+        # Runs AFTER schema load so the specialized graphs are frozen into the
+        # permanent generation too (mirrors the reload path ordering).
         self._freeze_resident_graph()
 
     def _compile_execution_graph_sync(self, yield_during_compile: bool = True) -> ExecutionGraph:
@@ -197,7 +207,14 @@ class AsyncOspreyEngine:
         # memoizes ast_root by Source content, so unchanged source files share
         # the same ast_root between graphs. Nulling parents on shared nodes
         # would corrupt the new graph's AST.
+        #
+        # Typed-action-contracts dispatch order (mirrors osprey_engine.py):
+        # _specialized_graphs is cleared BEFORE _execution_graph is swapped,
+        # so any in-flight execute() observes one of the consistent states:
+        #   (old, old_specialized) → (old, {}) → (new, {}) → (new, new_specialized)
+        # and never (new_graph, stale_specialized_backed_by_old_graph).
         old_graph = self._execution_graph
+        self._specialized_graphs.clear()
         self._execution_graph = new_graph
 
         # Confirm to the provider which sources are now actually live so it dedups
@@ -207,6 +224,10 @@ class AsyncOspreyEngine:
         self._sources_provider.mark_sources_applied(new_graph.validated_sources.sources.hash())
 
         log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
+
+        # Reload typed-action-contracts specialized graphs against the new full graph.
+        self._load_and_register_schemas()
+
         self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
 
         if self._validation_result_exporter is not None:
@@ -276,6 +297,46 @@ class AsyncOspreyEngine:
     def config(self) -> SourcesConfig:
         return self._execution_graph.validated_sources.sources.config
 
+    def register_specialized_graph(self, action_name: str, graph: ExecutionGraph) -> None:
+        """Register a specialized execution graph for a given action name.
+
+        When execute() is called for this action_name, the specialized graph
+        will be used instead of the default graph (§4.5 runtime dispatch).
+        Mirrors OspreyEngine.register_specialized_graph in the gevent variant.
+        """
+        self._specialized_graphs[action_name] = graph
+        log.info("Registered specialized graph for action %r", action_name)
+
+    def _load_and_register_schemas(self) -> None:
+        """Read schemas from $OSPREY_SCHEMAS_DIR and register specialized graphs.
+
+        Called after every compilation (init + reload). No-op if env var unset
+        or directory empty/missing. Mirrors OspreyEngine._load_and_register_schemas.
+        """
+        schemas_dir_str = os.environ.get("OSPREY_SCHEMAS_DIR", "")
+        if not schemas_dir_str:
+            return
+        schemas_dir = Path(schemas_dir_str)
+        if not schemas_dir.is_dir():
+            log.warning("OSPREY_SCHEMAS_DIR=%r is not a directory; skipping schema load", schemas_dir_str)
+            return
+
+        action_names = self.get_known_action_names()
+        loaded = 0
+        for action_name in action_names:
+            try:
+                schema = load_schema_for_action(action_name, schemas_dir)
+            except SchemaLoadError as e:
+                log.warning("Failed to load schema for %s: %s", action_name, e)
+                continue
+            if schema is None:
+                continue
+            specialized = specialize_graph(self._execution_graph, schema)
+            self.register_specialized_graph(action_name, specialized)
+            loaded += 1
+        if loaded:
+            log.info("Loaded %d specialized graphs from %s", loaded, schemas_dir)
+
     async def execute(
         self,
         udf_helpers: UDFHelpers,
@@ -289,8 +350,12 @@ class AsyncOspreyEngine:
             max_concurrent = CONFIG.instance().get_int(
                 'OSPREY_MAX_ASYNC_PER_EXECUTION', _DEFAULT_MAX_ASYNC_PER_EXECUTION
             )
+        # Typed-action-contracts dispatch: pick the specialized graph if one is
+        # registered for this action_name, otherwise fall back to the default
+        # full graph.  Schema-less actions incur zero overhead — dict.get is O(1).
+        graph = self._specialized_graphs.get(action.action_name, self._execution_graph)
         return await async_execute(
-            self._execution_graph,
+            graph,
             udf_helpers,
             action,
             max_concurrent=max_concurrent,

@@ -136,6 +136,10 @@ class OspreyEngine:
         else:
             # Only do this if no exception occurred above
             self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
+            # Confirm to the provider which sources are now live so it dedups no-op
+            # re-deliveries against what we applied; the except branch above leaves
+            # it unmarked, so a failed compile retries on the next re-delivery.
+            self._sources_provider.mark_sources_applied(self._execution_graph.validated_sources.sources.hash())
 
         # noinspection PyBroadException
         # try to send validation results, should not block osprey_engine if this fails

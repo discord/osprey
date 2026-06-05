@@ -25,6 +25,16 @@ class BaseSourcesProvider(abc.ABC):
     def set_sources_watcher(self, callback: SourcesWatcherCallback) -> None:
         raise NotImplementedError
 
+    def mark_sources_applied(self, sources_hash: str) -> None:
+        """Notify the provider that the consumer (engine) has successfully applied
+        the sources identified by ``sources_hash``.
+
+        Providers that dedup repeated etcd deliveries use this to track what was
+        actually *applied* rather than merely *received*, so a recompile that
+        fails or is dropped self-heals on the next re-delivery instead of being
+        suppressed. Default: no-op (providers without dedup need not track it)."""
+        return None
+
 
 class StaticSourcesProvider(BaseSourcesProvider):
     """Provides a static sources that won't change for the lifetime of the provider."""

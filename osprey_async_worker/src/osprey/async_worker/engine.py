@@ -197,6 +197,12 @@ class AsyncOspreyEngine:
         old_graph = self._execution_graph
         self._execution_graph = new_graph
 
+        # Confirm to the provider which sources are now actually live so it dedups
+        # future no-op re-deliveries against what we APPLIED (not just received).
+        # The compile-failure path above returns early without marking, so a
+        # transient failure self-heals on the next etcd re-delivery.
+        self._sources_provider.mark_sources_applied(new_graph.validated_sources.sources.hash())
+
         log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
         self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
 

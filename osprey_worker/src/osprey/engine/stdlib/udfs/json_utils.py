@@ -76,7 +76,11 @@ def get_from_data(
                 try:
                     return rvalue_type_checker.coerce(value)
                 except (TypeError, ValueError):
-                    pass  # fallthrough to below InvalidJsonType
+                    # Coercion failed. For a non-required field, treat a present-but-uncoercible
+                    # value the same as a missing one (skip dependents quietly) rather than
+                    # raising a noisy InvalidJsonType. Required fields still fail loudly below.
+                    if not required:
+                        raise ExpectedUdfException() from None
             raise InvalidJsonType(str(expr), rvalue_type_checker.to_typing_type(), type(value))
 
     return value

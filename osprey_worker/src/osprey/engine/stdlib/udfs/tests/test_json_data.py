@@ -75,3 +75,32 @@ def test_execute_coerce_type(execute: ExecuteFunction) -> None:
     )
 
     assert data == {'Foo': 123, 'Bar': None, 'Foo2': 123}
+
+
+@pytest.mark.parametrize('bad_value', ['267000.0', '', 'not-a-number'])
+def test_execute_uncoercible_optional_treated_as_absent(
+    execute_with_result: ExecuteWithResultFunction, bad_value: str
+) -> None:
+    """A present-but-uncoercible value on a non-required field is treated like a missing one
+    (no error reported), instead of raising a noisy InvalidJsonType.
+
+    Regression for the most frequent rules-sink error (client_build_number sent as a non-int
+    string such as a float-formatted, empty, or non-numeric value).
+    """
+    result = execute_with_result(
+        "Foo: Optional[int] = JsonData(path='$.foo', coerce_type=True, required=False)",
+        data={'foo': bad_value},
+    )
+    assert not result.error_infos, (bad_value, result.error_infos)
+    assert result.extracted_features['Foo'] is None
+
+
+def test_execute_uncoercible_required_still_raises(execute_with_result: ExecuteWithResultFunction) -> None:
+    """A `required` field still raises InvalidJsonType for an uncoercible value — only
+    non-required fields degrade to absent."""
+    result = execute_with_result(
+        "Foo: int = JsonData(path='$.foo', coerce_type=True, required=True)",
+        data={'foo': 'not-a-number'},
+    )
+    assert len(result.error_infos) == 1, result.error_infos
+    assert '$.foo' in str(result.error_infos[0].error)

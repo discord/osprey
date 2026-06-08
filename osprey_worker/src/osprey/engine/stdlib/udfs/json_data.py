@@ -17,14 +17,16 @@ class Arguments(ArgumentsBase):
     required: bool = True
     """Whether or not the value is required to be in the action data.
 
-    Defaults to `True`. If `False`, will gracefully handle both missing and present-but-null values.
+    Defaults to `True`. If `False`, will gracefully handle missing, present-but-null, and
+    (when `coerce_type` is set) present-but-uncoercible values by skipping dependent nodes.
     """
 
     coerce_type: bool = True
     """Whether to attempt to convert the value to the expected type.
 
     By default `JsonData` will attempt to coerce the value to the declared type (e.g., parse a number from a string).
-    If coercion fails, it still raises `InvalidJsonType`. Set to `False` to require exact type matches.
+    If coercion fails on a `required` field it raises `InvalidJsonType`; on a non-required field the value is
+    treated as absent. Set to `False` to require exact type matches.
     """
 
 

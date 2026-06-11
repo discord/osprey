@@ -198,6 +198,13 @@ class ExecutionContext:
                 return None
             else:
                 raise NodeFailurePropagationException()
+        except KeyError:
+            if self._execution_graph.is_pruned_node(node):
+                if return_none_for_failed_values:
+                    return None
+                else:
+                    raise NodeFailurePropagationException()
+            raise
 
     def get_name_node(self, name: Name) -> ASTNode:
         """Returns the node that is responsible for resolving a given Loaded name."""

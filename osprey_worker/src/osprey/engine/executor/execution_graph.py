@@ -84,6 +84,10 @@ class ExecutionGraph:
         """Whether we need to unwrap the value that is represented by this node before using it."""
         return id(node) in self._nodes_to_unwrap
 
+    def is_pruned_node(self, node: 'ASTNode') -> bool:
+        """Whether this node's chain was pruned. Always False for a full graph; SpecializedExecutionGraph overrides."""
+        return False
+
     def _get_executor_for(self, node: ASTNode) -> 'BaseNodeExecutor[Any, Any]':
         return self._node_executor_registry.construct_executor_for(node, validated_sources=self._validated_sources)
 

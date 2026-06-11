@@ -18,16 +18,28 @@ import pytest
 from osprey.engine.ast.sources import Sources
 from osprey.engine.ast_validator import validate_sources
 from osprey.engine.ast_validator.validator_registry import ValidatorRegistry
-from osprey.engine.executor.execution_context import Action
+from osprey.engine.ast_validator.validators.feature_name_to_entity_type_mapping import (
+    FeatureNameToEntityTypeMapping,
+)
+from osprey.engine.executor.execution_context import (
+    Action,
+    ExecutionContext,
+    NodeFailurePropagationException,
+)
 from osprey.engine.executor.execution_graph import compile_execution_graph
 from osprey.engine.executor.executor import execute
 from osprey.engine.executor.graph_specializer import (
     SpecializedExecutionGraph,
+    _collect_all_chains_recursive,
     _get_all_sorted_chains,
     _get_top_level_group,
     _node_key_from_chain,
     specialize_graph,
 )
+from osprey.engine.stdlib.udfs._prelude import ArgumentsBase, UDFBase
+from osprey.engine.stdlib.udfs.categories import UdfCategories
+from osprey.engine.stdlib.udfs.rules import Rule, WhenRules
+from osprey.engine.stdlib.udfs.verdicts import DeclareVerdict
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
 from osprey.engine.schema.schema_loader import ActionSchema
 from osprey.engine.stdlib import get_config_registry
@@ -37,7 +49,6 @@ from osprey.engine.stdlib.udfs.import_ import Import
 from osprey.engine.stdlib.udfs.json_data import JsonData
 from osprey.engine.stdlib.udfs.require import Require
 from osprey.engine.stdlib.udfs.resolve_optional import ResolveOptional
-from osprey.engine.stdlib.udfs.rules import Rule
 from osprey.engine.ast_validator.validators.imports_must_not_have_cycles import ImportsMustNotHaveCycles
 from osprey.engine.ast_validator.validators.unique_stored_names import UniqueStoredNames
 from osprey.engine.ast_validator.validators.validate_call_kwargs import ValidateCallKwargs
@@ -51,6 +62,11 @@ from osprey.engine.udf.registry import UDFRegistry
 # Minimal UDF registry without postgres-backed UDFs (no POSTGRES_HOSTS needed)
 _TEST_REGISTRY = UDFRegistry.with_udfs(
     JsonData, EntityJson, Import, Require, GetActionName, ResolveOptional, Rule
+)
+
+# Effect-aware registry: adds WhenRules/DeclareVerdict so effect sinks are present
+_EFFECT_REGISTRY = UDFRegistry.with_udfs(
+    JsonData, EntityJson, Import, Require, GetActionName, ResolveOptional, Rule, WhenRules, DeclareVerdict
 )
 
 
@@ -106,6 +122,35 @@ def _run_graph(graph, data: Dict[str, Any], action_name: str = "test_action") ->
     )
     result = execute(graph, UDFHelpers(), action, gevent.pool.Pool(4))
     return result.extracted_features
+
+
+def _run_graph_full_result(graph, data: Dict[str, Any], action_name: str = "test_action"):
+    """Like _run_graph but returns the full ExecutionResult (for inspecting effects/errors)."""
+    action = Action(
+        action_id=1,
+        action_name=action_name,
+        data=data,
+        timestamp=datetime.utcnow(),
+    )
+    return execute(graph, UDFHelpers(), action, gevent.pool.Pool(4))
+
+
+def _compile_effect(sources_dict: Dict[str, str]):
+    """Compile with the effect-aware registry (adds WhenRules/DeclareVerdict)."""
+    sources = Sources.from_dict({k: dedent(v) for k, v in sources_dict.items()})
+    registry = ValidatorRegistry.from_validator_classes([
+        ValidateCallKwargs,
+        ValidateDynamicCallsHaveAnnotatedRValue,
+        ImportsMustNotHaveCycles,
+        UniqueStoredNames,
+        VariablesMustBeDefined,
+        ValidateStaticTypes,
+        FeatureNameToEntityTypeMapping,
+        get_config_registry().get_validator(),
+    ])
+    validated = validate_sources(sources, _EFFECT_REGISTRY, registry)
+    graph = compile_execution_graph(validated)
+    return validated, graph
 
 
 # ---------------------------------------------------------------------------
@@ -628,3 +673,156 @@ def test_load_and_register_schemas_noop_when_env_unset() -> None:
         OspreyEngine._load_and_register_schemas(engine)
 
     engine.register_specialized_graph.assert_not_called()
+
+
+# ===========================================================================
+# Pruned-node = failed-node semantics (Hole A + B + guard)
+# ===========================================================================
+
+
+def test_pruned_rule_in_whenrules_any_does_not_kill_live_rules() -> None:
+    """Hole A: a pruned Rule in rules_any must not KeyError and kill co-listed live rules.
+
+    Before the fix: WhenRules.resolve_arguments calls resolved(dead_rule_name,
+    return_none_for_failed_values=True). The dead Rule's Assign chain was pruned
+    (never executed) → KeyError → whole WhenRules block aborted.
+
+    After the fix: KeyError on a pruned node is caught and treated as a failed
+    node (returns None since return_none_for_failed_values=True). The live Rule
+    is still resolved, fires, and its effect is applied.
+    """
+    _, graph = _compile_effect(
+        {
+            'main.sml': """
+            AbsentId: int = JsonData(path='$.absent.id')
+            PresentId: int = JsonData(path='$.user.id')
+            IsAbsentHigh: bool = AbsentId > 0
+            IsPresentHigh: bool = PresentId > 0
+            DeadRule = Rule(when_all=[IsAbsentHigh], description='absent-dep rule')
+            LiveRule = Rule(when_all=[IsPresentHigh], description='present-dep rule')
+            WhenRules(rules_any=[DeadRule, LiveRule], then=[DeclareVerdict(verdict="live")])
+            """,
+        }
+    )
+    schema = _make_schema(provides={'user': {'id': 'int'}}, absent=['absent'])
+    specialized = specialize_graph(graph, schema)
+
+    # DeadRule must be pruned (absent dep); LiveRule must NOT be.
+    assert specialized.pruned_count > 0
+
+    payload = {'user': {'id': 42}}
+
+    # Full graph: IsAbsentHigh fails (absent key), DeadRule doesn't fire.
+    # LiveRule fires (PresentId=42 > 0). Verdict "live" must be emitted.
+    full_result = _run_graph_full_result(graph, payload)
+    full_verdicts = [v.verdict for v in full_result.verdicts]
+
+    # Specialized graph: DeadRule is pruned. LiveRule should still fire.
+    # KeyError from resolving the pruned DeadRule must be treated as failure,
+    # not a crash.
+    spec_result = _run_graph_full_result(specialized, payload)
+    spec_verdicts = [v.verdict for v in spec_result.verdicts]
+
+    # No KeyError-class error in the error_infos.
+    for ei in spec_result.error_infos:
+        assert not isinstance(ei.error, KeyError), (
+            f'KeyError for pruned rule leaked into error_infos: {ei.error}'
+        )
+    assert spec_verdicts == ['live'], (
+        f'LiveRule should have fired verdict "live"; got {spec_verdicts}'
+    )
+    # Both graphs agree on the verdict (full graph also fires LiveRule).
+    assert full_verdicts == spec_verdicts
+
+
+def test_nested_when_all_expression_with_pruned_dep_fails_gracefully() -> None:
+    """Hole B: a surviving BooleanOperation whose dep was pruned must resolve gracefully.
+
+    A Rule's when_all item is a compound `and` expression: one operand depends on
+    an absent-group extractor (pruned), the other on a present-group extractor (live).
+    By rule (c) the BooleanOperation survives (one live dep). At runtime it calls
+    resolved(absent_dep_node, return_none_for_failed_values=True) which would
+    KeyError before the fix.
+
+    After the fix: the KeyError is caught, the pruned dep resolves to None,
+    all([None, True]) = False, the Rule doesn't fire — same as the full graph
+    (where the absent field is missing, causing the extractor to fail, also
+    making the compound condition False).
+    """
+    _, graph = _compile_effect(
+        {
+            'main.sml': """
+            AbsentId: int = JsonData(path='$.absent.id')
+            PresentId: int = JsonData(path='$.user.id')
+            IsAbsentHigh: bool = AbsentId > 0
+            IsPresentHigh: bool = PresentId > 0
+            CompoundCond: bool = IsAbsentHigh and IsPresentHigh
+            TestRule = Rule(when_all=[CompoundCond], description='compound rule')
+            WhenRules(rules_any=[TestRule], then=[DeclareVerdict(verdict="compound")])
+            """,
+        }
+    )
+    schema = _make_schema(provides={'user': {'id': 'int'}}, absent=['absent'])
+    specialized = specialize_graph(graph, schema)
+
+    payload = {'user': {'id': 42}}
+
+    # Full graph: absent field missing → IsAbsentHigh fails → CompoundCond = False
+    # → TestRule doesn't fire → no verdict.
+    full_result = _run_graph_full_result(graph, payload)
+    full_verdicts = [v.verdict for v in full_result.verdicts]
+    assert full_verdicts == [], f'Full graph should emit no verdicts; got {full_verdicts}'
+
+    # Specialized graph: IsAbsentHigh chain pruned. CompoundCond survives (IsPresentHigh live).
+    # BooleanOperation resolves IsAbsentHigh → None (pruned) → all([None, True]) = False
+    # → TestRule doesn't fire → no verdict. No crash.
+    spec_result = _run_graph_full_result(specialized, payload)
+    spec_verdicts = [v.verdict for v in spec_result.verdicts]
+
+    for ei in spec_result.error_infos:
+        assert not isinstance(ei.error, KeyError), (
+            f'KeyError for pruned dep leaked into error_infos: {ei.error}'
+        )
+    assert spec_verdicts == [], (
+        f'Specialized graph should emit no verdicts (compound cond False); got {spec_verdicts}'
+    )
+
+    # Present-group features must be identical in both graphs.
+    full_features = _run_graph(graph, payload)
+    spec_features = _run_graph(specialized, payload)
+    assert full_features.get('PresentId') == spec_features.get('PresentId') == 42
+
+
+def test_resolved_keyerror_for_non_pruned_node_still_raises() -> None:
+    """Guard: KeyError for a non-pruned node must not be swallowed by the fix.
+
+    If resolved() gets a KeyError for a node that is NOT in the pruned set, it is
+    a real engine bug (a node was never executed). The fix must re-raise that
+    KeyError unchanged so the bug stays loud and diagnosable.
+    """
+    _, graph = _compile(
+        {
+            'main.sml': """
+            UserId: int = JsonData(path='$.user.id')
+            """,
+        }
+    )
+    # Full (non-specialized) graph — no nodes are pruned.
+    action = Action(
+        action_id=1, action_name='test_action', data={'user': {'id': 1}}, timestamp=datetime.utcnow()
+    )
+    ctx = ExecutionContext(graph, action, UDFHelpers())
+
+    # Get an ASTNode from the graph that was never executed (never set via set_resolved_value).
+    # Use the first chain's executor node — it is NOT in _resolved_node_values yet.
+    all_chains = _collect_all_chains_recursive(_get_all_sorted_chains(graph))
+    assert all_chains, 'Expected at least one chain'
+    never_executed_node = all_chains[0].executor.node
+
+    # The full graph's is_pruned_node is always False.
+    assert not graph.is_pruned_node(never_executed_node)
+
+    # resolved() on a non-pruned, never-executed node must raise KeyError, not
+    # NodeFailurePropagationException — the fix must not mask real bugs.
+    with pytest.raises(KeyError):
+        ctx.resolved(never_executed_node, return_none_for_failed_values=False)

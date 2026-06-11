@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, FrozenSet, List, Optional, Sequence, Set, Tuple
 
-from osprey.engine.ast.grammar import IsConstant, List as GrammarList, Source
+from osprey.engine.ast.grammar import ASTNode, IsConstant, List as GrammarList, Source
 from osprey.engine.ast.grammar import String
 from osprey.engine.executor.dependency_chain import DependencyChain
 from osprey.engine.executor.execution_graph import ExecutionGraph
@@ -49,11 +49,15 @@ log = logging.getLogger(__name__)
 NodeKey = Tuple[str, int, int, str]
 
 
-def _node_key_from_chain(chain: DependencyChain) -> NodeKey:
-    """Compute stable node key from a DependencyChain."""
-    node = chain.executor.node
+def _node_key_from_node(node: ASTNode) -> NodeKey:
+    """Compute stable node key from an ASTNode directly."""
     span = node.span
     return (span.source.path, span.start_line, span.start_pos, type(node).__name__)
+
+
+def _node_key_from_chain(chain: DependencyChain) -> NodeKey:
+    """Compute stable node key from a DependencyChain."""
+    return _node_key_from_node(chain.executor.node)
 
 
 def _chain_udf(chain: DependencyChain) -> Optional[object]:
@@ -344,6 +348,10 @@ class SpecializedExecutionGraph(ExecutionGraph):
             for chain in original
             if _node_key_from_chain(chain) not in self._pruned_keys
         ]
+
+    def is_pruned_node(self, node: ASTNode) -> bool:
+        """True if this node's chain was pruned by this specialization."""
+        return _node_key_from_node(node) in self._pruned_keys
 
     @property
     def pruned_count(self) -> int:

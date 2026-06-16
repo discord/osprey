@@ -42,8 +42,12 @@ class AsyncMultiOutputSink(AsyncBaseOutputSink):
         if tasks:
             await asyncio.gather(*tasks)
 
-    def _record_failure(self, sink: AsyncBaseOutputSink, sink_name: str) -> None:
-        """Bump the consecutive-failure count and open the circuit if it crosses the threshold."""
+    def _record_failure(self, sink: AsyncBaseOutputSink, sink_name: str) -> bool:
+        """Bump the consecutive-failure count; open the circuit if it crosses the threshold.
+
+        Returns True if the circuit is now open, so the caller can stop retrying
+        immediately rather than holding the stream for the rest of the budget.
+        """
         key = id(sink)
         failures = self._consecutive_failures.get(key, 0) + 1
         self._consecutive_failures[key] = failures
@@ -57,6 +61,8 @@ class AsyncMultiOutputSink(AsyncBaseOutputSink):
                 f'shedding pushes for {sink.circuit_breaker_cooldown_seconds}s'
             )
             metrics.increment('output_sink.circuit_opened', tags=[f'sink:{sink_name}'])
+            return True
+        return False
 
     async def _push_one(self, sink: AsyncBaseOutputSink, result: ExecutionResult) -> None:
         """Push to a single sink with timeout, bounded retry, and circuit breaking.
@@ -86,20 +92,25 @@ class AsyncMultiOutputSink(AsyncBaseOutputSink):
                 async with asyncio.timeout(min(sink.timeout, remaining)):
                     await sink.push(result)
                 metrics.timing('handled_message_output', (loop.time() - start) * 1000, tags=[f'sink:{sink_name}'])
-                self._consecutive_failures[key] = 0  # success closes the circuit
+                # Success fully closes the circuit — clear both the failure count
+                # and any open-until set by an earlier attempt or a concurrent push.
+                self._consecutive_failures[key] = 0
+                self._circuit_open_until.pop(key, None)
                 return
             except TimeoutError:
                 logger.warning(f'Timeout pushing to {sink_name} (attempt {attempt}/{attempts})')
                 metrics.increment('output_sink.timeout', tags=[f'sink:{sink_name}'])
-                self._record_failure(sink, sink_name)
+                opened = self._record_failure(sink, sink_name)
                 if attempt == attempts:
                     metrics.increment('output_sink.timeout_exhausted', tags=[f'sink:{sink_name}'])
+                if opened:
+                    break  # circuit just opened — shed rather than hold the stream
             except Exception as exc:
                 logger.exception(f'Error pushing to {sink_name}: {exc}')
                 metrics.increment('output_sink.error', tags=[f'sink:{sink_name}', f'error:{exc.__class__.__name__}'])
-                self._record_failure(sink, sink_name)
-                if attempt == attempts:
-                    break
+                opened = self._record_failure(sink, sink_name)
+                if opened or attempt == attempts:
+                    break  # circuit just opened (shed) or retries exhausted
                 # Bounded backoff that never sleeps past the total push budget.
                 backoff = min(0.5 * attempt, sink.max_backoff_seconds)
                 if loop.time() + backoff >= deadline:

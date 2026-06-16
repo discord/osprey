@@ -310,3 +310,61 @@ async def test_total_push_budget_bounds_retry_time():
     elapsed = asyncio.get_running_loop().time() - start
 
     assert elapsed < 1.0  # budget (0.05s) stopped it well short of the uncapped time
+
+
+@pytest.mark.asyncio
+async def test_circuit_opens_mid_push_stops_retrying():
+    """A retry-enabled sink stops retrying the instant the breaker opens, mid-push."""
+
+    class RetryingFailingSink(CountingFailingSink):
+        max_retries = 5  # would be 6 attempts if the breaker didn't cut it short
+        circuit_breaker_threshold = 3
+
+    sink = RetryingFailingSink()
+    multi = AsyncMultiOutputSink([sink])
+
+    await multi.push(_make_result())
+
+    # The 3rd consecutive failure opens the circuit; remaining retries are shed
+    # instead of holding the stream for the rest of max_total_push_seconds.
+    assert sink.push_count == 3
+
+
+@pytest.mark.asyncio
+async def test_success_clears_circuit_open_state():
+    """A successful push clears the open-until entry, fully closing the circuit."""
+
+    class FlakySink(AsyncBaseOutputSink):
+        circuit_breaker_threshold = 2
+        circuit_breaker_cooldown_seconds = 0.02
+
+        def __init__(self):
+            self.push_count = 0
+            self.fail = True
+
+        def will_do_work(self, result: ExecutionResult) -> bool:
+            return True
+
+        async def push(self, result: ExecutionResult) -> None:
+            self.push_count += 1
+            if self.fail:
+                raise RuntimeError('down')
+
+        async def stop(self) -> None:
+            pass
+
+    sink = FlakySink()
+    multi = AsyncMultiOutputSink([sink])
+    key = id(sink)
+
+    await multi.push(_make_result())  # fail 1
+    await multi.push(_make_result())  # fail 2 -> opens
+    assert key in multi._circuit_open_until
+
+    await asyncio.sleep(0.03)  # cooldown elapses
+    sink.fail = False
+    await multi.push(_make_result())  # half-open probe succeeds
+
+    # Success must fully close the circuit, not just reset the failure count.
+    assert key not in multi._circuit_open_until
+    assert multi._consecutive_failures[key] == 0

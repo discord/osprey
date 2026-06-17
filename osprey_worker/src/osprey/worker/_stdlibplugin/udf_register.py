@@ -25,7 +25,7 @@ from osprey.engine.stdlib.udfs.phone_country import PhoneCountry
 from osprey.engine.stdlib.udfs.phone_prefix import PhonePrefix
 from osprey.engine.stdlib.udfs.random_bool import RandomBool
 from osprey.engine.stdlib.udfs.random_int import RandomInt
-from osprey.engine.stdlib.udfs.regex_match import RegexMatch, RegexMatchMap
+from osprey.engine.stdlib.udfs.regex_match import RegexMatch, RegexMatchMap, TokensNear
 from osprey.engine.stdlib.udfs.require import Require
 from osprey.engine.stdlib.udfs.resolve_optional import ResolveOptional
 from osprey.engine.stdlib.udfs.rules import Rule, WhenRules
@@ -103,6 +103,7 @@ def register_udfs() -> Sequence[Type[UDFBase[Any, Any]]]:
         RandomInt,
         RegexMatch,
         RegexMatchMap,
+        TokensNear,
         Require,
         ResolveOptional,
         Rule,

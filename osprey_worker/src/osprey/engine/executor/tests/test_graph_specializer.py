@@ -385,6 +385,37 @@ def test_misclassified_absent_feeding_enforcement_rule_drops_verdict() -> None:
         assert not isinstance(ei.error, KeyError), f'KeyError leaked: {ei.error}'
 
 
+def test_mixed_and_or_outer_node_survives_when_inner_pruned() -> None:
+    """C1 regression: `A and B or C` compiles to an Or node and an And node that
+    share (source, start_line, start_pos) — a structural NodeKey collides between
+    them. If the And subtree reads an absent group (pruned) but the Or has a live
+    branch (C present), the Or MUST survive. A structural key wrongly prunes the
+    Or (it matches the And's pruned key) and silently drops the feature/verdict.
+    Node identity must be collision-free (id()-based)."""
+    _, graph = _compile(
+        {
+            "main.sml": """
+            AbsentA: bool = JsonData(path='$.absent.a', required=False)
+            AbsentB: bool = JsonData(path='$.absent.b', required=False)
+            PresentLow: bool = JsonData(path='$.user.c', required=False)
+            Cond: bool = AbsentA and AbsentB or PresentLow
+            """,
+        }
+    )
+    schema = _make_schema(provides={"user": {"c": "bool"}}, absent=["absent"])
+    specialized = specialize_graph(graph, schema)
+    payload = {"user": {"c": True}}  # absent group genuinely absent; C present and live
+
+    full = _run_graph(graph, payload)
+    spec = _run_graph(specialized, payload)
+    assert full.get("Cond") is True, f"full graph Cond should be True; got {full.get('Cond')!r}"
+    # The Or (outer) must NOT be pruned just because the And (inner) was.
+    assert "Cond" in spec, "Cond was silently dropped — outer Or wrongly pruned (NodeKey collision)"
+    assert spec.get("Cond") == full.get("Cond"), (
+        f"Cond diverged: full={full.get('Cond')!r} spec={spec.get('Cond')!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test: idempotent across runs
 # ---------------------------------------------------------------------------
@@ -409,27 +440,26 @@ def test_idempotent_across_runs() -> None:
 # Test: stable node keys survive rewrite
 # ---------------------------------------------------------------------------
 
-def test_stable_node_keys_survive_rewrite() -> None:
+def test_node_keys_are_collision_free_identity() -> None:
+    """Node keys are id()-based: int, and unique per distinct AST node — including
+    the `A and B or C` case whose Or/And nodes share line+col (structural keys
+    collided there; see test_mixed_and_or_outer_node_survives_when_inner_pruned)."""
     _, graph = _compile(
         {
             "main.sml": """
             UserId: int = JsonData(path='$.user.id')
+            Mixed: bool = UserId == 1 and UserId == 2 or UserId == 3
             """,
         }
     )
-    chains = _get_all_sorted_chains(graph)
+    chains = _collect_all_chains_recursive(_get_all_sorted_chains(graph))
     assert len(chains) > 0
     keys = [_node_key_from_chain(c) for c in chains]
-    # Keys must be 4-tuples
     for key in keys:
-        assert len(key) == 4
-        source_path, start_line, start_pos, class_name = key
-        assert isinstance(source_path, str)
-        assert isinstance(start_line, int)
-        assert isinstance(start_pos, int)
-        assert isinstance(class_name, str)
-    # Keys must be unique for distinct chains
-    assert len(set(keys)) == len(keys)
+        assert isinstance(key, int)
+    # One key per distinct underlying node object (id() never collides).
+    distinct_nodes = {id(c.executor.node) for c in chains}
+    assert len(set(keys)) == len(distinct_nodes)
 
 
 # ---------------------------------------------------------------------------
@@ -455,8 +485,12 @@ def test_conservative_when_all_prunes_rule_when_any_dep_pruned() -> None:
     # SomeRule depends only on IsTargetHigh → pruned (rule c).
     # All three chains must be in the pruned set.
     pruned_keys = specialized._pruned_keys
-    rule_assign_keys = [k for k in pruned_keys if k[3] == "Assign"]
-    assert len(rule_assign_keys) > 0, "Expected at least one Assign (Rule) chain to be pruned"
+    pruned_classes = [
+        type(c.executor.node).__name__
+        for c in _collect_all_chains_recursive(_get_all_sorted_chains(graph))
+        if _node_key_from_chain(c) in pruned_keys
+    ]
+    assert "Assign" in pruned_classes, "Expected at least one Assign (Rule) chain to be pruned"
     assert specialized.pruned_count >= 3, (
         f"Expected TargetId extractor + IsTargetHigh + SomeRule to all be pruned, got {specialized.pruned_count}"
     )
@@ -540,8 +574,12 @@ def test_resolve_optional_rescue_scoped_to_dep_tree() -> None:
         f"got {specialized.pruned_count}: {pruned_keys}"
     )
     # All pruned chains should be Assign or Call (not the ResolveOptional chain).
-    for k in pruned_keys:
-        assert k[3] in ("Assign", "Call", "Boolean"), f"Unexpected pruned key type: {k}"
+    pruned_classes = {
+        type(c.executor.node).__name__
+        for c in _collect_all_chains_recursive(_get_all_sorted_chains(graph))
+        if _node_key_from_chain(c) in pruned_keys
+    }
+    assert pruned_classes <= {"Assign", "Call", "Boolean"}, f"Unexpected pruned node types: {pruned_classes}"
     # Execution must succeed and return the default for TargetIdOrZero.
     result = _run_graph(specialized, {"user": {"id": 1}})
     assert result.get("TargetIdOrZero") == 0

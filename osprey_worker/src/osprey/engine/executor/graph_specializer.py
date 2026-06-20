@@ -24,13 +24,12 @@ Pruning rules (per §4.4 of the typed-action-contracts plan):
          pruning of their parent, since they are always computable.
   3. Surviving chains are assembled into a SpecializedExecutionGraph.
 
-Stable node identity: NodeKey = Tuple[str, int, int, str]
-  = (source_path, span.start_line, span.start_pos, ast_node_class_name)
+Node identity: NodeKey = id(ast_node) — collision-free (see NodeKey definition).
 """
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, FrozenSet, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, FrozenSet, List, Optional, Sequence, Set
 
 from osprey.engine.ast.grammar import ASTNode, IsConstant, List as GrammarList, Source
 from osprey.engine.ast.grammar import String
@@ -45,19 +44,31 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Stable node identity: (source_path, start_line, start_pos, ast_class_name)
-NodeKey = Tuple[str, int, int, str]
+# Node identity = id() of the AST node object.
+#
+# A structural key (source_path, start_line, start_pos, class_name) is NOT unique:
+# CPython gives a mixed-operator boolean expression `A and B or C` two
+# BooleanOperation nodes (the outer Or and inner And) that share the leftmost
+# child's line+col, and Osprey's Span carries no end position to disambiguate
+# them. With a structural key, pruning the inner And (it reads an absent group)
+# would also prune the surviving outer Or (same key) — silently dropping the
+# feature/verdict even when the schema's `absent` set is correct.
+#
+# The specializer and the runtime (SpecializedExecutionGraph) operate on the SAME
+# full_graph AST node objects, and the spec graph is rebuilt against a fresh graph
+# on every recompile, so id() is stable for a specialization's lifetime and
+# collision-free across distinct nodes.
+NodeKey = int
 
 
 def _node_key_from_node(node: ASTNode) -> NodeKey:
-    """Compute stable node key from an ASTNode directly."""
-    span = node.span
-    return (span.source.path, span.start_line, span.start_pos, type(node).__name__)
+    """Collision-free node identity (id of the AST node object)."""
+    return id(node)
 
 
 def _node_key_from_chain(chain: DependencyChain) -> NodeKey:
-    """Compute stable node key from a DependencyChain."""
-    return _node_key_from_node(chain.executor.node)
+    """Collision-free node identity from a DependencyChain's executor node."""
+    return id(chain.executor.node)
 
 
 def _chain_udf(chain: DependencyChain) -> Optional[object]:

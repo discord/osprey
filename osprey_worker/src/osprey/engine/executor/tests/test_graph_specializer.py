@@ -342,6 +342,49 @@ def test_misclassified_absent_group_divergence_pinned() -> None:
     assert specialized_result.get("UserId") == 1
 
 
+def test_misclassified_absent_feeding_enforcement_rule_drops_verdict() -> None:
+    """Severe variant of misclassification: a wrongly-absent group feeds a RULE
+    with an enforcement effect AND the payload actually contains the group.
+
+    The specialized graph silently DROPS the enforcement the full graph emits —
+    no verdict, no error, no None feature to notice. This is the production
+    correctness risk implied by `absent` being a fragile, import-closure-derived
+    set (Druid validation showed generator-vs-hand `absent` sets diverge wildly:
+    guild_joined gen={fields_changed,max_age,max_uses,target_user,user_id} vs
+    hand={message,report,request_name,target_user,team}). A single wrong `absent`
+    entry on a group that feeds a live enforcement rule = silently missed
+    enforcement. Pinned here so any future change that worsens or fixes it is visible.
+    """
+    _, graph = _compile_effect(
+        {
+            'main.sml': """
+            TargetId: int = JsonData(path='$.target_user.id')
+            IsBadTarget: bool = TargetId > 0
+            BanRule = Rule(when_all=[IsBadTarget], description='ban bad target')
+            WhenRules(rules_any=[BanRule], then=[DeclareVerdict(verdict="ban")])
+            """,
+        }
+    )
+    # Schema WRONGLY declares target_user absent (provides lists an unrelated group).
+    schema = _make_schema(provides={'user': {'id': 'int'}}, absent=['target_user'])
+    specialized = specialize_graph(graph, schema)
+    # Payload CONTRADICTS the schema: target_user present and "bad".
+    payload = {'target_user': {'id': 999}}
+
+    full = _run_graph_full_result(graph, payload)
+    spec = _run_graph_full_result(specialized, payload)
+    full_verdicts = [v.verdict for v in full.verdicts]
+    spec_verdicts = [v.verdict for v in spec.verdicts]
+
+    # Full graph enforces.
+    assert full_verdicts == ['ban'], f'full graph should ban; got {full_verdicts}'
+    # Specialized graph silently drops enforcement — NO verdict ...
+    assert spec_verdicts == [], f'specialized silently drops enforcement; got {spec_verdicts}'
+    # ... and NO error surfaces (the divergence is invisible at runtime).
+    for ei in spec.error_infos:
+        assert not isinstance(ei.error, KeyError), f'KeyError leaked: {ei.error}'
+
+
 # ---------------------------------------------------------------------------
 # Test: idempotent across runs
 # ---------------------------------------------------------------------------

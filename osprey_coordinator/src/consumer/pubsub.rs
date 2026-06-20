@@ -152,6 +152,43 @@ pub async fn start_pubsub_subscriber(
     priority_queue_sender: PriorityQueueSender,
     metrics: Arc<OspreyCoordinatorMetrics>,
 ) -> Result<()> {
+    // Number of independent StreamingPull streams to run per pod. Each stream is
+    // its own subscriber connection + StreamingPullManager (own event loop), all
+    // feeding the shared priority queue. PubSub load-balances a single
+    // subscription across multiple streaming-pull connections, so N streams give
+    // ~Nx the per-pod pull+dispatch parallelism. Critically, each manager runs
+    // its own loop, so a modack/lease-renewal burst in one loop cannot starve the
+    // whole pod's message reception -- the single-loop failure mode behind the
+    // 2026-06-19 backlog. Defaults to 1 (prior single-stream behavior).
+    let num_streams = std::env::var("PUBSUB_NUM_STREAMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1);
+
+    tracing::info!(num_streams, "starting pubsub subscriber");
+
+    let streams = (0..num_streams).map(|stream_index| {
+        run_pubsub_stream(
+            stream_index,
+            snowflake_client.clone(),
+            priority_queue_sender.clone(),
+            metrics.clone(),
+        )
+    });
+
+    // Each stream runs until the shared exit_signal fires (returning Ok) or it
+    // errors; try_join_all resolves on the first error, or once all have stopped.
+    futures::future::try_join_all(streams).await?;
+    Result::Ok(())
+}
+
+async fn run_pubsub_stream(
+    stream_index: usize,
+    snowflake_client: Arc<SnowflakeClient>,
+    priority_queue_sender: PriorityQueueSender,
+    metrics: Arc<OspreyCoordinatorMetrics>,
+) -> Result<()> {
     let subscriber_client = create_pubsub_subscription_client().await;
     let subscription_name = {
         let project_id =
@@ -197,7 +234,7 @@ pub async fn start_pubsub_subscriber(
     let max_acking_receiver_wait_time = config.max_acking_receiver_wait_time;
 
     tracing::info!(
-        {subscription_name = %subscription_name},
+        {subscription_name = %subscription_name, stream_index},
         "creating streaming pull manager"
     );
     let flow_control = FlowControl::default()

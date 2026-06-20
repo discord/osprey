@@ -773,19 +773,10 @@ where
             && self.state.background_tasks.is_empty()
     }
 
-    /// Issues a single batch of modack requests to renew leases for messages that are either in-flight or on hold.
-    ///
-    /// This handler runs inside the manager's `select!` loop, so it deliberately renews **at most one batch
-    /// (`ACK_IDS_MAX_BATCH_SIZE`) per call** and then yields back to the loop, rather than draining every
-    /// renewable message in one pass. An unbounded drain here lets a burst of lease renewals (modack) monopolize
-    /// the loop and starve the lowest-priority streaming-pull receive branch. That starvation is self-reinforcing:
-    /// fewer messages received -> in-flight/on-hold messages age past their lease -> more of them need renewal ->
-    /// even more modack -> even less receive, a spiral that pins per-stream throughput regardless of pod count and
-    /// only unwinds when upstream publish volume drops.
-    ///
-    /// Bounding to one batch is sufficient because `collect_ack_ids_that_need_to_be_renewed` re-schedules each
-    /// collected message's next renewal forward, so successive calls (driven by `LEASE_RENEWAL_INTERVAL`) cycle
-    /// through the rest of the currently-expired set; the per-stream working set is itself bounded by flow control.
+    /// Renews at most one batch (`ACK_IDS_MAX_BATCH_SIZE`) of leases per tick, then yields to the
+    /// `select!` loop. Draining unbounded here lets a modack burst starve the low-priority receive
+    /// branch — a self-reinforcing backlog spiral. One batch per tick suffices: collect pops and
+    /// reschedules each item forward, so successive ticks cover the rest (working set is flow-bounded).
     fn handle_renew_leases(&mut self) {
         self.state.recompute_message_lease_renewal_duration_secs();
         let lease_renewal_duration =

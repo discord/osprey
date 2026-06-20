@@ -692,7 +692,9 @@ def test_load_and_register_schemas_populates_specialized_graphs() -> None:
         engine._specialized_graphs = {}
         engine.get_known_action_names = MagicMock(return_value={"guild_joined"})
 
-        with patch.dict(os.environ, {"OSPREY_SCHEMAS_DIR": tmp_dir}):
+        # Pruning must be explicitly enabled (the activation gate), in addition to
+        # OSPREY_SCHEMAS_DIR pointing at schema files.
+        with patch.dict(os.environ, {"OSPREY_SCHEMAS_DIR": tmp_dir, "OSPREY_TYPED_CONTRACT_PRUNING": "true"}):
             OspreyEngine._load_and_register_schemas(engine)
 
         # Verify that register_specialized_graph was called for guild_joined
@@ -716,6 +718,51 @@ def test_load_and_register_schemas_noop_when_env_unset() -> None:
         OspreyEngine._load_and_register_schemas(engine)
 
     engine.register_specialized_graph.assert_not_called()
+
+
+def test_load_and_register_schemas_noop_when_pruning_disabled() -> None:
+    """Activation gate: with schema files present but OSPREY_TYPED_CONTRACT_PRUNING
+    unset/false, _load_and_register_schemas registers NOTHING — so execute() uses
+    the full graph and pruning cannot change behavior just by shipping schemas."""
+    from unittest.mock import MagicMock, patch
+    from osprey.worker.lib.osprey_engine import OspreyEngine
+
+    valid_schema = {
+        "$schema": "https://discord.dev/smite/action-schema/v1",
+        "action": "guild_joined",
+        "version": 1,
+        "generated_from": {"source": "test", "date": "2026-06-20", "authored_by": "test"},
+        "provides": {"user": {"id": "int"}},
+        "absent": ["target_user"],
+        "types_used": {},
+        "optional_for": {},
+    }
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        (Path(tmp_dir) / "guild_joined.json").write_text(json.dumps(valid_schema))
+        engine = MagicMock(spec=OspreyEngine)
+        engine._specialized_graphs = {}
+        engine.get_known_action_names = MagicMock(return_value={"guild_joined"})
+        # Schema dir IS set, but pruning flag is NOT enabled -> gate blocks registration.
+        with patch.dict(os.environ, {"OSPREY_SCHEMAS_DIR": tmp_dir}, clear=False):
+            os.environ.pop("OSPREY_TYPED_CONTRACT_PRUNING", None)
+            OspreyEngine._load_and_register_schemas(engine)
+        engine.register_specialized_graph.assert_not_called()
+
+
+def test_absent_pruning_enabled_env_parsing() -> None:
+    """absent_pruning_enabled() is false by default and only true for truthy values."""
+    from unittest.mock import patch
+    from osprey.engine.schema.schema_loader import absent_pruning_enabled
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("OSPREY_TYPED_CONTRACT_PRUNING", None)
+        assert absent_pruning_enabled() is False
+    for truthy in ("1", "true", "TRUE", "yes", "on"):
+        with patch.dict(os.environ, {"OSPREY_TYPED_CONTRACT_PRUNING": truthy}):
+            assert absent_pruning_enabled() is True
+    for falsy in ("", "0", "false", "no", "off", "nope"):
+        with patch.dict(os.environ, {"OSPREY_TYPED_CONTRACT_PRUNING": falsy}):
+            assert absent_pruning_enabled() is False
 
 
 # ===========================================================================

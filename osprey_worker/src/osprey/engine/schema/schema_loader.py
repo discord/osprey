@@ -14,6 +14,22 @@ log = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = "https://discord.dev/smite/action-schema/v1"
 
+# Activation gate for runtime absent-group pruning. Pruning is a behavior-
+# changing optimization: it removes execution-graph chains for groups a schema
+# declares `absent`. A WRONG `absent` entry on a group that is actually present
+# (the set is fragile — see CollectJsonDataPaths) silently drops features /
+# enforcement. So pruning is OFF unless this env var is explicitly truthy, even
+# when schema files are present on disk. Loading schemas for the compile-time
+# CollectJsonDataPaths warning is unaffected — only the runtime graph
+# specialization is gated.
+_PRUNING_ENV = "OSPREY_TYPED_CONTRACT_PRUNING"
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def absent_pruning_enabled() -> bool:
+    """True iff runtime absent-group pruning is explicitly enabled via env."""
+    return os.environ.get(_PRUNING_ENV, "").strip().lower() in _TRUTHY
+
 
 @dataclass(frozen=True)
 class ActionSchema:

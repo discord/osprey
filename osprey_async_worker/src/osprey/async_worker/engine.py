@@ -40,7 +40,12 @@ from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execution_graph
 from osprey.engine.executor.graph_specializer import specialize_graph
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
-from osprey.engine.schema.schema_loader import SchemaLoadError, load_schema_for_action, resolve_schemas_dir
+from osprey.engine.schema.schema_loader import (
+    SchemaLoadError,
+    absent_pruning_enabled,
+    load_schema_for_action,
+    resolve_schemas_dir,
+)
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.worker.lib.instruments import metrics
@@ -325,7 +330,13 @@ class AsyncOspreyEngine:
 
         No-op if :func:`resolve_schemas_dir` returns ``None``. Mirrors
         :meth:`OspreyEngine._load_and_register_schemas` in the gevent variant.
+
+        Gated behind :func:`absent_pruning_enabled` (OSPREY_TYPED_CONTRACT_PRUNING):
+        even with schema files present, runtime pruning stays OFF until explicitly
+        enabled, so merely shipping schemas on the rules path cannot change behavior.
         """
+        if not absent_pruning_enabled():
+            return
         schemas_dir = resolve_schemas_dir()
         if schemas_dir is None:
             return

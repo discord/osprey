@@ -31,7 +31,12 @@ from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execu
 from osprey.engine.executor.executor import execute
 from osprey.engine.executor.graph_specializer import specialize_graph
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
-from osprey.engine.schema.schema_loader import SchemaLoadError, load_schema_for_action, resolve_schemas_dir
+from osprey.engine.schema.schema_loader import (
+    SchemaLoadError,
+    absent_pruning_enabled,
+    load_schema_for_action,
+    resolve_schemas_dir,
+)
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.engine.utils.types import add_slots
@@ -137,7 +142,13 @@ class OspreyEngine:
         Called after every compilation (init + reload). No-op if
         :func:`resolve_schemas_dir` returns ``None`` (neither
         ``OSPREY_SCHEMAS_DIR`` nor ``OSPREY_RULES_PATH/schemas`` resolves).
+
+        Gated behind :func:`absent_pruning_enabled` (OSPREY_TYPED_CONTRACT_PRUNING):
+        runtime pruning stays OFF until explicitly enabled, so shipping schema
+        files on the rules path cannot change behavior on its own.
         """
+        if not absent_pruning_enabled():
+            return
         schemas_dir = resolve_schemas_dir()
         if schemas_dir is None:
             return

@@ -342,18 +342,16 @@ def test_misclassified_absent_group_divergence_pinned() -> None:
     assert specialized_result.get("UserId") == 1
 
 
-def test_misclassified_absent_feeding_enforcement_rule_drops_verdict() -> None:
-    """Severe variant of misclassification: a wrongly-absent group feeds a RULE
-    with an enforcement effect AND the payload actually contains the group.
+def test_misclassified_absent_feeding_enforcement_rule_preserves_verdict() -> None:
+    """A wrongly-absent group that feeds an enforcement RULE must NOT silently drop the
+    verdict, even when the payload actually contains the group (a false-absent).
 
-    The specialized graph silently DROPS the enforcement the full graph emits —
-    no verdict, no error, no None feature to notice. This is the production
-    correctness risk implied by `absent` being a fragile, import-closure-derived
-    set (Druid validation showed generator-vs-hand `absent` sets diverge wildly:
-    guild_joined gen={fields_changed,max_age,max_uses,target_user,user_id} vs
-    hand={message,report,request_name,target_user,team}). A single wrong `absent`
-    entry on a group that feeds a live enforcement rule = silently missed
-    enforcement. Pinned here so any future change that worsens or fixes it is visible.
+    The verdict-critical rescue (specialize_graph step 3b) keeps every Rule and its when_all
+    closure — including the extractor for the supposedly-absent group — so the rule reads the
+    real data and fires exactly as the full graph. Only analytics-only absent nodes are
+    pruned, so a wrong `absent` entry (from a producer or consumer change) can at worst drop
+    an analytics feature, never an emitted verdict/effect. Before the rescue this silently
+    dropped the ban (the production correctness risk of an import-closure-derived `absent`).
     """
     _, graph = _compile_effect(
         {
@@ -378,9 +376,9 @@ def test_misclassified_absent_feeding_enforcement_rule_drops_verdict() -> None:
 
     # Full graph enforces.
     assert full_verdicts == ['ban'], f'full graph should ban; got {full_verdicts}'
-    # Specialized graph silently drops enforcement — NO verdict ...
-    assert spec_verdicts == [], f'specialized silently drops enforcement; got {spec_verdicts}'
-    # ... and NO error surfaces (the divergence is invisible at runtime).
+    # Rescue preserves enforcement: the rule subtree is not pruned, so it reads the
+    # (actually present) target_user and fires — no silent drop.
+    assert spec_verdicts == ['ban'], f'rescue must preserve the verdict; got {spec_verdicts}'
     for ei in spec.error_infos:
         assert not isinstance(ei.error, KeyError), f'KeyError leaked: {ei.error}'
 
@@ -932,15 +930,15 @@ def test_shadow_divergences_helper() -> None:
 
 
 def test_pruned_rule_in_whenrules_any_does_not_kill_live_rules() -> None:
-    """Hole A: a pruned Rule in rules_any must not KeyError and kill co-listed live rules.
+    """Hole A: a Rule in rules_any with an absent dependency must not kill co-listed live
+    rules.
 
-    Before the fix: WhenRules.resolve_arguments calls resolved(dead_rule_name,
-    return_none_for_failed_values=True). The dead Rule's Assign chain was pruned
-    (never executed) → KeyError → whole WhenRules block aborted.
-
-    After the fix: KeyError on a pruned node is caught and treated as a failed
-    node (returns None since return_none_for_failed_values=True). The live Rule
-    is still resolved, fires, and its effect is applied.
+    With the verdict-critical rescue (specialize_graph step 3b), every rule in a WhenRules'
+    rules_any is enforcement-critical and is kept — so DeadRule is NOT pruned. It executes,
+    its absent (required=True) dependency fails, and it simply doesn't fire; LiveRule fires
+    and its effect is applied. No pruned-node read, so no KeyError. (WhenRules.resolve_arguments
+    still tolerates a failed rule via return_none_for_failed_values=True, which also covers
+    any rule that fails for non-pruning reasons.)
     """
     _, graph = _compile_effect(
         {
@@ -958,8 +956,9 @@ def test_pruned_rule_in_whenrules_any_does_not_kill_live_rules() -> None:
     schema = _make_schema(provides={'user': {'id': 'int'}}, absent=['absent'])
     specialized = specialize_graph(graph, schema)
 
-    # DeadRule must be pruned (absent dep); LiveRule must NOT be.
-    assert specialized.pruned_count > 0
+    # Both rules feed the WhenRules, so the rescue keeps the whole enforcement closure —
+    # nothing is pruned here (no analytics-only nodes).
+    assert specialized.pruned_count == 0
 
     payload = {'user': {'id': 42}}
 
@@ -968,9 +967,8 @@ def test_pruned_rule_in_whenrules_any_does_not_kill_live_rules() -> None:
     full_result = _run_graph_full_result(graph, payload)
     full_verdicts = [v.verdict for v in full_result.verdicts]
 
-    # Specialized graph: DeadRule is pruned. LiveRule should still fire.
-    # KeyError from resolving the pruned DeadRule must be treated as failure,
-    # not a crash.
+    # Specialized graph: DeadRule is rescued, executes, its absent dep fails -> doesn't
+    # fire; LiveRule still fires. No pruned-node read, so no KeyError.
     spec_result = _run_graph_full_result(specialized, payload)
     spec_verdicts = [v.verdict for v in spec_result.verdicts]
 
@@ -1079,29 +1077,20 @@ def test_resolved_keyerror_for_non_pruned_node_still_raises() -> None:
         ctx.resolved(never_executed_node, return_none_for_failed_values=False)
 
 
-def test_required_false_truthy_when_absent_condition_overprunes_rule() -> None:
-    """Hole C (KNOWN LIMITATION, pinned): conservative Rule pruning over-prunes when a
-    `required=False` field in a GENUINELY-absent group feeds a comparison that is TRUE
-    when the field is None (`!=`, `== None`, `is None`).
+def test_required_false_truthy_when_absent_condition_is_enforcement_equivalent() -> None:
+    """Hole C (FIXED by the verdict-critical rescue): a `required=False` field in a
+    genuinely-absent group, feeding a comparison that is TRUE when the field is None
+    (`!=`, `== None`, `is None`), must still fire its Rule under pruning.
 
     Full graph: the `required=False` extractor returns None (not a failure), so
-    `None != "spam"` evaluates True; with the other when_all conditions satisfied the
-    Rule fires and the verdict is emitted. The specialized graph prunes the extractor
-    (rule c) -> prunes the comparison (rule c) -> conservatively prunes the Rule (rule a),
-    silently dropping the verdict.
+    `None != "spam"` evaluates True; with the other when_all conditions satisfied the Rule
+    fires. The rescue (specialize_graph step 3b) keeps every Rule and its when_all closure,
+    so the specialized graph computes the comparison identically (None -> True) and fires
+    the same verdict — rather than conservatively pruning the Rule and silently dropping it.
 
-    This differs from `required=True` (absent -> extractor FAILS -> comparison fails ->
-    rule does not fire -> pruning is equivalent; see the Hole-B test) and from the
-    `==`/falsy-when-None case (rule does not fire either way). It is the truthy-when-None
-    dual of the None-vs-False question: today the engine fabricates `True` for
-    `None != const`, the rule fires, and pruning changes fire->no-fire.
-
-    Impact today: LATENT -- the all-232-action in-process sweep found 0 such live cases,
-    and pruning is default-off. But it is a real missed-enforcement mechanism. A correct
-    fix is a `required`-aware specializer change (rescue, rather than prune, the when_all
-    subtree of a required=False extractor so it computes None->comparison at runtime).
-    Until then: do NOT enable pruning for any action whose rules read a required=False
-    field of one of its absent groups in a truthy-when-None comparison.
+    This is the truthy-when-None dual of the None-vs-False question; before the rescue the
+    specialized graph dropped the verdict here (a latent missed-enforcement mechanism, found
+    in 0 of the 232 live actions but real for future rules). It now matches the full graph.
     """
     _, graph = _compile_effect(
         {
@@ -1125,9 +1114,7 @@ def test_required_false_truthy_when_absent_condition_overprunes_rule() -> None:
 
     # Full graph fires (None != "spam" is True).
     assert full_verdicts == ['ban'], f'full graph should ban; got {full_verdicts}'
-    # KNOWN LIMITATION: specialized graph silently drops the verdict (over-prune).
-    # When the required-aware rescue lands, flip this to `== ['ban']`.
-    assert spec_verdicts == [], f'pinned over-prune divergence changed; got {spec_verdicts}'
-    # The drop must at least be silent-but-clean (no KeyError leak).
+    # Rescue keeps the rule subtree, so the specialized graph fires the same verdict.
+    assert spec_verdicts == ['ban'], f'rescue must make this enforcement-equivalent; got {spec_verdicts}'
     for ei in spec_result.error_infos:
         assert not isinstance(ei.error, KeyError), f'KeyError leaked: {ei.error}'

@@ -22,6 +22,14 @@ Pruning rules (per §4.4 of the typed-action-contracts plan):
      (c) Default propagation: prune if ALL non-constant (non-IsConstant) deps
          are pruned. Literal constants (String, Number, Boolean) do not block
          pruning of their parent, since they are always computable.
+  2.5 Verdict-critical rescue: after propagation, the transitive closure of every
+     WhenRules chain (rules_any -> Rules -> when_all -> extractors, plus then -> effects)
+     is un-pruned. Enforcement-feeding nodes therefore always compute exactly as the full
+     graph — a required=False extractor over an absent group resolves to None and flows
+     through its comparison (`None != x` is True) — so pruning can NEVER change an emitted
+     verdict/effect; it only ever drops analytics-only features (those feeding no effect).
+     This supersedes (a) for any Rule bound to a WhenRules and is what makes a wrong
+     `absent` entry (from a producer or consumer change) unable to silently miss enforcement.
   3. Surviving chains are assembled into a SpecializedExecutionGraph.
 
 Node identity: NodeKey = id(ast_node) — collision-free (see NodeKey definition).
@@ -32,13 +40,13 @@ import logging
 import re
 from typing import TYPE_CHECKING, FrozenSet, List, Optional, Sequence, Set
 
-from osprey.engine.ast.grammar import ASTNode, IsConstant, List as GrammarList, Source
-from osprey.engine.ast.grammar import String
+from osprey.engine.ast.grammar import ASTNode, IsConstant, Source, String
+from osprey.engine.ast.grammar import List as GrammarList
 from osprey.engine.executor.dependency_chain import DependencyChain
 from osprey.engine.executor.execution_graph import ExecutionGraph
 from osprey.engine.executor.node_executor.call_executor import CallExecutor
 from osprey.engine.stdlib.udfs.resolve_optional import ResolveOptional
-from osprey.engine.stdlib.udfs.rules import Rule
+from osprey.engine.stdlib.udfs.rules import Rule, WhenRules
 
 if TYPE_CHECKING:
     from osprey.engine.schema.schema_loader import ActionSchema
@@ -111,6 +119,13 @@ def _is_resolve_optional_chain(chain: DependencyChain) -> bool:
     return isinstance(udf, ResolveOptional)
 
 
+def _is_whenrules_chain(chain: DependencyChain) -> bool:
+    """Return True if this chain's UDF is WhenRules (binds rules to effects). A WhenRules
+    chain's transitive closure is the entire enforcement output path (rules_any -> Rules ->
+    when_all -> extractors, plus then -> effects), which the specializer must never prune."""
+    return isinstance(_chain_udf(chain), WhenRules)
+
+
 def _is_rule_chain(chain: DependencyChain) -> bool:
     """Return True if this chain's UDF is Rule.
 
@@ -166,6 +181,16 @@ def _collect_all_chains_recursive(chains: Sequence[DependencyChain]) -> List[Dep
     for chain in chains:
         visit(chain)
     return result
+
+
+def _collect_chain_keys(chain: DependencyChain, out: "Set[NodeKey]") -> None:
+    """Add `chain`'s node key and the keys of all its transitive deps to `out`."""
+    key = _node_key_from_chain(chain)
+    if key in out:
+        return
+    out.add(key)
+    for dep in chain.dependent_on:
+        _collect_chain_keys(dep, out)
 
 
 def specialize_graph(
@@ -276,6 +301,20 @@ def specialize_graph(
             if has_non_const_dep and not non_const_surviving_dep_keys:
                 pruned.add(key)
                 changed = True
+
+    # Step 3b — rescue the enforcement output path. Everything a WhenRules transitively
+    # depends on is verdict/effect-determining: the rules_any List, its Rules, each Rule's
+    # when_all conditions and their extractors, and the then effects. Keep that entire
+    # closure so the specialized graph computes verdicts/effects exactly as the full graph
+    # — a required=False extractor over an absent group resolves to None and flows through
+    # its comparison normally (`None != x` is True; the full graph fires, so the specialized
+    # graph must too, instead of conservatively dropping the Rule). Only analytics-only nodes
+    # (feeding no effect) stay pruned, so pruning can never change an emitted verdict/effect.
+    protected: Set[NodeKey] = set()
+    for chain in all_chains:
+        if _is_whenrules_chain(chain):
+            _collect_chain_keys(chain, protected)
+    pruned -= protected
 
     log.debug(
         "specialize_graph: schema=%s absent_groups=%r pruned %d of %d chains",

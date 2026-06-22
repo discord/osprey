@@ -269,3 +269,133 @@ where
         self.next_flush = Instant::now() + self.pending_ack_flush_interval;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::time::Instant as StdInstant;
+
+    use tokio::time::{advance, Instant as TokioInstant};
+
+    use super::*;
+
+    const DELAY: Duration = Duration::from_secs(30);
+
+    fn new_queue(capacity: usize, max_chunk: usize) -> MessageAckQueue<String> {
+        MessageAckQueue::new(capacity, max_chunk, Duration::from_millis(100))
+    }
+
+    /// Insert `n` messages all scheduled to renew at the current (paused) instant, so a single
+    /// `advance` makes the whole set due. Returns the internal AckIds in insertion order.
+    fn insert_due(q: &mut MessageAckQueue<String>, n: usize) -> Vec<AckId> {
+        let renew_at = TokioInstant::now();
+        (0..n)
+            .map(|i| q.transform_and_store_ack_id(format!("srv-{}", i), StdInstant::now(), renew_at))
+            .collect()
+    }
+
+    /// One renewal tick == exactly one `collect` call (the post-fix `handle_renew_leases` does this
+    /// once per `LEASE_RENEWAL_INTERVAL` instead of looping until drained). Returns server ack ids.
+    fn one_tick(q: &mut MessageAckQueue<String>, max_chunk: usize) -> Vec<String> {
+        q.collect_ack_ids_that_need_to_be_renewed(max_chunk, DELAY)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_caps_a_single_tick_at_max_chunk_size() {
+        // The post-fix invariant: one tick renews AT MOST one batch and yields. If collect could
+        // exceed max_chunk_size, "one batch per tick" would be a lie and starvation could return.
+        let mut q = new_queue(1000, 10);
+        insert_due(&mut q, 35);
+        advance(Duration::from_secs(1)).await;
+
+        assert_eq!(one_tick(&mut q, 10).len(), 10);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collected_items_are_rescheduled_not_immediately_recollected() {
+        // THE load-bearing property. A collected message is pushed forward to now+(delay/2..delay),
+        // so the next tick advances to the REST of the set rather than re-renewing the same batch.
+        // If this were false, one-batch-per-tick would renew the same head forever and starve the
+        // tail — exactly the regression this whole change must not introduce.
+        let mut q = new_queue(1000, 100);
+        insert_due(&mut q, 5);
+        advance(Duration::from_secs(1)).await;
+
+        assert_eq!(one_tick(&mut q, 100).len(), 5);
+        // Same instant, no time advance: the 5 just-renewed items must NOT come back.
+        assert!(
+            one_tick(&mut q, 100).is_empty(),
+            "rescheduled items reappeared at the same instant -> tail would starve under one-batch-per-tick"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_batch_per_tick_covers_every_message_with_no_starvation_or_duplication() {
+        // The exact scenario the live load test couldn't reach: a working set spanning multiple
+        // batches at the production batch size (ACK_IDS_MAX_BATCH_SIZE == 2500). Post-fix the
+        // coordinator renews one batch per tick; assert the whole 5001-message set is covered in
+        // ceil(5001/2500) == 3 ticks, each message exactly once, none skipped.
+        let mut q = new_queue(8000, 2500);
+        insert_due(&mut q, 5001);
+        advance(Duration::from_secs(1)).await;
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut ticks = 0;
+        loop {
+            let batch = one_tick(&mut q, 2500);
+            if batch.is_empty() {
+                break;
+            }
+            ticks += 1;
+            assert!(batch.len() <= 2500, "a single tick exceeded one batch");
+            for id in batch {
+                assert!(
+                    seen.insert(id),
+                    "a message was renewed twice in one coverage pass -> another is being starved"
+                );
+            }
+        }
+
+        assert_eq!(seen.len(), 5001, "some held message was never renewed (starved)");
+        assert_eq!(ticks, 3, "5001 / 2500 should drain in exactly 3 ticks");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renewal_recurs_after_the_lease_window() {
+        // A still-held message must keep getting renewed across cycles, not renewed once and dropped.
+        let mut q = new_queue(1000, 100);
+        insert_due(&mut q, 3);
+        advance(Duration::from_secs(1)).await;
+        assert_eq!(one_tick(&mut q, 100).len(), 3);
+
+        // Rescheduled into now+(15s..30s); advance past the max so they are due again.
+        advance(Duration::from_secs(31)).await;
+        assert_eq!(
+            one_tick(&mut q, 100).len(),
+            3,
+            "held messages must be renewed again on the next cycle"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acked_messages_are_never_renewed() {
+        let mut q = new_queue(1000, 100);
+        let ids = insert_due(&mut q, 5);
+        q.remove_ack_id(&ids[2]); // simulate the worker acking message 2
+
+        advance(Duration::from_secs(1)).await;
+        let batch = one_tick(&mut q, 100);
+
+        assert_eq!(batch.len(), 4, "an acked message was still renewed");
+        assert!(!batch.contains(&"srv-2".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_queue_renews_nothing() {
+        let mut q = new_queue(1000, 100);
+        assert!(one_tick(&mut q, 100).is_empty());
+    }
+}

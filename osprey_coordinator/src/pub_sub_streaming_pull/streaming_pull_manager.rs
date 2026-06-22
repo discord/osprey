@@ -773,66 +773,59 @@ where
             && self.state.background_tasks.is_empty()
     }
 
-    /// Issues modack requests to pub-sub in order to renew leases for messages that are either in-flight or on hold.
-    ///
-    /// Returns true if a full batch was flushed, and the next lease renewal flush should perhaps be expedited.
+    /// Renews at most one batch (`ACK_IDS_MAX_BATCH_SIZE`) of leases per tick, then yields to the
+    /// `select!` loop. Draining unbounded here lets a modack burst starve the low-priority receive
+    /// branch — a self-reinforcing backlog spiral. One batch per tick suffices: collect pops and
+    /// reschedules each item forward, so successive ticks cover the rest (working set is flow-bounded).
     fn handle_renew_leases(&mut self) {
-        loop {
-            self.state.recompute_message_lease_renewal_duration_secs();
-            let lease_renewal_duration =
-                Duration::from_secs(self.state.message_lease_renewal_duration_secs as _);
+        self.state.recompute_message_lease_renewal_duration_secs();
+        let lease_renewal_duration =
+            Duration::from_secs(self.state.message_lease_renewal_duration_secs as _);
 
-            let chunk = self
-                .state
-                .message_ack_queue
-                .collect_ack_ids_that_need_to_be_renewed(
-                    ACK_IDS_MAX_BATCH_SIZE,
-                    self.state.get_buffered_lease_renewal_duration(),
-                );
-
-            if chunk.is_empty() {
-                break;
-            }
-
-            let chunk_is_full = chunk.len() == ACK_IDS_MAX_BATCH_SIZE;
-
-            tracing::debug!(
-                {subscription = %self.state.subscription, client_id = %self.state.client_id},
-                "renewing leases for {} messages with a lease duration of {} seconds",
-                chunk.len(),
-                self.state.message_lease_renewal_duration_secs,
+        let chunk = self
+            .state
+            .message_ack_queue
+            .collect_ack_ids_that_need_to_be_renewed(
+                ACK_IDS_MAX_BATCH_SIZE,
+                self.state.get_buffered_lease_renewal_duration(),
             );
 
-            self.state
-                .metrics
-                .message_leases_renewed
-                .incr_by(chunk.len() as _);
-
-            let mut ack_ids = Vec::with_capacity(chunk.len());
-
-            for (elapsed, ack_id) in chunk {
-                if elapsed > lease_renewal_duration {
-                    self.state
-                        .message_latency_histogram
-                        .saturating_record(elapsed.as_millis() as _);
-                }
-                ack_ids.push(ack_id);
-            }
-
-            self.state.perform_request_in_background_with_retries(
-                "renew_leases",
-                make_modack_request(
-                    &self.state.subscription,
-                    ack_ids,
-                    self.state.message_lease_renewal_duration_secs,
-                ),
-                |mut c, r| async move { c.modify_ack_deadline(r).await },
-            );
-
-            if !chunk_is_full {
-                break;
-            }
+        if chunk.is_empty() {
+            return;
         }
+
+        tracing::debug!(
+            {subscription = %self.state.subscription, client_id = %self.state.client_id},
+            "renewing leases for {} messages with a lease duration of {} seconds",
+            chunk.len(),
+            self.state.message_lease_renewal_duration_secs,
+        );
+
+        self.state
+            .metrics
+            .message_leases_renewed
+            .incr_by(chunk.len() as _);
+
+        let mut ack_ids = Vec::with_capacity(chunk.len());
+
+        for (elapsed, ack_id) in chunk {
+            if elapsed > lease_renewal_duration {
+                self.state
+                    .message_latency_histogram
+                    .saturating_record(elapsed.as_millis() as _);
+            }
+            ack_ids.push(ack_id);
+        }
+
+        self.state.perform_request_in_background_with_retries(
+            "renew_leases",
+            make_modack_request(
+                &self.state.subscription,
+                ack_ids,
+                self.state.message_lease_renewal_duration_secs,
+            ),
+            |mut c, r| async move { c.modify_ack_deadline(r).await },
+        );
     }
 
     /// Flushes a chunk of acks or nacks to pub-sub server.

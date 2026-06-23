@@ -16,7 +16,11 @@ import logging
 from typing import Callable, Dict, FrozenSet, Iterable, Mapping, Optional, Tuple
 
 from osprey.engine.executor.execution_graph import ExecutionGraph
-from osprey.engine.executor.graph_specializer import shadow_divergences, specialize_graph
+from osprey.engine.executor.graph_specializer import (
+    SpecializedExecutionGraph,
+    shadow_divergences,
+    specialize_graph,
+)
 from osprey.engine.schema.schema_loader import (
     SchemaLoadError,
     filter_includes,
@@ -96,8 +100,15 @@ def resolve_dispatch(
     """
     spec = specialized_graphs.get(action_name)
     if spec is not None and filter_includes(prune_filter, action_name):
-        guard = getattr(spec, 'absent_groups_satisfied', None)
-        if action_data is None or guard is None or guard(action_data):
+        # Fail CLOSED: serve the lean (folded) graph only when we can VERIFY the fold precondition
+        # holds for THIS payload — a SpecializedExecutionGraph whose assumed-absent groups are
+        # genuinely absent. Missing action_data, or any non-specialized graph, falls back to the
+        # full graph (never serve baked-in folds unguarded) and emits a metric so the gap is visible.
+        if (
+            isinstance(spec, SpecializedExecutionGraph)
+            and action_data is not None
+            and spec.absent_groups_satisfied(action_data)
+        ):
             return spec, None
         metrics.increment('osprey.typed_contracts.guard_fallback', tags=[f'action:{action_name}'])
     if spec is not None and filter_includes(shadow_filter, action_name):

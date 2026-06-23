@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Dict, Hashable, Iterator, List, Optional, Sequence, Set, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Hashable, Iterator, List, Mapping, Optional, Sequence, Set, TypeVar
 
 from osprey.engine.ast.grammar import Assign, ASTNode, Load, Name, Source, Statement
 from osprey.engine.utils.periodic_execution_yielder import maybe_periodic_yield
@@ -88,9 +88,10 @@ class ExecutionGraph:
         """Whether this node's chain was pruned. Always False for a full graph; SpecializedExecutionGraph overrides."""
         return False
 
-    def get_prefolded_node_values(self) -> 'Dict[int, Any]':
+    def get_prefolded_node_values(self) -> 'Mapping[int, Any]':
         """Precomputed NodeResults (keyed by id(node)) to seed before execution. Empty for a full
-        graph; SpecializedExecutionGraph overrides to inject constant-folded absent-group values."""
+        graph; SpecializedExecutionGraph overrides to inject constant-folded absent-group values.
+        Declared as Mapping (not Dict) so the override can narrow the value type covariantly."""
         return {}
 
     def _get_executor_for(self, node: ASTNode) -> 'BaseNodeExecutor[Any, Any]':

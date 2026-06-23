@@ -442,15 +442,20 @@ def test_fold_matches_rescue_node_for_node() -> None:
     folded = specialized.get_prefolded_node_values()
     assert folded, 'fold map must be non-empty'
     mismatches = []
+    compared = 0
     for node_id, fold_result in folded.items():
         if node_id not in rescue_values:
             continue  # node not reached in this payload's execution (e.g. short-circuited)
+        compared += 1
         rescue_result = rescue_values[node_id]
         # Compare Ok/Err KIND and (for Ok) the value — the load-bearing distinction.
         same_kind = fold_result.is_ok() == rescue_result.is_ok()
         same_value = (not fold_result.is_ok()) or (fold_result.unwrap() == rescue_result.unwrap())
         if not (same_kind and same_value):
             mismatches.append((node_id, fold_result, rescue_result))
+    # Guard against a vacuous pass: the gate must actually cross-check folded nodes against the
+    # rescue, not silently compare zero of them.
+    assert compared > 0, 'no folded node was cross-checked against the rescue — gate is vacuous'
     assert not mismatches, f'fold diverged from rescue for {len(mismatches)} node(s): {mismatches[:5]}'
 
 

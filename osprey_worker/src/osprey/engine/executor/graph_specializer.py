@@ -38,19 +38,21 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime
 from typing import TYPE_CHECKING, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set
 
 from osprey.engine.ast.grammar import ASTNode, IsConstant, Source, String
 from osprey.engine.ast.grammar import List as GrammarList
 from osprey.engine.executor.dependency_chain import DependencyChain
+from osprey.engine.executor.execution_context import Action, ExecutionContext, NodeResult
 from osprey.engine.executor.execution_graph import ExecutionGraph
 from osprey.engine.executor.node_executor.call_executor import CallExecutor
+from osprey.engine.executor.udf_execution_helpers import UDFHelpers
 from osprey.engine.stdlib.udfs.resolve_optional import ResolveOptional
 from osprey.engine.stdlib.udfs.rules import Rule, WhenRules
 from result import Err, Ok
 
 if TYPE_CHECKING:
-    from osprey.engine.executor.execution_context import NodeResult
     from osprey.engine.schema.schema_loader import ActionSchema
 
 log = logging.getLogger(__name__)
@@ -253,12 +255,13 @@ def _compute_fold_values(
     so the Ok/Err kind and value are byte-identical to what the rescue would execute (no
     hand-derived fold table; zero drift). Constants are executed too so foldable operands
     resolve, but they are not injected (they stay cheap to recompute at runtime).
+
+    Keying: we store under id(chain.executor.node) — the same key set_resolved_value uses. A
+    consumer resolving a Name redirects (ExecutionContext.get_name_node) to the assignment node's
+    id, so seeding by executor.node id is what makes Name/Assign resolution line up at runtime. Any
+    widening of _is_fold_safe to new node kinds must keep test_fold_matches_rescue_node_for_node
+    green — it is the load-bearing check that this replay equals the rescue's executed values.
     """
-    from datetime import datetime
-
-    from osprey.engine.executor.execution_context import Action, ExecutionContext
-    from osprey.engine.executor.udf_execution_helpers import UDFHelpers
-
     ctx = ExecutionContext(
         full_graph,
         Action(action_id=0, action_name=action_name, data={}, timestamp=datetime(2020, 1, 1)),
@@ -272,8 +275,12 @@ def _compute_fold_values(
             continue
         try:
             result: "NodeResult" = Ok(chain.executor.execute(execution_context=ctx))
-        except Exception:
+        except Exception as e:
+            # An absent extractor expectedly raises (MissingJsonPath/ExpectedUdfException) -> Err,
+            # exactly as the rescue would. Log at debug so a genuinely-broken fold-safe node stays
+            # diagnosable rather than indistinguishable from the expected absent failures.
             result = Err(None)
+            log.debug("fold replay raised for %s on %s: %r", chain.executor.node, action_name, e)
         # Store directly rather than via set_resolved_value — the latter calls the topological
         # sorter's done(), which raises for chains never handed out by get_ready().
         ctx._resolved_node_values[key] = result

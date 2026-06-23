@@ -296,7 +296,7 @@ class OspreyEngine:
 
         serve_graph, shadow_spec = resolve_dispatch(
             action_name, self._specialized_graphs, self._prune_filter,
-            self._shadow_filter, self._execution_graph,
+            self._shadow_filter, self._execution_graph, action_data=action.data,
         )
         result = _exec(serve_graph)
         if shadow_spec is not None:

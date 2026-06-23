@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import TYPE_CHECKING, FrozenSet, List, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set
 
 from osprey.engine.ast.grammar import ASTNode, IsConstant, Source, String
 from osprey.engine.ast.grammar import List as GrammarList
@@ -47,8 +47,10 @@ from osprey.engine.executor.execution_graph import ExecutionGraph
 from osprey.engine.executor.node_executor.call_executor import CallExecutor
 from osprey.engine.stdlib.udfs.resolve_optional import ResolveOptional
 from osprey.engine.stdlib.udfs.rules import Rule, WhenRules
+from result import Err, Ok
 
 if TYPE_CHECKING:
+    from osprey.engine.executor.execution_context import NodeResult
     from osprey.engine.schema.schema_loader import ActionSchema
 
 log = logging.getLogger(__name__)
@@ -193,6 +195,93 @@ def _collect_chain_keys(chain: DependencyChain, out: "Set[NodeKey]") -> None:
         _collect_chain_keys(dep, out)
 
 
+def _is_constant_node(chain: DependencyChain) -> bool:
+    node = chain.executor.node
+    return isinstance(node, IsConstant) and node.is_constant
+
+
+def _is_fold_safe(chain: DependencyChain) -> bool:
+    """True if this chain's value can be recomputed at specialize-time by replaying its own
+    executor: structural ops (comparison/bool/unary/binary), literals, lists, names, assigns —
+    plus json extractors (which only read action data). Rule / WhenRules / ResolveOptional /
+    effect / backend-UDF executors are NOT fold-safe in P0; they stay rescued + executed, so a
+    node depending on one is never folded (safe-by-default)."""
+    if isinstance(chain.executor, CallExecutor):
+        return _is_json_extractor(chain)
+    return True
+
+
+def _compute_foldable_closure(
+    all_chains: Sequence[DependencyChain],
+    absent_groups: FrozenSet[str],
+) -> Set[NodeKey]:
+    """The set of nodes whose value is fully determined by absent-group inputs.
+
+    Seeded at absent json-extractors and propagated up through fold-safe nodes whose every
+    non-constant dependency is itself foldable. A present-group extractor has no non-constant
+    deps, so it is never added; a non-fold-safe UDF (Rule/effect/backend) blocks its parent.
+    """
+    foldable: Set[NodeKey] = set()
+    for chain in all_chains:
+        if _is_json_extractor(chain):
+            path = _get_extractor_path(chain)
+            if path is not None and _get_top_level_group(path) in absent_groups:
+                foldable.add(_node_key_from_chain(chain))
+
+    changed = True
+    while changed:
+        changed = False
+        for chain in all_chains:
+            key = _node_key_from_chain(chain)
+            if key in foldable or not _is_fold_safe(chain):
+                continue
+            non_const_deps = [dep for dep in chain.dependent_on if not _is_constant_node(dep)]
+            if non_const_deps and all(_node_key_from_chain(dep) in foldable for dep in non_const_deps):
+                foldable.add(key)
+                changed = True
+    return foldable
+
+
+def _compute_fold_values(
+    full_graph: ExecutionGraph,
+    all_chains: Sequence[DependencyChain],
+    foldable: Set[NodeKey],
+    action_name: str,
+) -> "Dict[NodeKey, NodeResult]":
+    """Compute each foldable node's NodeResult by REPLAYING its executor against an empty
+    (all-groups-absent) action — reusing the engine's own executors + ExecutionContext.resolved
+    so the Ok/Err kind and value are byte-identical to what the rescue would execute (no
+    hand-derived fold table; zero drift). Constants are executed too so foldable operands
+    resolve, but they are not injected (they stay cheap to recompute at runtime).
+    """
+    from datetime import datetime
+
+    from osprey.engine.executor.execution_context import Action, ExecutionContext
+    from osprey.engine.executor.udf_execution_helpers import UDFHelpers
+
+    ctx = ExecutionContext(
+        full_graph,
+        Action(action_id=0, action_name=action_name, data={}, timestamp=datetime(2020, 1, 1)),
+        UDFHelpers(),
+    )
+    fold_values: "Dict[NodeKey, NodeResult]" = {}
+    # all_chains is post-order (deps before dependents), so a node's deps are resolved first.
+    for chain in all_chains:
+        key = _node_key_from_chain(chain)
+        if key not in foldable and not _is_constant_node(chain):
+            continue
+        try:
+            result: "NodeResult" = Ok(chain.executor.execute(execution_context=ctx))
+        except Exception:
+            result = Err(None)
+        # Store directly rather than via set_resolved_value — the latter calls the topological
+        # sorter's done(), which raises for chains never handed out by get_ready().
+        ctx._resolved_node_values[key] = result
+        if key in foldable:
+            fold_values[key] = result
+    return fold_values
+
+
 def specialize_graph(
     full_graph: ExecutionGraph,
     schema: "ActionSchema",
@@ -316,11 +405,25 @@ def specialize_graph(
             _collect_chain_keys(chain, protected)
     pruned -= protected
 
+    # Step 4 — constant-fold the enforcement-feeding absent subtrees. The rescue (step 3b) keeps
+    # these nodes so they EXECUTE against the real payload — which throws (MissingJsonPath) and
+    # makes backend calls when the group is genuinely absent. Instead, precompute their value once
+    # (by replaying their executors against absent input) and inject it at runtime, skipping
+    # execution. We fold only the fold-safe nodes inside the WhenRules closure; analytics-only
+    # absent nodes stay pruned (dropped). Validity is conditional on the group actually being
+    # absent for the action — enforced at dispatch by `absent_groups_satisfied` (a misclassified
+    # payload falls back to the full graph), which preserves the rescue's misclassification safety.
+    foldable = _compute_foldable_closure(all_chains, absent_groups) & protected
+    fold_values = (
+        _compute_fold_values(full_graph, all_chains, foldable, schema.action) if foldable else {}
+    )
+
     log.debug(
-        "specialize_graph: schema=%s absent_groups=%r pruned %d of %d chains",
+        "specialize_graph: schema=%s absent_groups=%r pruned %d, folded %d of %d chains",
         schema.action,
         absent_groups,
         len(pruned),
+        len(fold_values),
         len(all_chains),
     )
 
@@ -328,6 +431,7 @@ def specialize_graph(
         full_graph=full_graph,
         pruned_keys=frozenset(pruned),
         schema=schema,
+        fold_values=fold_values,
     )
 
 
@@ -396,6 +500,7 @@ class SpecializedExecutionGraph(ExecutionGraph):
         '_nodes_to_unwrap',
         '_full_graph',
         '_pruned_keys',
+        '_fold_values',
         '_schema',
     )
 
@@ -404,6 +509,7 @@ class SpecializedExecutionGraph(ExecutionGraph):
         full_graph: ExecutionGraph,
         pruned_keys: FrozenSet[NodeKey],
         schema: "ActionSchema",
+        fold_values: "Optional[Mapping[NodeKey, NodeResult]]" = None,
     ) -> None:
         # Initialize the base ExecutionGraph with the full graph's registry and sources
         super().__init__(
@@ -417,27 +523,52 @@ class SpecializedExecutionGraph(ExecutionGraph):
         self._sorted_dependency_chains = full_graph._sorted_dependency_chains
         self._full_graph = full_graph
         self._pruned_keys = pruned_keys
+        # Folded nodes: value precomputed at specialize-time, injected at runtime, never executed.
+        # Keyed by NodeKey (== id(node)), so it doubles as the runtime pre-seed map.
+        self._fold_values: Mapping[NodeKey, NodeResult] = fold_values or {}
         self._schema = schema
 
     def get_sorted_dependency_chain(self, source: Source) -> Sequence[DependencyChain]:
-        """Return the sorted dependency chain for a source, with pruned chains removed."""
+        """Return the sorted dependency chain for a source, with pruned AND folded chains removed
+        (both are excluded from scheduling — pruned resolve to None/failure, folded are pre-seeded)."""
         original = self._full_graph.get_sorted_dependency_chain(source)
-        if not self._pruned_keys:
+        if not self._pruned_keys and not self._fold_values:
             return original
         return [
             chain
             for chain in original
             if _node_key_from_chain(chain) not in self._pruned_keys
+            and _node_key_from_chain(chain) not in self._fold_values
         ]
 
     def is_pruned_node(self, node: ASTNode) -> bool:
-        """True if this node's chain was pruned by this specialization."""
-        return _node_key_from_node(node) in self._pruned_keys
+        """True if this node's chain was removed from scheduling (pruned or folded). Folded nodes
+        are also pre-seeded, so their resolution never reaches the KeyError-pruned path; including
+        them here keeps the 'not scheduled' predicate consistent."""
+        key = _node_key_from_node(node)
+        return key in self._pruned_keys or key in self._fold_values
+
+    def get_prefolded_node_values(self) -> "Mapping[int, NodeResult]":
+        """Precomputed NodeResults to seed into the ExecutionContext before execution, so folded
+        nodes resolve to their constant without running their executor."""
+        return self._fold_values
+
+    def absent_groups_satisfied(self, action_data: Mapping[str, object]) -> bool:
+        """True iff every group this specialization assumed absent is genuinely missing from
+        ``action_data`` — the precondition for the folded/pruned values to be valid. A
+        misclassified payload (an 'absent' group actually present) returns False, so dispatch
+        must serve the full graph instead (preserving the rescue's misclassification safety)."""
+        return all(group not in action_data for group in self._schema.absent_groups)
 
     @property
     def pruned_count(self) -> int:
         """Number of chains pruned by this specialization."""
         return len(self._pruned_keys)
+
+    @property
+    def fold_count(self) -> int:
+        """Number of chains constant-folded (precomputed + injected) by this specialization."""
+        return len(self._fold_values)
 
     @property
     def schema(self) -> "ActionSchema":

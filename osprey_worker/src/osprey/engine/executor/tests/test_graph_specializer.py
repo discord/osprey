@@ -342,17 +342,21 @@ def test_misclassified_absent_group_divergence_pinned() -> None:
     assert specialized_result.get("UserId") == 1
 
 
-def test_misclassified_absent_feeding_enforcement_rule_preserves_verdict() -> None:
-    """A wrongly-absent group that feeds an enforcement RULE must NOT silently drop the
-    verdict, even when the payload actually contains the group (a false-absent).
+def test_misclassified_absent_feeding_enforcement_falls_back_via_presence_guard() -> None:
+    """A wrongly-absent group that feeds an enforcement RULE must NOT silently drop the verdict,
+    even when the payload actually contains the group (a false-absent).
 
-    The verdict-critical rescue (specialize_graph step 3b) keeps every Rule and its when_all
-    closure — including the extractor for the supposedly-absent group — so the rule reads the
-    real data and fires exactly as the full graph. Only analytics-only absent nodes are
-    pruned, so a wrong `absent` entry (from a producer or consumer change) can at worst drop
-    an analytics feature, never an emitted verdict/effect. Before the rescue this silently
-    dropped the ban (the production correctness risk of an import-closure-derived `absent`).
+    With constant-folding (specialize_graph step 4), the specialized graph BAKES IN the absent
+    assumption: the enforcement extractor over the declared-absent group is folded to its absent
+    value, so running the *specialized* graph on a MISCLASSIFIED payload (group actually present)
+    would drop the verdict. Safety is restored at DISPATCH by the absent-group presence guard
+    (`absent_groups_satisfied`): when an "absent" group is actually present, the guard is False so
+    `resolve_dispatch` serves the FULL graph (which reads the real data and fires). When the group
+    is genuinely absent, the folded graph is served (faster — the extractor is neither executed nor
+    throws). This preserves the rescue's misclassification safety without paying its runtime cost.
     """
+    from osprey.engine.executor.typed_contract_dispatch import resolve_dispatch
+
     _, graph = _compile_effect(
         {
             'main.sml': """
@@ -366,20 +370,130 @@ def test_misclassified_absent_feeding_enforcement_rule_preserves_verdict() -> No
     # Schema WRONGLY declares target_user absent (provides lists an unrelated group).
     schema = _make_schema(provides={'user': {'id': 'int'}}, absent=['target_user'])
     specialized = specialize_graph(graph, schema)
-    # Payload CONTRADICTS the schema: target_user present and "bad".
-    payload = {'target_user': {'id': 999}}
+    misclassified = {'target_user': {'id': 999}}  # contradicts schema: target_user present + "bad"
+    genuinely_absent = {'user': {'id': 1}}
 
-    full = _run_graph_full_result(graph, payload)
-    spec = _run_graph_full_result(specialized, payload)
-    full_verdicts = [v.verdict for v in full.verdicts]
-    spec_verdicts = [v.verdict for v in spec.verdicts]
-
-    # Full graph enforces.
+    # Full graph enforces on the present-but-misclassified payload.
+    full_verdicts = [v.verdict for v in _run_graph_full_result(graph, misclassified).verdicts]
     assert full_verdicts == ['ban'], f'full graph should ban; got {full_verdicts}'
-    # Rescue preserves enforcement: the rule subtree is not pruned, so it reads the
-    # (actually present) target_user and fires — no silent drop.
-    assert spec_verdicts == ['ban'], f'rescue must preserve the verdict; got {spec_verdicts}'
-    for ei in spec.error_infos:
+
+    # The guard distinguishes the two payloads.
+    assert specialized.absent_groups_satisfied(misclassified) is False
+    assert specialized.absent_groups_satisfied(genuinely_absent) is True
+
+    gates = (frozenset({'*'}), frozenset())  # prune-all, no shadow
+    graphs = {'test_action': specialized}
+    # Misclassified payload -> guard fails -> dispatch serves the FULL graph -> ban preserved.
+    serve, shadow = resolve_dispatch('test_action', graphs, *gates, graph, action_data=misclassified)
+    assert serve is graph and shadow is None, 'misclassified payload must fall back to the full graph'
+    # Genuinely-absent payload -> guard holds -> dispatch serves the folded specialized graph.
+    serve2, _ = resolve_dispatch('test_action', graphs, *gates, graph, action_data=genuinely_absent)
+    assert serve2 is specialized, 'genuinely-absent payload must serve the folded graph'
+
+
+def test_fold_matches_rescue_node_for_node() -> None:
+    """KEYSTONE GATE: every constant-folded node's injected NodeResult (kind + value) must equal
+    what the RESCUE would have executed for that node. The fold reuses the engine's own executors,
+    so this should hold by construction; this test pins it (a wrong fold = silent enforcement flip).
+
+    We capture the rescue's resolved values by running the *full* graph on a genuinely-absent
+    payload, then assert each folded node's precomputed value matches.
+    """
+    from result import Ok
+
+    _, graph = _compile_effect(
+        {
+            'main.sml': """
+            _TargetName: Optional[str] = JsonData(path='$.target_user.name', required=False)
+            TargetIdReq: int = JsonData(path='$.target_user.id')
+            UserId: int = JsonData(path='$.user.id')
+            TargetNotSpam: bool = _TargetName != "spam"
+            TargetReqHigh: bool = TargetIdReq > 10
+            UserIsBad: bool = UserId == 42
+            BanRule = Rule(when_all=[TargetNotSpam, UserIsBad], description='ban')
+            BadReqRule = Rule(when_all=[TargetReqHigh], description='req')
+            WhenRules(rules_any=[BanRule, BadReqRule], then=[DeclareVerdict(verdict="ban")])
+            """,
+        }
+    )
+    schema = _make_schema(provides={'user': {'id': 'int'}}, absent=['target_user'])
+    specialized = specialize_graph(graph, schema)
+    assert specialized.fold_count > 0, 'expected enforcement-feeding absent nodes to be folded'
+
+    # Run the FULL graph on a genuinely-absent payload and capture every resolved NodeResult.
+    action = Action(action_id=1, action_name='test_action', data={'user': {'id': 42}},
+                    timestamp=datetime.utcnow())
+    ctx = ExecutionContext(graph, action, UDFHelpers())
+    rescue_values: Dict[int, Any] = {}
+
+    import osprey.engine.executor.executor as _ex
+    real_set = ExecutionContext.set_resolved_value
+
+    def _capturing(self, chain, value):  # capture every executed node's NodeResult
+        rescue_values[id(chain.executor.node)] = value
+        return real_set(self, chain, value)
+
+    ExecutionContext.set_resolved_value = _capturing  # type: ignore[method-assign]
+    try:
+        _ex.execute(graph, UDFHelpers(), action, gevent.pool.Pool(4))
+    finally:
+        ExecutionContext.set_resolved_value = real_set  # type: ignore[method-assign]
+
+    folded = specialized.get_prefolded_node_values()
+    assert folded, 'fold map must be non-empty'
+    mismatches = []
+    for node_id, fold_result in folded.items():
+        if node_id not in rescue_values:
+            continue  # node not reached in this payload's execution (e.g. short-circuited)
+        rescue_result = rescue_values[node_id]
+        # Compare Ok/Err KIND and (for Ok) the value — the load-bearing distinction.
+        same_kind = fold_result.is_ok() == rescue_result.is_ok()
+        same_value = (not fold_result.is_ok()) or (fold_result.unwrap() == rescue_result.unwrap())
+        if not (same_kind and same_value):
+            mismatches.append((node_id, fold_result, rescue_result))
+    assert not mismatches, f'fold diverged from rescue for {len(mismatches)} node(s): {mismatches[:5]}'
+
+
+def test_fold_eliminates_absent_extractor_execution() -> None:
+    """The observability win: a folded enforcement extractor over a genuinely-absent group is
+    neither scheduled nor executed, so it raises NO ExpectedUdfException/MissingJsonPath at runtime
+    (the rescue executed it and threw). Verdict equivalence is preserved (truthy-when-None still
+    fires) — see test_required_false_truthy_when_absent_condition_is_enforcement_equivalent."""
+    from osprey.engine.executor.execution_context import ExpectedUdfException
+
+    _, graph = _compile_effect(
+        {
+            'main.sml': """
+            _TargetName: Optional[str] = JsonData(path='$.target_user.name', required=False)
+            UserId: int = JsonData(path='$.user.id')
+            TargetNotSpam: bool = _TargetName != "spam"
+            UserIsBad: bool = UserId == 42
+            BanRule = Rule(when_all=[TargetNotSpam, UserIsBad], description='ban')
+            WhenRules(rules_any=[BanRule], then=[DeclareVerdict(verdict="ban")])
+            """,
+        }
+    )
+    schema = _make_schema(provides={'user': {'id': 'int'}}, absent=['target_user'])
+    specialized = specialize_graph(graph, schema)
+    payload = {'user': {'id': 42}}  # target_user genuinely absent
+
+    raised = {'n': 0}
+    orig = ExpectedUdfException.__init__
+
+    def _counting(self, *a, **k):
+        raised['n'] += 1
+        orig(self, *a, **k)
+
+    ExpectedUdfException.__init__ = _counting  # type: ignore[method-assign]
+    try:
+        spec_result = _run_graph_full_result(specialized, payload)
+    finally:
+        ExpectedUdfException.__init__ = orig  # type: ignore[method-assign]
+
+    spec_verdicts = [v.verdict for v in spec_result.verdicts]
+    assert spec_verdicts == ['ban'], f'fold must preserve the truthy-when-None ban; got {spec_verdicts}'
+    assert raised['n'] == 0, f'folded absent extractor must not execute/raise; got {raised["n"]}'
+    for ei in spec_result.error_infos:
         assert not isinstance(ei.error, KeyError), f'KeyError leaked: {ei.error}'
 
 

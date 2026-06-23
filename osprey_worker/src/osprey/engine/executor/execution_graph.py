@@ -88,6 +88,11 @@ class ExecutionGraph:
         """Whether this node's chain was pruned. Always False for a full graph; SpecializedExecutionGraph overrides."""
         return False
 
+    def get_prefolded_node_values(self) -> 'Dict[int, Any]':
+        """Precomputed NodeResults (keyed by id(node)) to seed before execution. Empty for a full
+        graph; SpecializedExecutionGraph overrides to inject constant-folded absent-group values."""
+        return {}
+
     def _get_executor_for(self, node: ASTNode) -> 'BaseNodeExecutor[Any, Any]':
         return self._node_executor_registry.construct_executor_for(node, validated_sources=self._validated_sources)
 

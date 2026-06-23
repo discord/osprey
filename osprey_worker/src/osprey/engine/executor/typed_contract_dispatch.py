@@ -13,7 +13,7 @@ logic to these functions.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, FrozenSet, Iterable, Optional, Tuple
+from typing import Callable, Dict, FrozenSet, Iterable, Mapping, Optional, Tuple
 
 from osprey.engine.executor.execution_graph import ExecutionGraph
 from osprey.engine.executor.graph_specializer import shadow_divergences, specialize_graph
@@ -75,19 +75,31 @@ def resolve_dispatch(
     prune_filter: FrozenSet[str],
     shadow_filter: FrozenSet[str],
     full_graph: ExecutionGraph,
+    action_data: Optional[Mapping[str, object]] = None,
 ) -> Tuple[ExecutionGraph, Optional[ExecutionGraph]]:
     """Decide which graph(s) to run for an action. Returns
     ``(graph_to_serve, shadow_spec_or_None)``:
 
-      * PRUNE  -> ``(specialized, None)``     — serve the lean graph
+      * PRUNE  -> ``(specialized, None)``     — serve the lean (pruned + constant-folded) graph
       * SHADOW -> ``(full, specialized)``     — serve full, also run specialized to diff
       * else   -> ``(full, None)``            — default graph, zero overhead
 
     Schema-less / non-allowlisted actions hit the final case (``dict.get`` is O(1)).
+
+    Presence guard (safety keystone): the specialized graph constant-folds enforcement-feeding
+    absent-group nodes, baking in the "absent" assumption. So the PRUNE branch serves the lean
+    graph ONLY when every group it assumed absent is genuinely missing from this action's
+    ``action_data``; a misclassified payload (an "absent" group actually present) falls back to the
+    full graph — preserving the rescue's misclassification safety — and emits a metric so the bad
+    schema is visible. SHADOW is unaffected: it always serves full and a misclassification simply
+    shows up as a (real, worth-surfacing) shadow divergence.
     """
     spec = specialized_graphs.get(action_name)
     if spec is not None and filter_includes(prune_filter, action_name):
-        return spec, None
+        guard = getattr(spec, 'absent_groups_satisfied', None)
+        if action_data is None or guard is None or guard(action_data):
+            return spec, None
+        metrics.increment('osprey.typed_contracts.guard_fallback', tags=[f'action:{action_name}'])
     if spec is not None and filter_includes(shadow_filter, action_name):
         return full_graph, spec
     return full_graph, None

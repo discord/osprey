@@ -157,6 +157,10 @@ class ExecutionContext:
         self._outputs: Dict[str, Any] = {}
         self._pending_executions: Set[DependencyChain] = set()
         self._resolved_node_values: Dict[int, NodeResult] = {}
+        # Seed any precomputed (constant-folded) node values for a specialized graph, so folded
+        # absent-group nodes resolve to their constant without being scheduled or executed. Empty
+        # for a full graph. Keyed by id(node), matching set_resolved_value's keying.
+        self._resolved_node_values.update(execution_graph.get_prefolded_node_values())
         self._visited_executions: Set[DependencyChain] = set()
         # a k/v store of effects, by effect type
         self._effects: DefaultDict[Type[EffectBase], List[EffectBase]] = defaultdict(list)

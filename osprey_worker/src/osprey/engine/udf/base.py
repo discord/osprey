@@ -14,6 +14,7 @@ from .type_helpers import is_typevar, to_display_str
 
 if TYPE_CHECKING:
     from osprey.engine.ast_validator.validation_context import ValidationContext
+    from osprey.engine.executor.execution_context import NodeResult
     from osprey.engine.executor.node_executor.call_executor import CallExecutor
 
 
@@ -92,6 +93,24 @@ class UDFBase(Generic[Arguments, RValue], ABC):
     category: ClassVar[Optional[str]] = None
     """If present, a string name for what category this UDF falls into. Can be used for, say, grouping UDFs
     in documentation."""
+
+    def is_fold_safe_when_absent(self) -> bool:
+        """Typed action contracts: may the graph specializer CONSTANT-FOLD this UDF when its
+        primary input comes from an absent json group — i.e. replace running it (and its backend
+        IO) with the precomputed `absent_value()`? Default False: the UDF executes as normal.
+
+        Override (returning True for the safe configurations) + implement `absent_value` only for
+        UDFs whose result on an absent input is a determinate constant — e.g. HasLabel with
+        `status='added'` is always False. The specializer still computes the value via
+        `resolve_arguments` so an absent *required* input that fails propagates as a failure
+        exactly as `execute` would; this only skips the UDF body (and its IO)."""
+        return False
+
+    def absent_value(self, arguments: Arguments) -> 'NodeResult':
+        """The NodeResult this UDF produces when its primary input is absent, given resolved
+        arguments. Only called when `is_fold_safe_when_absent()` is True, and MUST equal what
+        `execute` would produce/raise on absent input (Ok(value), or Err for a raise)."""
+        raise NotImplementedError(f'{type(self).__name__} is fold-safe but did not implement absent_value')
 
     def __init__(self, validation_context: 'ValidationContext', arguments: Arguments):
         self._rvalue_type_checker: Optional[RValueTypeChecker] = None

@@ -11,7 +11,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import gevent.pool
 import pytest
@@ -36,6 +36,9 @@ from osprey.engine.executor.graph_specializer import (
     _node_key_from_chain,
     specialize_graph,
 )
+from osprey.engine.executor.typed_contract_dispatch import resolve_dispatch
+from result import Err, Ok
+from osprey.engine.executor.node_executor.call_executor import CallExecutor
 from osprey.engine.stdlib.udfs._prelude import ArgumentsBase, UDFBase
 from osprey.engine.stdlib.udfs.categories import UdfCategories
 from osprey.engine.stdlib.udfs.rules import Rule, WhenRules
@@ -355,8 +358,6 @@ def test_misclassified_absent_feeding_enforcement_falls_back_via_presence_guard(
     is genuinely absent, the folded graph is served (faster — the extractor is neither executed nor
     throws). This preserves the rescue's misclassification safety without paying its runtime cost.
     """
-    from osprey.engine.executor.typed_contract_dispatch import resolve_dispatch
-
     _, graph = _compile_effect(
         {
             'main.sml': """
@@ -399,8 +400,6 @@ def test_fold_matches_rescue_node_for_node() -> None:
     We capture the rescue's resolved values by running the *full* graph on a genuinely-absent
     payload, then assert each folded node's precomputed value matches.
     """
-    from result import Ok
-
     _, graph = _compile_effect(
         {
             'main.sml': """
@@ -426,7 +425,6 @@ def test_fold_matches_rescue_node_for_node() -> None:
     ctx = ExecutionContext(graph, action, UDFHelpers())
     rescue_values: Dict[int, Any] = {}
 
-    import osprey.engine.executor.executor as _ex
     real_set = ExecutionContext.set_resolved_value
 
     def _capturing(self, chain, value):  # capture every executed node's NodeResult
@@ -435,7 +433,7 @@ def test_fold_matches_rescue_node_for_node() -> None:
 
     ExecutionContext.set_resolved_value = _capturing  # type: ignore[method-assign]
     try:
-        _ex.execute(graph, UDFHelpers(), action, gevent.pool.Pool(4))
+        execute(graph, UDFHelpers(), action, gevent.pool.Pool(4))
     finally:
         ExecutionContext.set_resolved_value = real_set  # type: ignore[method-assign]
 
@@ -1237,3 +1235,100 @@ def test_required_false_truthy_when_absent_condition_is_enforcement_equivalent()
     assert spec_verdicts == ['ban'], f'rescue must make this enforcement-equivalent; got {spec_verdicts}'
     for ei in spec_result.error_infos:
         assert not isinstance(ei.error, KeyError), f'KeyError leaked: {ei.error}'
+
+
+# ===========================================================================
+# P1: declared-absent_value UDF folding + rescue removal
+# ===========================================================================
+
+
+class _ProbeArgs(ArgumentsBase):
+    value: Optional[int]
+
+
+class FoldableProbeUdf(UDFBase[_ProbeArgs, bool]):
+    """Test UDF declaring itself fold-safe-when-absent with a constant absent_value, whose body
+    RAISES if executed — so a folded instance proves the body (its 'backend call') is skipped.
+    This is the mechanism HasLabel(status='added') rides to avoid the labels-service call."""
+
+    def is_fold_safe_when_absent(self) -> bool:
+        return True
+
+    def absent_value(self, arguments: _ProbeArgs):
+        return Ok(True)
+
+    def execute(self, execution_context, arguments) -> bool:
+        raise AssertionError('folded UDF body must not execute')
+
+
+def test_declared_udf_is_folded_without_executing_its_body() -> None:
+    """P1: a UDF that declares is_fold_safe_when_absent + absent_value is CONSTANT-FOLDED over an
+    absent group — its precomputed value is injected and its body (the backend call) is never run —
+    yet the enforcement rule reading it still fires. With the rescue removed, this works purely via
+    folding: the absent extractor + the declared UDF fold, so the Rule's deps are never pruned."""
+    registry = UDFRegistry.with_udfs(
+        JsonData, EntityJson, Import, Require, GetActionName, ResolveOptional, Rule, WhenRules,
+        DeclareVerdict, FoldableProbeUdf,
+    )
+    sources = Sources.from_dict({'main.sml': dedent("""
+        _V: Optional[int] = JsonData(path='$.absent.v', required=False)
+        Flag: bool = FoldableProbeUdf(value=_V)
+        R = Rule(when_all=[Flag], description='probe')
+        WhenRules(rules_any=[R], then=[DeclareVerdict(verdict="hit")])
+    """)})
+    vreg = ValidatorRegistry.from_validator_classes([
+        ValidateCallKwargs, ValidateDynamicCallsHaveAnnotatedRValue, ImportsMustNotHaveCycles,
+        UniqueStoredNames, VariablesMustBeDefined, ValidateStaticTypes, FeatureNameToEntityTypeMapping,
+        get_config_registry().get_validator(),
+    ])
+    validated = validate_sources(sources, registry, vreg)
+    graph = compile_execution_graph(validated)
+
+    schema = _make_schema(provides={'user': {'id': 'int'}}, absent=['absent'])
+    specialized = specialize_graph(graph, schema)
+
+    # The probe UDF chain folds to Ok(True) and is excluded from scheduling.
+    probe_keys = [
+        _node_key_from_chain(c)
+        for c in _collect_all_chains_recursive(_get_all_sorted_chains(graph))
+        if isinstance(c.executor, CallExecutor) and isinstance(c.executor._udf, FoldableProbeUdf)
+    ]
+    assert probe_keys, 'expected the probe UDF chain'
+    folded = specialized.get_prefolded_node_values()
+    for k in probe_keys:
+        assert k in folded and folded[k].is_ok() and folded[k].unwrap() is True, 'probe UDF must fold to Ok(True)'
+
+    # Running the specialized graph fires the verdict WITHOUT a helper and WITHOUT executing the
+    # probe body (which raises) — folding replaced the call; no rescue step involved.
+    spec_result = _run_graph_full_result(specialized, {'user': {'id': 1}})  # 'absent' genuinely absent
+    assert [v.verdict for v in spec_result.verdicts] == ['hit']
+    for ei in spec_result.error_infos:
+        assert not isinstance(ei.error, (KeyError, AssertionError)), f'unexpected error: {ei.error}'
+
+
+def test_no_rescue_step_enforcement_preserved_via_folding() -> None:
+    """The rescue (old step 3b) is gone. A required=True absent extractor feeding an enforcement
+    Rule used to be pruned then un-pruned by the rescue; now it is FOLDED (to Err), the comparison
+    folds, and the Rule survives because its folded deps are never added to the pruned set — so the
+    conservative Rule-prune never fires. Enforcement is identical to the full graph; nothing is
+    pruned in a pure-enforcement closure."""
+    _, graph = _compile_effect(
+        {
+            'main.sml': """
+            _Opt: Optional[str] = JsonData(path='$.target_user.name', required=False)
+            NotSpam: bool = _Opt != "spam"
+            UserId: int = JsonData(path='$.user.id')
+            Bad: bool = UserId == 7
+            BanRule = Rule(when_all=[NotSpam, Bad], description='ban')
+            WhenRules(rules_any=[BanRule], then=[DeclareVerdict(verdict="ban")])
+            """,
+        }
+    )
+    schema = _make_schema(provides={'user': {'id': 'int'}}, absent=['target_user'])
+    specialized = specialize_graph(graph, schema)
+    # Enforcement-only closure: the absent nodes are folded, not pruned.
+    assert specialized.fold_count > 0
+    assert specialized.pruned_count == 0
+    payload = {'user': {'id': 7}}  # target_user genuinely absent; None != "spam" is True
+    assert [v.verdict for v in _run_graph_full_result(graph, payload).verdicts] == ['ban']
+    assert [v.verdict for v in _run_graph_full_result(specialized, payload).verdicts] == ['ban']

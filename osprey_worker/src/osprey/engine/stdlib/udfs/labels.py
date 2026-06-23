@@ -190,6 +190,21 @@ class HasLabel(
 
             validation_context.add_error(message='unknown label', span=arguments.label.argument_span, hint=hint)
 
+    def is_fold_safe_when_absent(self) -> bool:
+        # An entity from an absent json group has zero labels, so `_execute`'s `label_state is None`
+        # branch decides the result. For status='added' (the common case) that is always False,
+        # independent of `manual` (the `desired_status == REMOVED` conjunct short-circuits). We
+        # constant-fold only that case; 'removed'/unknown statuses execute as normal.
+        return self.desired_status == _SimpleStatus.ADDED
+
+    def absent_value(self, arguments: HasLabelArguments) -> Result[bool, None]:
+        # Reproduces `_execute` on an absent (zero-label) entity: error_on_empty raises
+        # EmptyEntityError (-> Err); otherwise the `label_state is None` branch yields
+        # `desired_status == REMOVED and manual != YES`, which is False for status='added'.
+        if arguments.error_on_empty:
+            return Err(None)
+        return Ok(self.desired_status == _SimpleStatus.REMOVED and _ManualType.get(arguments.manual) != _ManualType.YES)
+
     def _check_error_on_empty(
         self, entity: EntityT[Any], label: str, entity_labels: EntityLabels, error_on_empty: bool
     ) -> None:

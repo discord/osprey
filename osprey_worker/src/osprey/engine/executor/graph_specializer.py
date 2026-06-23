@@ -22,15 +22,20 @@ Pruning rules (per §4.4 of the typed-action-contracts plan):
      (c) Default propagation: prune if ALL non-constant (non-IsConstant) deps
          are pruned. Literal constants (String, Number, Boolean) do not block
          pruning of their parent, since they are always computable.
-  2.5 Verdict-critical rescue: after propagation, the transitive closure of every
-     WhenRules chain (rules_any -> Rules -> when_all -> extractors, plus then -> effects)
-     is un-pruned. Enforcement-feeding nodes therefore always compute exactly as the full
-     graph — a required=False extractor over an absent group resolves to None and flows
-     through its comparison (`None != x` is True) — so pruning can NEVER change an emitted
-     verdict/effect; it only ever drops analytics-only features (those feeding no effect).
-     This supersedes (a) for any Rule bound to a WhenRules and is what makes a wrong
-     `absent` entry (from a producer or consumer change) unable to silently miss enforcement.
   3. Surviving chains are assembled into a SpecializedExecutionGraph.
+
+Constant-folding (replaces the old "verdict-critical rescue"): the absent-derived nodes inside
+every WhenRules closure (rules_any -> Rules -> when_all -> extractors/UDFs, plus then -> effects)
+are not pruned — they are CONSTANT-FOLDED. Their value is precomputed once at specialize-time by
+replaying the engine's own executors against absent input (and, for UDFs that declare an
+`absent_value` such as HasLabel, taking that declaration instead of running the body), then injected
+at runtime so the node never executes — no MissingJsonPath throw, no backend call. Because these
+nodes are folded rather than pruned, the conservative Rule-prune never cascades into an enforcement
+closure, so enforcement is computed exactly as the full graph and the explicit rescue step is no
+longer needed. Non-fold-safe enforcement nodes (Rules, effects, undeclared backend UDFs) still
+execute, reading the folded values. The fold bakes in the "absent" assumption, so a MISCLASSIFIED
+payload is caught at dispatch by `absent_groups_satisfied` (serve the full graph) — see
+typed_contract_dispatch.resolve_dispatch.
 
 Node identity: NodeKey = id(ast_node) — collision-free (see NodeKey definition).
 """
@@ -203,13 +208,20 @@ def _is_constant_node(chain: DependencyChain) -> bool:
 
 
 def _is_fold_safe(chain: DependencyChain) -> bool:
-    """True if this chain's value can be recomputed at specialize-time by replaying its own
-    executor: structural ops (comparison/bool/unary/binary), literals, lists, names, assigns —
-    plus json extractors (which only read action data). Rule / WhenRules / ResolveOptional /
-    effect / backend-UDF executors are NOT fold-safe in P0; they stay rescued + executed, so a
-    node depending on one is never folded (safe-by-default)."""
+    """True if this chain's value can be recomputed at specialize-time:
+      - structural ops (comparison/bool/unary/binary), literals, lists, names, assigns — by
+        replaying their own executor (they only read resolved deps);
+      - json extractors — by replaying (they only read action data);
+      - a UDF that declares `is_fold_safe_when_absent()` — via its `absent_value()` (so its body
+        and any backend IO are skipped).
+    Everything else (Rule / WhenRules / ResolveOptional / effects / undeclared backend UDFs) is NOT
+    fold-safe; it stays scheduled + executed, so a node depending on it is never folded
+    (safe-by-default)."""
     if isinstance(chain.executor, CallExecutor):
-        return _is_json_extractor(chain)
+        if _is_json_extractor(chain):
+            return True
+        udf = chain.executor._udf
+        return bool(udf is not None and udf.is_fold_safe_when_absent())
     return True
 
 
@@ -273,8 +285,20 @@ def _compute_fold_values(
         key = _node_key_from_chain(chain)
         if key not in foldable and not _is_constant_node(chain):
             continue
+        udf = _chain_udf(chain)
+        is_declared_udf = (
+            udf is not None and not _is_json_extractor(chain) and udf.is_fold_safe_when_absent()  # type: ignore[attr-defined]
+        )
         try:
-            result: "NodeResult" = Ok(chain.executor.execute(execution_context=ctx))
+            if is_declared_udf:
+                # A UDF declared fold-safe (e.g. HasLabel(status='added')): resolve its arguments
+                # (so an absent *required* input still propagates a failure exactly as execute
+                # would), then take the declared absent_value INSTEAD of running the body — skipping
+                # its backend IO. resolve_arguments makes no UDF call itself.
+                resolved_args = udf.resolve_arguments(ctx, chain.executor)  # type: ignore[union-attr]
+                result: "NodeResult" = udf.absent_value(resolved_args)  # type: ignore[union-attr]
+            else:
+                result = Ok(chain.executor.execute(execution_context=ctx))
         except Exception as e:
             # An absent extractor expectedly raises (MissingJsonPath/ExpectedUdfException) -> Err,
             # exactly as the rescue would. Log at debug so a genuinely-broken fold-safe node stays
@@ -307,24 +331,47 @@ def specialize_graph(
     all_top_level_chains = _get_all_sorted_chains(full_graph)
     all_chains = _collect_all_chains_recursive(all_top_level_chains)
 
-    # Step 2 — seed pruned set with absent extractors
-    pruned: Set[NodeKey] = set()
+    # Step 2 — constant-fold the enforcement-feeding absent subtrees (this REPLACES the old
+    # "rescue"). `protected` is the transitive closure of every WhenRules chain: the rules_any
+    # List, its Rules, each Rule's when_all conditions + their extractors/UDFs, and the then
+    # effects. The fold-safe nodes in it (json extractors, structural ops, and UDFs that declare an
+    # absent_value such as HasLabel) are folded — their value is precomputed by replaying the
+    # engine's own executors against absent input and injected at runtime, skipping execution (no
+    # MissingJsonPath throw, no backend call). Non-fold-safe enforcement nodes (the Rules, effects,
+    # undeclared backend UDFs) are NOT folded; they stay scheduled and execute, reading the folded
+    # values — exactly as the rescue made them, but without the rescue step.
+    protected: Set[NodeKey] = set()
+    for chain in all_chains:
+        if _is_whenrules_chain(chain):
+            _collect_chain_keys(chain, protected)
+    foldable = _compute_foldable_closure(all_chains, absent_groups) & protected
+    fold_values = (
+        _compute_fold_values(full_graph, all_chains, foldable, schema.action) if foldable else {}
+    )
 
+    # Step 3 — seed the pruned set with absent extractors that are NOT folded (i.e. analytics-only
+    # absent reads, outside any WhenRules closure). Folded enforcement extractors are deliberately
+    # EXCLUDED: folding them (rather than pruning them) is what keeps the conservative Rule-prune
+    # below from cascading into the enforcement closure, so the old step-3b "rescue" is unnecessary
+    # and has been removed. A genuinely-misclassified payload is still caught by the dispatch-time
+    # `absent_groups_satisfied` guard (serve the full graph), preserving misclassification safety.
+    pruned: Set[NodeKey] = set()
     for chain in all_chains:
         if _is_json_extractor(chain):
             path = _get_extractor_path(chain)
-            if path is not None:
-                group = _get_top_level_group(path)
-                if group in absent_groups:
-                    pruned.add(_node_key_from_chain(chain))
+            if path is not None and _get_top_level_group(path) in absent_groups:
+                key = _node_key_from_chain(chain)
+                if key not in foldable:
+                    pruned.add(key)
 
-    # Step 3 — propagation loop
+    # Step 4 — propagation loop (analytics-only pruning).
     changed = True
     while changed:
         changed = False
         for chain in all_chains:
             key = _node_key_from_chain(chain)
-            if key in pruned:
+            if key in pruned or key in foldable:
+                # Folded nodes are injected, not pruned — never propagate-prune them.
                 continue
 
             deps = chain.dependent_on
@@ -398,32 +445,8 @@ def specialize_graph(
                 pruned.add(key)
                 changed = True
 
-    # Step 3b — rescue the enforcement output path. Everything a WhenRules transitively
-    # depends on is verdict/effect-determining: the rules_any List, its Rules, each Rule's
-    # when_all conditions and their extractors, and the then effects. Keep that entire
-    # closure so the specialized graph computes verdicts/effects exactly as the full graph
-    # — a required=False extractor over an absent group resolves to None and flows through
-    # its comparison normally (`None != x` is True; the full graph fires, so the specialized
-    # graph must too, instead of conservatively dropping the Rule). Only analytics-only nodes
-    # (feeding no effect) stay pruned, so pruning can never change an emitted verdict/effect.
-    protected: Set[NodeKey] = set()
-    for chain in all_chains:
-        if _is_whenrules_chain(chain):
-            _collect_chain_keys(chain, protected)
-    pruned -= protected
-
-    # Step 4 — constant-fold the enforcement-feeding absent subtrees. The rescue (step 3b) keeps
-    # these nodes so they EXECUTE against the real payload — which throws (MissingJsonPath) and
-    # makes backend calls when the group is genuinely absent. Instead, precompute their value once
-    # (by replaying their executors against absent input) and inject it at runtime, skipping
-    # execution. We fold only the fold-safe nodes inside the WhenRules closure; analytics-only
-    # absent nodes stay pruned (dropped). Validity is conditional on the group actually being
-    # absent for the action — enforced at dispatch by `absent_groups_satisfied` (a misclassified
-    # payload falls back to the full graph), which preserves the rescue's misclassification safety.
-    foldable = _compute_foldable_closure(all_chains, absent_groups) & protected
-    fold_values = (
-        _compute_fold_values(full_graph, all_chains, foldable, schema.action) if foldable else {}
-    )
+    # (The old step-3b "rescue" — un-pruning the WhenRules closure — is gone: enforcement-feeding
+    # absent nodes are now FOLDED in step 2, so the propagation above never prunes them.)
 
     log.debug(
         "specialize_graph: schema=%s absent_groups=%r pruned %d, folded %d of %d chains",

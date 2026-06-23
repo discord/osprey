@@ -392,13 +392,15 @@ def test_misclassified_absent_feeding_enforcement_falls_back_via_presence_guard(
     assert serve2 is specialized, 'genuinely-absent payload must serve the folded graph'
 
 
-def test_fold_matches_rescue_node_for_node() -> None:
+def test_fold_matches_full_graph_node_for_node() -> None:
     """KEYSTONE GATE: every constant-folded node's injected NodeResult (kind + value) must equal
-    what the RESCUE would have executed for that node. The fold reuses the engine's own executors,
-    so this should hold by construction; this test pins it (a wrong fold = silent enforcement flip).
+    what the FULL graph would have executed for that node on the same (genuinely-absent) payload.
+    The fold reuses the engine's own executors, so this should hold by construction; this test pins
+    it (a wrong fold = silent enforcement flip). (The full graph is the ground truth now that the
+    rescue is gone — folding must reproduce exactly what executing the unspecialized graph yields.)
 
-    We capture the rescue's resolved values by running the *full* graph on a genuinely-absent
-    payload, then assert each folded node's precomputed value matches.
+    We capture the full graph's resolved values by running it on a genuinely-absent payload, then
+    assert each folded node's precomputed value matches.
     """
     _, graph = _compile_effect(
         {
@@ -423,12 +425,12 @@ def test_fold_matches_rescue_node_for_node() -> None:
     action = Action(action_id=1, action_name='test_action', data={'user': {'id': 42}},
                     timestamp=datetime.utcnow())
     ctx = ExecutionContext(graph, action, UDFHelpers())
-    rescue_values: Dict[int, Any] = {}
+    full_graph_values: Dict[int, Any] = {}
 
     real_set = ExecutionContext.set_resolved_value
 
     def _capturing(self, chain, value):  # capture every executed node's NodeResult
-        rescue_values[id(chain.executor.node)] = value
+        full_graph_values[id(chain.executor.node)] = value
         return real_set(self, chain, value)
 
     ExecutionContext.set_resolved_value = _capturing  # type: ignore[method-assign]
@@ -442,19 +444,19 @@ def test_fold_matches_rescue_node_for_node() -> None:
     mismatches = []
     compared = 0
     for node_id, fold_result in folded.items():
-        if node_id not in rescue_values:
+        if node_id not in full_graph_values:
             continue  # node not reached in this payload's execution (e.g. short-circuited)
         compared += 1
-        rescue_result = rescue_values[node_id]
+        full_result = full_graph_values[node_id]
         # Compare Ok/Err KIND and (for Ok) the value — the load-bearing distinction.
-        same_kind = fold_result.is_ok() == rescue_result.is_ok()
-        same_value = (not fold_result.is_ok()) or (fold_result.unwrap() == rescue_result.unwrap())
+        same_kind = fold_result.is_ok() == full_result.is_ok()
+        same_value = (not fold_result.is_ok()) or (fold_result.unwrap() == full_result.unwrap())
         if not (same_kind and same_value):
-            mismatches.append((node_id, fold_result, rescue_result))
+            mismatches.append((node_id, fold_result, full_result))
     # Guard against a vacuous pass: the gate must actually cross-check folded nodes against the
-    # rescue, not silently compare zero of them.
-    assert compared > 0, 'no folded node was cross-checked against the rescue — gate is vacuous'
-    assert not mismatches, f'fold diverged from rescue for {len(mismatches)} node(s): {mismatches[:5]}'
+    # full graph, not silently compare zero of them.
+    assert compared > 0, 'no folded node was cross-checked against the full graph — gate is vacuous'
+    assert not mismatches, f'fold diverged from full graph for {len(mismatches)} node(s): {mismatches[:5]}'
 
 
 def test_fold_eliminates_absent_extractor_execution() -> None:

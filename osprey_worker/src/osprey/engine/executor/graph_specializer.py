@@ -15,10 +15,10 @@ Pruning rules (per §4.4 of the typed-action-contracts plan):
          dep in chain.dependent_on is pruned.  Rule.execute calls all(when_all)
          via ListExecutor which resolves each dep WITHOUT return_none_for_failed;
          a pruned dep that was never executed will raise KeyError at runtime.
-     (b) ResolveOptional with non-None default_value: rescued — not pruned
-         even if its optional_value dep is pruned (returns default at runtime).
-         The optional_value extractor chain and its transitive deps are rescued
-         so the executor can execute and return None for the absent field.
+     (b) ResolveOptional with non-None default_value: kept (not pruned) even if its
+         optional_value dep is absent. optional_value is an Optional kwarg, so a folded/absent
+         optional_value resolves to None without running its extractor, and execute() returns the
+         default on None.
      (c) Default propagation: prune if ALL non-constant (non-IsConstant) deps
          are pruned. Literal constants (String, Number, Boolean) do not block
          pruning of their parent, since they are always computable.
@@ -44,7 +44,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime
-from typing import TYPE_CHECKING, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set
 
 from osprey.engine.ast.grammar import ASTNode, IsConstant, Source, String
 from osprey.engine.ast.grammar import List as GrammarList
@@ -55,6 +55,7 @@ from osprey.engine.executor.node_executor.call_executor import CallExecutor
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
 from osprey.engine.stdlib.udfs.resolve_optional import ResolveOptional
 from osprey.engine.stdlib.udfs.rules import Rule, WhenRules
+from osprey.engine.udf.base import UDFBase
 from result import Err, Ok
 
 if TYPE_CHECKING:
@@ -80,7 +81,7 @@ def _node_key_from_chain(chain: DependencyChain) -> NodeKey:
     return id(chain.executor.node)
 
 
-def _chain_udf(chain: DependencyChain) -> Optional[object]:
+def _chain_udf(chain: DependencyChain) -> Optional[UDFBase[Any, Any]]:
     """Return the UDF instance from a CallExecutor chain, or None."""
     if isinstance(chain.executor, CallExecutor):
         return chain.executor._udf
@@ -286,25 +287,35 @@ def _compute_fold_values(
         if key not in foldable and not _is_constant_node(chain):
             continue
         udf = _chain_udf(chain)
-        is_declared_udf = (
-            udf is not None and not _is_json_extractor(chain) and udf.is_fold_safe_when_absent()  # type: ignore[attr-defined]
-        )
-        try:
-            if is_declared_udf:
-                # A UDF declared fold-safe (e.g. HasLabel(status='added')): resolve its arguments
-                # (so an absent *required* input still propagates a failure exactly as execute
-                # would), then take the declared absent_value INSTEAD of running the body — skipping
-                # its backend IO. resolve_arguments makes no UDF call itself.
-                resolved_args = udf.resolve_arguments(ctx, chain.executor)  # type: ignore[union-attr]
-                result: "NodeResult" = udf.absent_value(resolved_args)  # type: ignore[union-attr]
+        result: "NodeResult"
+        if udf is not None and not _is_json_extractor(chain) and udf.is_fold_safe_when_absent():
+            # A UDF that declares itself fold-safe: resolve its arguments (so an absent *required*
+            # input still fail-propagates exactly as execute would) then take the declared
+            # absent_value INSTEAD of running the body — skipping its backend IO. resolve_arguments
+            # makes no UDF call itself.
+            try:
+                resolved_args = udf.resolve_arguments(ctx, chain.executor)
+            except Exception:
+                # A required absent input fail-propagated -> shadowed, exactly as execute would.
+                result = Err(None)
             else:
+                try:
+                    result = udf.absent_value(resolved_args)
+                except Exception as e:
+                    # absent_value must never raise (it's a pure declaration). Surface a buggy
+                    # declaration LOUDLY rather than silently mis-folding to Err — but don't crash
+                    # config-load for every action; fall back to Err for this node only.
+                    result = Err(None)
+                    log.warning("absent_value raised for %s on %s: %r", chain.executor.node, action_name, e)
+        else:
+            try:
                 result = Ok(chain.executor.execute(execution_context=ctx))
-        except Exception as e:
-            # An absent extractor expectedly raises (MissingJsonPath/ExpectedUdfException) -> Err,
-            # exactly as the rescue would. Log at debug so a genuinely-broken fold-safe node stays
-            # diagnosable rather than indistinguishable from the expected absent failures.
-            result = Err(None)
-            log.debug("fold replay raised for %s on %s: %r", chain.executor.node, action_name, e)
+            except Exception as e:
+                # An absent extractor expectedly raises (MissingJsonPath/ExpectedUdfException) ->
+                # Err, exactly as the rescue would. Debug-log so a genuinely-broken fold-safe node
+                # stays diagnosable rather than indistinguishable from the expected absent failures.
+                result = Err(None)
+                log.debug("fold replay raised for %s on %s: %r", chain.executor.node, action_name, e)
         # Store directly rather than via set_resolved_value — the latter calls the topological
         # sorter's done(), which raises for chains never handed out by get_ready().
         ctx._resolved_node_values[key] = result

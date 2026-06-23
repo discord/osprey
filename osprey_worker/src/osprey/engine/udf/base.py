@@ -100,16 +100,20 @@ class UDFBase(Generic[Arguments, RValue], ABC):
         IO) with the precomputed `absent_value()`? Default False: the UDF executes as normal.
 
         Override (returning True for the safe configurations) + implement `absent_value` only for
-        UDFs whose result on an absent input is a determinate constant — e.g. HasLabel with
-        `status='added'` is always False. The specializer still computes the value via
-        `resolve_arguments` so an absent *required* input that fails propagates as a failure
-        exactly as `execute` would; this only skips the UDF body (and its IO)."""
+        UDFs whose result on an absent input is a determinate constant. NOTE this only helps a UDF
+        whose primary input is OPTIONAL — one that folds to a real `Ok(None)`. If the input is a
+        required value (or an entity, which can never hold None), the upstream extractor folds to
+        `Err`, which the specializer propagates through `resolve_arguments` (so the UDF fails
+        exactly as `execute` would) and `absent_value` is never reached — so declaring it buys
+        nothing there. The first beneficiaries are IO UDFs keyed on an optional scalar."""
         return False
 
     def absent_value(self, arguments: Arguments) -> 'NodeResult':
         """The NodeResult this UDF produces when its primary input is absent, given resolved
-        arguments. Only called when `is_fold_safe_when_absent()` is True, and MUST equal what
-        `execute` would produce/raise on absent input (Ok(value), or Err for a raise)."""
+        arguments. Only called when `is_fold_safe_when_absent()` is True. MUST equal the Ok/Err
+        *kind* — and, for Ok, the *value* — that `execute` would produce on absent input (the Err
+        payload is not load-bearing: downstream resolution branches only on Ok-vs-Err). MUST NOT
+        do IO (it runs at config-load). A bug here is surfaced loudly by the specializer."""
         raise NotImplementedError(f'{type(self).__name__} is fold-safe but did not implement absent_value')
 
     def __init__(self, validation_context: 'ValidationContext', arguments: Arguments):

@@ -8,7 +8,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Set
+from typing import Callable, Dict, FrozenSet, List, Mapping, Optional, Set
 
 log = logging.getLogger(__name__)
 
@@ -62,40 +62,33 @@ class SchemaLoadError(Exception):
     """Raised when a schema file cannot be parsed or is invalid."""
 
 
-def load_schema(schema_path: Path, schemas_dir: Optional[Path] = None) -> ActionSchema:
-    """Load and parse a single action schema JSON file.
+def parse_schema(raw: dict, ref_reader: Callable[[str], dict], where: str) -> ActionSchema:
+    """Parse an already-decoded schema dict into an ActionSchema.
+
+    This is the source-agnostic core shared by the disk loader (``load_schema``) and the
+    in-memory loader (``load_schema_for_action_from_sources``). The two differ only in HOW
+    they read raw JSON and resolve ``$ref:`` references.
 
     Args:
-        schema_path: Path to the <action_name>.json schema file.
-        schemas_dir: Base directory for resolving $ref: paths. Defaults to
-            the parent directory of schema_path.
-
-    Returns:
-        Parsed ActionSchema.
+        raw: The decoded top-level schema JSON.
+        ref_reader: Resolves a ``$ref:`` string (e.g. ``"$ref:types/user.json"``) to the
+            decoded contents of the referenced type. Implementations must enforce any
+            path-traversal guards and raise SchemaLoadError on escape / not-found.
+        where: A human-readable location label (file path or sources key) for error messages.
 
     Raises:
-        SchemaLoadError: if the file is missing, malformed, or violates constraints.
+        SchemaLoadError: if the schema is malformed or violates constraints.
     """
-    if schemas_dir is None:
-        schemas_dir = schema_path.parent
-
-    try:
-        raw = json.loads(schema_path.read_text())
-    except FileNotFoundError:
-        raise SchemaLoadError(f"Schema file not found: {schema_path}")
-    except json.JSONDecodeError as e:
-        raise SchemaLoadError(f"Invalid JSON in {schema_path}: {e}")
-
     version = raw.get("version")
     if version != _SUPPORTED_VERSION:
         raise SchemaLoadError(
-            f"Unsupported schema version in {schema_path}: {version!r}. "
+            f"Unsupported schema version in {where}: {version!r}. "
             f"Expected {_SUPPORTED_VERSION!r}."
         )
 
     action = raw.get("action", "")
     if not action:
-        raise SchemaLoadError(f"Missing 'action' field in {schema_path}")
+        raise SchemaLoadError(f"Missing 'action' field in {where}")
 
     raw_provides: Dict[str, object] = raw.get("provides", {})
     absent_list: List[str] = raw.get("absent", [])
@@ -109,34 +102,14 @@ def load_schema(schema_path: Path, schemas_dir: Optional[Path] = None) -> Action
     overlap = provides_groups & absent_groups
     if overlap:
         raise SchemaLoadError(
-            f"Schema {schema_path}: groups {overlap!r} appear in both 'provides' and 'absent'."
+            f"Schema {where}: groups {overlap!r} appear in both 'provides' and 'absent'."
         )
 
-    # Resolve $ref: references — load referenced type files and merge into provides
-    # $ref values point to types/<name>.json relative to schemas_dir
-    _schemas_dir_resolved = schemas_dir.resolve()
-
-    def _resolve_ref_path(ref_str: str) -> Path:
-        """Resolve a $ref: path and assert it stays within schemas_dir."""
-        ref_rel = ref_str[len("$ref:"):]
-        ref_path = (schemas_dir / ref_rel).resolve()
-        if not ref_path.is_relative_to(_schemas_dir_resolved):
-            raise SchemaLoadError(
-                f"$ref path escapes schemas directory: {ref_rel!r} resolves to {ref_path}"
-            )
-        return ref_path
-
+    # Resolve $ref: references — load referenced type definitions and merge into provides.
     resolved_provides: Dict[str, object] = {}
     for group, value in raw_provides.items():
         if isinstance(value, str) and value.startswith("$ref:"):
-            ref_path = _resolve_ref_path(value)
-            try:
-                ref_data = json.loads(ref_path.read_text())
-            except FileNotFoundError:
-                raise SchemaLoadError(f"Referenced type file not found: {ref_path} (from {schema_path})")
-            except json.JSONDecodeError as e:
-                raise SchemaLoadError(f"Invalid JSON in referenced file {ref_path}: {e}")
-            resolved_provides[group] = ref_data
+            resolved_provides[group] = ref_reader(value)
         else:
             resolved_provides[group] = value
 
@@ -144,14 +117,11 @@ def load_schema(schema_path: Path, schemas_dir: Optional[Path] = None) -> Action
     for group, ref_str in types_used.items():
         if isinstance(ref_str, str) and ref_str.startswith("$ref:") and group not in resolved_provides:
             try:
-                ref_path = _resolve_ref_path(ref_str)
-                ref_data = json.loads(ref_path.read_text())
-                resolved_provides[group] = ref_data
+                resolved_provides[group] = ref_reader(ref_str)
                 provides_groups.add(group)
             except SchemaLoadError:
-                raise
-            except (FileNotFoundError, json.JSONDecodeError):
-                # types_used refs are informational; skip if the file doesn't exist yet
+                # types_used refs are informational; skip if the type isn't available yet (a
+                # missing/escaping ref here must not break loading the schema).
                 pass
 
     # Flatten provides to dot-notation field types: "user.id" -> "int"
@@ -178,6 +148,51 @@ def load_schema(schema_path: Path, schemas_dir: Optional[Path] = None) -> Action
         provides_field_types=provides_field_types,
         optional_for=optional_for,
     )
+
+
+def load_schema(schema_path: Path, schemas_dir: Optional[Path] = None) -> ActionSchema:
+    """Load and parse a single action schema JSON file from disk.
+
+    Args:
+        schema_path: Path to the <action_name>.json schema file.
+        schemas_dir: Base directory for resolving $ref: paths. Defaults to
+            the parent directory of schema_path.
+
+    Returns:
+        Parsed ActionSchema.
+
+    Raises:
+        SchemaLoadError: if the file is missing, malformed, or violates constraints.
+    """
+    if schemas_dir is None:
+        schemas_dir = schema_path.parent
+
+    try:
+        raw = json.loads(schema_path.read_text())
+    except FileNotFoundError:
+        raise SchemaLoadError(f"Schema file not found: {schema_path}")
+    except json.JSONDecodeError as e:
+        raise SchemaLoadError(f"Invalid JSON in {schema_path}: {e}")
+
+    # $ref values point to types/<name>.json relative to schemas_dir.
+    _schemas_dir_resolved = schemas_dir.resolve()
+
+    def _disk_ref_reader(ref_str: str) -> dict:
+        """Resolve a $ref: path on disk, asserting it stays within schemas_dir."""
+        ref_rel = ref_str[len("$ref:"):]
+        ref_path = (schemas_dir / ref_rel).resolve()
+        if not ref_path.is_relative_to(_schemas_dir_resolved):
+            raise SchemaLoadError(
+                f"$ref path escapes schemas directory: {ref_rel!r} resolves to {ref_path}"
+            )
+        try:
+            return json.loads(ref_path.read_text())
+        except FileNotFoundError:
+            raise SchemaLoadError(f"Referenced type file not found: {ref_path} (from {schema_path})")
+        except json.JSONDecodeError as e:
+            raise SchemaLoadError(f"Invalid JSON in referenced file {ref_path}: {e}")
+
+    return parse_schema(raw, _disk_ref_reader, where=str(schema_path))
 
 
 def resolve_schemas_dir() -> Optional[Path]:
@@ -224,3 +239,48 @@ def load_schema_for_action(action_name: str, schemas_dir: Path) -> Optional[Acti
     except SchemaLoadError:
         log.exception("Failed to load schema for action %r from %s", action_name, schema_path)
         return None
+
+
+def load_schema_for_action_from_sources(
+    action_name: str, schemas: Mapping[str, str]
+) -> Optional[ActionSchema]:
+    """Load the schema for an action from the in-memory ``Sources`` schema map.
+
+    ``schemas`` maps repo-relative posix paths (``schemas/<action>.json``,
+    ``schemas/types/<name>.json``) to raw JSON contents — the same map that rides on the
+    etcd Sources payload. This is the etcd-sourced counterpart to
+    :func:`load_schema_for_action`: it lets #55's specializer activate on the prod worker,
+    which has no schemas directory on disk.
+
+    Returns None if no schema exists for ``action_name``.
+
+    Raises:
+        SchemaLoadError: if the schema (or a referenced type) is malformed, missing, or a
+            ``$ref:`` attempts to escape the ``schemas/`` key space.
+    """
+    key = f"schemas/{action_name}.json"
+    raw_text = schemas.get(key)
+    if raw_text is None:
+        return None
+
+    def _sources_ref_reader(ref_str: str) -> dict:
+        """Resolve a $ref: against the schemas map, rejecting absolute / traversing paths."""
+        ref_rel = ref_str[len("$ref:"):]
+        # Reject absolute paths or any parent-traversal segment — refs must stay within the
+        # `schemas/` key space, mirroring the disk loader's path-traversal guard.
+        if ref_rel.startswith("/") or any(part == ".." for part in ref_rel.split("/")):
+            raise SchemaLoadError(f"$ref path escapes schemas directory: {ref_rel!r}")
+        ref_key = f"schemas/{ref_rel}"
+        ref_text = schemas.get(ref_key)
+        if ref_text is None:
+            raise SchemaLoadError(f"Referenced type not found: {ref_key} (from {key})")
+        try:
+            return json.loads(ref_text)
+        except json.JSONDecodeError as e:
+            raise SchemaLoadError(f"Invalid JSON in referenced source {ref_key}: {e}")
+
+    try:
+        raw = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        raise SchemaLoadError(f"Invalid JSON in {key}: {e}")
+    return parse_schema(raw, _sources_ref_reader, where=key)

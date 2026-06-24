@@ -348,6 +348,7 @@ class AsyncOspreyEngine:
             self._shadow_filter,
             self.get_known_action_names,
             self.register_specialized_graph,
+            schemas=self._execution_graph.validated_sources.sources.schemas(),
         )
 
     async def execute(

@@ -13,23 +13,45 @@ from .yaml import SafeDumper, SafeLineLoader, WithLineAndCol
 
 SOURCE_ENTRY_POINT_PATH = 'main.sml'
 CONFIG_PATH = 'config.yaml'
+# Typed-action-contract schema JSON rides on the same Sources payload as the rules, keyed
+# under this prefix (e.g. 'schemas/guild_joined.json', 'schemas/types/user.json'). These keys
+# never collide with the *.sml / config.yaml namespaces, so they round-trip through
+# to_dict/from_dict (and thus etcd) without touching the deployer or provider.
+SCHEMAS_PREFIX = 'schemas/'
 
 
 class Sources:
     """A collection of sources, and an arbitrary configuration which describes a set of imported rules and perhaps
     additional configuration that will be executed by the engine."""
 
-    def __init__(self, sources: Dict[str, Source], config: Optional['SourcesConfig'] = None):
+    def __init__(
+        self,
+        sources: Dict[str, Source],
+        config: Optional['SourcesConfig'] = None,
+        schemas: Optional[Dict[str, str]] = None,
+    ):
         assert SOURCE_ENTRY_POINT_PATH in sources, (
             "Sources requires a file with the `path` 'main.sml' to be present as the entry-point"
         )
         self._sources = sources
         self._config = config if config is not None else SourcesConfig(Source(path=CONFIG_PATH, contents=''))
+        # Typed-action-contract schema JSON, keyed by repo-relative posix path under
+        # SCHEMAS_PREFIX (path -> raw JSON contents). Carried separately from `sources` so it
+        # never flows through the .sml-only `add_source` path.
+        self._schemas = dict(schemas or {})
         self._hash: Optional[str] = None
 
     @property
     def config(self) -> 'SourcesConfig':
         return self._config
+
+    def schemas(self) -> Dict[str, str]:
+        """Returns a copy of the typed-action-contract schema map (path -> raw JSON)."""
+        return dict(self._schemas)
+
+    def get_schema(self, path: str) -> Optional[str]:
+        """Returns the raw JSON contents of a schema by its path, if present."""
+        return self._schemas.get(path)
 
     def get_by_path(self, path: str) -> Optional[Source]:
         """Gets a source that belongs to a given path, if it exists."""
@@ -60,21 +82,31 @@ class Sources:
         if self._config.source.contents:
             sources.append(self._config.source)
 
-        return {source.path: source.contents for source in sources}
+        result = {source.path: source.contents for source in sources}
+        # Schema keys live under SCHEMAS_PREFIX and never collide with *.sml / config.yaml, so
+        # this is a no-op (byte-identical) when there are no schemas.
+        result.update(self._schemas)
+        return result
 
     @staticmethod
     def from_dict(sources_dict: Dict[str, str]) -> 'Sources':
         """Creates a Sources object from a dict of path -> contents."""
         builder = SourcesBuilder()
 
+        schemas: Dict[str, str] = {}
         for path, contents in sources_dict.items():
+            # Partition schema keys BEFORE the config/add_source dispatch — they must not flow
+            # through `add_source`, which asserts a `.sml` suffix.
+            if path.startswith(SCHEMAS_PREFIX):
+                schemas[path] = contents
+                continue
             source = Source(path=path, contents=contents)
             if source.path == CONFIG_PATH:
                 builder.add_config(source)
             else:
                 builder.add_source(source)
 
-        return builder.build()
+        return builder.build(schemas=schemas)
 
     @staticmethod
     def from_path(root: Path) -> 'Sources':
@@ -94,7 +126,16 @@ class Sources:
         ]
         builder.add_config(*config_sources)
 
-        return builder.build()
+        # Typed-action-contract schemas: keyed by repo-relative posix path under SCHEMAS_PREFIX
+        # (e.g. 'schemas/guild_joined.json', 'schemas/types/user.json'). Anchored at the repo
+        # root with glob (NOT rglob) so every key is rooted at 'schemas/' and round-trips
+        # through from_dict's prefix partition; rglob would also match a nested 'schemas/' dir,
+        # whose non-prefixed key would crash from_dict's .sml assert.
+        schemas = {
+            '/'.join(path.relative_to(root).parts): path.read_text() for path in root.glob('schemas/**/*.json')
+        }
+
+        return builder.build(schemas=schemas)
 
     def hash(self) -> str:
         """Returns the hash of the sources - a good way to quickly identify what sources are being executed."""
@@ -112,6 +153,14 @@ class Sources:
                 hasher.update(source.path.encode('utf-8'))
                 hasher.update(b'|')
                 hasher.update(source.contents.encode('utf-8'))
+
+            # Fold the schema map into the hash (sorted by path for determinism) so a
+            # schema-only edit invalidates the hash and the worker reloads to pick up the new
+            # specialized graphs. Empty schemas add nothing, preserving back-compat hashes.
+            for path in sorted(self._schemas):
+                hasher.update(path.encode('utf-8'))
+                hasher.update(b'|')
+                hasher.update(self._schemas[path].encode('utf-8'))
 
             self._hash = hasher.hexdigest()
 
@@ -146,8 +195,8 @@ class SourcesBuilder:
         self._config = SourcesConfig(*self._config_sources.values())
         return self
 
-    def build(self) -> Sources:
-        return Sources(self._sources, config=self._config)
+    def build(self, schemas: Optional[Dict[str, str]] = None) -> Sources:
+        return Sources(self._sources, config=self._config, schemas=schemas)
 
 
 class SourcesConfig(Dict[str, Any]):

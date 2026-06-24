@@ -25,6 +25,7 @@ from osprey.engine.schema.schema_loader import (
     SchemaLoadError,
     filter_includes,
     load_schema_for_action,
+    load_schema_for_action_from_sources,
     resolve_schemas_dir,
 )
 from osprey.worker.lib.instruments import metrics
@@ -38,28 +39,39 @@ def load_and_register_specialized_graphs(
     shadow_filter: FrozenSet[str],
     get_action_names: Callable[[], Iterable[str]],
     register: Callable[[str, ExecutionGraph], None],
+    schemas: Optional[Mapping[str, str]] = None,
 ) -> int:
     """Load schemas for allowlisted actions, specialize them against ``full_graph``, and
     register each via ``register(action_name, specialized_graph)``. Returns the count
     registered.
 
-    No-op (returns 0) when neither gate is set or no schemas dir resolves — so shipping
-    schema files on the rules path cannot change behavior until an action is explicitly
-    listed in ``OSPREY_TYPED_CONTRACT_PRUNING`` / ``_SHADOW``. ``get_action_names`` is
-    called lazily (only past those gate checks) so the disabled-by-default path does no work.
+    Schemas come from one of two sources: the in-memory ``schemas`` map carried on the etcd
+    Sources payload (when non-empty), else the on-disk schemas directory resolved via
+    ``resolve_schemas_dir``. The Sources path lets the specializer activate on the
+    etcd-sourced prod worker, which has no schemas directory on disk.
+
+    No-op (returns 0) when neither gate is set, or when no schemas are provided AND no
+    schemas dir resolves — so shipping schema files cannot change behavior until an action is
+    explicitly listed in ``OSPREY_TYPED_CONTRACT_PRUNING`` / ``_SHADOW``. ``get_action_names``
+    is called lazily (only past those gate checks) so the disabled-by-default path does no work.
     """
     register_filter = prune_filter | shadow_filter
     if not register_filter:
         return 0
-    schemas_dir = resolve_schemas_dir()
-    if schemas_dir is None:
+    use_sources = bool(schemas)
+    schemas_dir = None if use_sources else resolve_schemas_dir()
+    if not use_sources and schemas_dir is None:
         return 0
     loaded = 0
     for action_name in get_action_names():
         if not filter_includes(register_filter, action_name):
             continue
         try:
-            schema = load_schema_for_action(action_name, schemas_dir)
+            if schemas:  # in-memory etcd Sources map (the truthiness narrows Optional for mypy)
+                schema = load_schema_for_action_from_sources(action_name, schemas)
+            else:
+                assert schemas_dir is not None  # guaranteed by the gate above
+                schema = load_schema_for_action(action_name, schemas_dir)
         except SchemaLoadError as e:
             log.warning("Failed to load schema for %s: %s", action_name, e)
             continue
@@ -68,8 +80,9 @@ def load_and_register_specialized_graphs(
         register(action_name, specialize_graph(full_graph, schema))
         loaded += 1
     if loaded:
+        source_desc = "Sources" if use_sources else schemas_dir
         log.info("Loaded %d specialized graphs from %s (prune=%r shadow=%r)",
-                 loaded, schemas_dir, sorted(prune_filter), sorted(shadow_filter))
+                 loaded, source_desc, sorted(prune_filter), sorted(shadow_filter))
     return loaded
 
 

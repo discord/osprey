@@ -10,6 +10,7 @@ from osprey.engine.schema.schema_loader import (
     SchemaLoadError,
     load_schema,
     load_schema_for_action,
+    load_schema_for_action_from_sources,
     resolve_schemas_dir,
 )
 
@@ -201,6 +202,82 @@ class TestSchemaLoader:
         assert len(schema.provides_groups) == 0
         assert len(schema.absent_groups) == 0
         assert len(schema.provides_field_types) == 0
+
+
+class TestLoadSchemaFromSources:
+    """``load_schema_for_action_from_sources`` reads schemas from the in-memory
+    ``Sources._schemas`` map (etcd payload) rather than disk — this is what activates typed
+    contracts on the etcd-sourced prod worker.
+    """
+
+    def test_finds_by_name(self) -> None:
+        schemas = {"schemas/guild_joined.json": json.dumps(_VALID_SCHEMA)}
+        schema = load_schema_for_action_from_sources("guild_joined", schemas)
+        assert schema is not None
+        assert schema.action == "guild_joined"
+        assert "user" in schema.provides_groups
+
+    def test_returns_none_if_missing(self) -> None:
+        schemas = {"schemas/guild_joined.json": json.dumps(_VALID_SCHEMA)}
+        assert load_schema_for_action_from_sources("other_action", schemas) is None
+        assert load_schema_for_action_from_sources("guild_joined", {}) is None
+
+    def test_resolves_ref_from_map(self) -> None:
+        schema_data = dict(_VALID_SCHEMA)
+        schema_data["provides"] = {"user": "$ref:types/user.json", "guild": {"id": "int"}}
+        schemas = {
+            "schemas/guild_joined.json": json.dumps(schema_data),
+            "schemas/types/user.json": json.dumps({"id": "int", "username": "str"}),
+        }
+        schema = load_schema_for_action_from_sources("guild_joined", schemas)
+        assert schema is not None
+        assert schema.provides_field_types["user.id"] == "int"
+        assert schema.provides_field_types["user.username"] == "str"
+        assert schema.provides_field_types["guild.id"] == "int"
+
+    def test_missing_ref_raises(self) -> None:
+        schema_data = dict(_VALID_SCHEMA)
+        schema_data["provides"] = {"user": "$ref:types/nonexistent.json"}
+        schemas = {"schemas/guild_joined.json": json.dumps(schema_data)}
+        with pytest.raises(SchemaLoadError, match="not found"):
+            load_schema_for_action_from_sources("guild_joined", schemas)
+
+    def test_relative_traversal_ref_raises(self) -> None:
+        schema_data = dict(_VALID_SCHEMA)
+        schema_data["provides"] = {"user": "$ref:../../etc/passwd"}
+        schemas = {"schemas/guild_joined.json": json.dumps(schema_data)}
+        with pytest.raises(SchemaLoadError, match="escapes schemas directory"):
+            load_schema_for_action_from_sources("guild_joined", schemas)
+
+    def test_absolute_ref_raises(self) -> None:
+        schema_data = dict(_VALID_SCHEMA)
+        schema_data["provides"] = {"user": "$ref:/etc/hostname"}
+        schemas = {"schemas/guild_joined.json": json.dumps(schema_data)}
+        with pytest.raises(SchemaLoadError, match="escapes schemas directory"):
+            load_schema_for_action_from_sources("guild_joined", schemas)
+
+    def test_parity_disk_vs_from_sources(self, tmp_path: Path) -> None:
+        """The same JSON loaded via disk ``load_schema`` and via the from-sources path must
+        yield equal ActionSchema objects (incl. a resolved $ref)."""
+        schema_data = dict(_VALID_SCHEMA)
+        schema_data["provides"] = {"user": "$ref:types/user.json", "guild": {"id": "int"}}
+        type_data = {"id": "int", "username": "str"}
+
+        # Disk
+        types_dir = tmp_path / "types"
+        types_dir.mkdir()
+        (types_dir / "user.json").write_text(json.dumps(type_data))
+        disk_path = _write_schema(tmp_path, schema_data)
+        disk_schema = load_schema(disk_path, schemas_dir=tmp_path)
+
+        # From sources
+        schemas = {
+            "schemas/guild_joined.json": json.dumps(schema_data),
+            "schemas/types/user.json": json.dumps(type_data),
+        }
+        sources_schema = load_schema_for_action_from_sources("guild_joined", schemas)
+
+        assert sources_schema == disk_schema
 
 
 class TestResolveSchemasDir:

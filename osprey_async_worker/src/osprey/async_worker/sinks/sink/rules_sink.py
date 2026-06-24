@@ -19,7 +19,6 @@ from osprey.worker.sinks.utils.acking_contexts_base import BaseAckingContext, Ve
 
 from osprey.async_worker.adaptor.interfaces import AsyncBaseOutputSink
 from osprey.async_worker.engine import AsyncOspreyEngine
-from osprey.async_worker.executor import execute as async_execute
 from osprey.async_worker.sinks.sink.input_stream import AsyncBaseInputStream
 
 logger = logging.getLogger(__name__)
@@ -92,8 +91,11 @@ class AsyncRulesRunner:
         result: Optional[ExecutionResult] = None
         try:
             with metrics.timed('handled_message', tags=tags, use_ms=True):
-                result = await async_execute(
-                    self._engine.execution_graph,
+                # Route through engine.execute() rather than async_execute() on the full graph
+                # directly, so typed-action-contract dispatch runs: an allowlisted action is served
+                # its specialized (pruned) graph and/or shadow-diffed. For non-allowlisted actions
+                # execute() serves the full execution graph — identical to the prior direct call.
+                result = await self._engine.execute(
                     self._udf_helpers,
                     action,
                     max_concurrent=self._max_concurrent_udfs,

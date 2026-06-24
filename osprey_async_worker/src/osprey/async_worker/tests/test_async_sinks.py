@@ -3,14 +3,16 @@
 import asyncio
 from datetime import datetime
 from typing import List
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from osprey.engine.executor.execution_context import Action, ExecutionResult
 
 from osprey.async_worker.adaptor.interfaces import AsyncBaseOutputSink
+from osprey.async_worker.sinks.sink import rules_sink as rules_sink_module
 from osprey.async_worker.sinks.sink.input_stream import AsyncStaticInputStream
 from osprey.async_worker.sinks.sink.output_sink import AsyncMultiOutputSink, AsyncStdoutOutputSink
+from osprey.async_worker.sinks.sink.rules_sink import AsyncRulesRunner
 
 
 def _make_result(action_id: int = 1, action_name: str = 'test') -> ExecutionResult:
@@ -189,3 +191,36 @@ async def test_multi_sink_stop():
 async def test_stdout_sink_will_do_work():
     sink = AsyncStdoutOutputSink()
     assert sink.will_do_work(_make_result()) is True
+
+
+# --- AsyncRulesRunner dispatch wiring ---
+
+
+@pytest.mark.asyncio
+async def test_classify_one_routes_through_engine_execute_for_dispatch():
+    """Regression: classify_one MUST execute via engine.execute() (which runs the
+    typed-action-contract resolve_dispatch + shadow), NOT via async_execute() against the
+    full execution_graph directly. The direct-graph path made the specializer a runtime
+    no-op on the asyncio worker (the sole prod path) — specialized graphs registered at
+    init but never served. This pins the sink to the dispatch-aware engine method."""
+    served = _make_result(action_id=123, action_name='guild_invite_created')
+    engine = MagicMock()
+    engine.execute = AsyncMock(return_value=served)
+    # No per-action sample config -> ActionSampler returns _SAMPLE_NEVER (action not dropped).
+    engine.get_config_subkey.return_value.get_action_config.return_value = None
+
+    output_sink = MagicMock()
+    output_sink.push = AsyncMock()
+
+    runner = AsyncRulesRunner(engine, output_sink, MagicMock(), max_concurrent_udfs=1)
+    action = Action(action_id=123, action_name='guild_invite_created', data={}, timestamp=datetime.utcnow())
+
+    with patch.object(rules_sink_module, 'metrics', MagicMock()):
+        result = await runner.classify_one(action, tag='test')
+
+    # The dispatch-aware engine method was used (the bug bypassed it for a direct full-graph run).
+    engine.execute.assert_awaited_once()
+    assert action in engine.execute.call_args.args, 'engine.execute must receive the action'
+    # The served result flows to the output sink and is returned.
+    output_sink.push.assert_awaited_once_with(served)
+    assert result is served

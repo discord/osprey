@@ -12,7 +12,7 @@ import json
 import logging
 from random import randint, uniform
 from time import time
-from typing import Any, Callable, ClassVar, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, ClassVar, Deque, Dict, List, Optional, Tuple
 
 from hash_ring import HashRing, HashRingNode
 from osprey.worker.lib import etcd
@@ -60,8 +60,6 @@ class _AsyncHashRing:
             )
             event = await loop.run_in_executor(None, watcher.begin_watching)
             self._handle_event(event)
-            # Reuse the watcher we already begin_watching()'d; the loop drives the
-            # same continue_watching() generator continuously without recreating it.
             self._watch_task = asyncio.create_task(self._watch_loop(watcher))
         except Exception:
             self._initialized = False
@@ -226,8 +224,6 @@ class AsyncServiceWatcher:
                 self._service_name, len(self._instances), list(self._instances.keys()),
             )
             await self._ring.ensure_initialized()
-            # Reuse the watcher we already begin_watching()'d; the loop drives the
-            # same continue_watching() generator continuously without recreating it.
             # Events are applied on the loop thread, keeping instance mutation
             # single-threaded and consistent with select(), and keeping any
             # DOWN-listener create_task on a running loop.

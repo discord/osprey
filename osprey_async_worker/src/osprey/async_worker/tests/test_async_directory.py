@@ -1,4 +1,4 @@
-"""Regression tests for the threaded continuous-consumption etcd watcher.
+"""Regression tests for the continuous-consumption etcd watcher.
 
 These tests cover the production incident where a worker's smite_shortlist instance
 set got wiped to empty and never repopulated (select() raised "No service" forever
@@ -6,21 +6,20 @@ until the worker was restarted). The root cause was that the watch loop consumed
 ``continue_watching()`` one event at a time, recreating the generator per event,
 which reset its resume index / dedup mux and defeated its built-in recovery.
 
-The fix iterates ``continue_watching()`` continuously on a dedicated daemon thread,
-forwarding each event to the asyncio loop where it is applied single-threaded.
+The fix drives a single persistent ``continue_watching()`` generator in
+``_watch_loop`` (one asyncio task per watcher, pumping ``next(it)`` through the
+executor), applying each event on the loop thread.
 
 Covered here:
   * recovery-after-empty-full-sync — an empty FullSyncRecursive wipes the set (no
     guard), and the SAME continuous generator repopulates it via incremental upserts;
-  * stop() teardown — stop() sets the stop event and cancels the consumer task, and
-    the daemon watch threads unwind on their next poll (they are not joined);
+  * stop() teardown — stop() cancels the watch task (and the ring's);
   * the same fix applied to _AsyncHashRing (SCALAR routing).
 """
 
 import asyncio
 import json
 import queue
-import threading
 from types import SimpleNamespace
 
 import pytest
@@ -36,9 +35,10 @@ from osprey.worker.lib.etcd import (
 
 from osprey.async_worker.lib.discovery.async_directory import AsyncServiceWatcher, _AsyncHashRing
 
-# Sentinel pushed into a fake watcher's inbox to make continue_watching() return,
-# simulating the watcher's next poll/timeout so the daemon thread can unwind.
-_STOP = object()
+# Sentinel pushed into a fake watcher's inbox to make continue_watching() return.
+# After the watch task is cancelled, the executor thread is still parked in
+# next() on inbox.get(); pushing this unblocks it so the pool thread is freed.
+_UNBLOCK = object()
 
 
 class FakeWatcher:
@@ -46,8 +46,8 @@ class FakeWatcher:
 
     ``begin_watching()`` returns a preset initial sync event. ``continue_watching()``
     is an infinite generator that yields whatever the test pushes into its inbox and
-    only returns when ``_STOP`` is pushed (blocking on the inbox in between, like the
-    real watcher blocking on etcd).
+    only returns when ``_UNBLOCK`` is pushed (blocking on the inbox in between, like
+    the real watcher blocking on etcd).
     """
 
     def __init__(self, initial_event):
@@ -63,15 +63,15 @@ class FakeWatcher:
     def push(self, event):
         self.inbox.put(event)
 
-    def close(self):
-        """Release a blocked continue_watching() so the daemon thread can unwind."""
-        self.inbox.put(_STOP)
+    def unblock(self):
+        """Release a blocked continue_watching() so the parked executor thread frees."""
+        self.inbox.put(_UNBLOCK)
 
     def continue_watching(self):
         self.continue_count += 1
         while True:
             item = self.inbox.get()
-            if item is _STOP:
+            if item is _UNBLOCK:
                 return
             yield item
 
@@ -130,7 +130,7 @@ def _ring_full_sync(members) -> FullSyncOne:
 
 
 async def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> bool:
-    """Poll ``predicate`` (yielding to the loop so the consumer task can run)."""
+    """Poll ``predicate`` (yielding to the loop so the watch task can run)."""
     elapsed = 0.0
     while elapsed < timeout:
         if predicate():
@@ -140,25 +140,12 @@ async def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -
     return predicate()
 
 
-def _live_thread_names() -> set:
-    """Names of currently-running daemon watch threads (no handle is stored on the
-    watcher, so liveness is observed via the threading registry instead)."""
-    return {t.name for t in threading.enumerate() if t.is_alive()}
-
-
-def _watch_thread_names(watcher: AsyncServiceWatcher) -> tuple:
-    return (
-        f'async-service-watch:{watcher._service_name}',
-        f'async-ring-watch:{watcher._ring._key}',
-    )
-
-
 async def _teardown_service(watcher: AsyncServiceWatcher, client: FakeEtcdClient) -> None:
     await watcher.stop()
+    # stop() cancels the watch tasks, but the executor threads driving next() are
+    # still parked on the fake inboxes — release them so the pool threads are freed.
     for fw in client.all_watchers:
-        fw.close()
-    names = _watch_thread_names(watcher)
-    await _wait_until(lambda: not (set(names) & _live_thread_names()))
+        fw.unblock()
 
 
 # --- AsyncServiceWatcher -----------------------------------------------------
@@ -196,7 +183,7 @@ async def test_recovers_after_empty_full_sync():
 
 @pytest.mark.asyncio
 async def test_incremental_upsert_and_delete_applied():
-    """Plain upsert/delete events flow through the queue and mutate the set."""
+    """Plain upsert/delete events flow through the watch loop and mutate the set."""
     a, b = _svc('a', 1), _svc('b', 2)
     watcher = FakeWatcher(initial_event=_full_sync([a]))
     client = FakeEtcdClient(recursive_watchers=[watcher])
@@ -216,7 +203,7 @@ async def test_incremental_upsert_and_delete_applied():
 
 @pytest.mark.asyncio
 async def test_stop_teardown():
-    """stop() sets the stop event and cancels the consumer; threads unwind on next poll."""
+    """stop() cancels the watch task for both the service watcher and its ring."""
     svc = _svc('a', 1)
     watcher = FakeWatcher(initial_event=_full_sync([svc]))
     client = FakeEtcdClient(recursive_watchers=[watcher])
@@ -224,25 +211,19 @@ async def test_stop_teardown():
     asw = AsyncServiceWatcher(client, '/discovery', 'smite_shortlist')
     await asw.ensure_initialized()
 
-    consumer = asw._consumer_task
-    ring_consumer = asw._ring._consumer_task
-    names = set(_watch_thread_names(asw))
-    assert names <= _live_thread_names()  # both watch threads are running
+    watch_task = asw._watch_task
+    ring_task = asw._ring._watch_task
+    assert watch_task is not None and not watch_task.done()
+    assert ring_task is not None and not ring_task.done()
 
     await asw.stop()
 
-    assert asw._stop_event.is_set()
-    assert asw._ring._stop_event.is_set()
-    assert consumer.done()
-    assert ring_consumer.done()
+    assert watch_task.done()
+    assert ring_task.done()
 
-    # stop() does NOT join the daemon threads — they unwind on their next poll/timeout.
-    # Simulate that next poll by releasing the blocked continue_watching() generators.
+    # Free the executor threads still parked in next() on the fake inboxes.
     for fw in client.all_watchers:
-        fw.close()
-    assert await _wait_until(
-        lambda: not (names & _live_thread_names())
-    ), 'watch threads did not unwind after their next poll'
+        fw.unblock()
 
 
 # --- _AsyncHashRing ----------------------------------------------------------
@@ -269,5 +250,4 @@ async def test_ring_recovers_after_key_deleted():
     assert await _wait_until(lambda: len(ring._members) == 1)
 
     await ring.stop()
-    ring_watcher.close()
-    await _wait_until(lambda: f'async-ring-watch:{key}' not in _live_thread_names())
+    ring_watcher.unblock()

@@ -12,7 +12,7 @@ import json
 import logging
 from random import randint, uniform
 from time import time
-from typing import Any, Callable, ClassVar, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, ClassVar, Deque, Dict, List, Optional, Tuple
 
 from hash_ring import HashRing, HashRingNode
 from osprey.worker.lib import etcd
@@ -133,27 +133,34 @@ class _AsyncHashRing:
         return result
 
     async def _watch_loop(self, watcher: Any) -> None:
+        # Drive the SAME continue_watching() generator every iteration: recreating it
+        # per event resets the watcher's resume index and dedup mux, defeating its
+        # built-in recovery (the smite_shortlist freeze). Reopen only on
+        # exhaustion/error, with exponential backoff. Mirrors AsyncEtcdSourcesProvider.
         loop = asyncio.get_running_loop()
+        backoff = 1.0
+        watcher_iter = watcher.continue_watching()
         try:
             while True:
-                event = await loop.run_in_executor(None, self._blocking_next, watcher)
-                if event is None:
-                    break
-                self._handle_event(event)
+                it = watcher_iter
+                try:
+                    event = await loop.run_in_executor(None, lambda: next(it))
+                    backoff = 1.0
+                except StopIteration:
+                    watcher_iter = watcher.continue_watching()
+                    continue
+                except Exception:
+                    logger.exception('async hash ring watch loop failed for %s', self._key)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    watcher_iter = watcher.continue_watching()
+                    continue
+                try:
+                    self._handle_event(event)
+                except Exception:
+                    logger.exception('async hash ring failed to apply event for %s', self._key)
         except asyncio.CancelledError:
             pass
-        except Exception:
-            logger.exception('hash ring watcher failed')
-
-    @staticmethod
-    def _blocking_next(watcher: Any) -> Any:
-        """Blocking call — runs in thread pool."""
-        try:
-            for event in watcher.continue_watching():
-                return event
-        except Exception:
-            return None
-        return None
 
     async def stop(self) -> None:
         if self._watch_task:
@@ -217,6 +224,9 @@ class AsyncServiceWatcher:
                 self._service_name, len(self._instances), list(self._instances.keys()),
             )
             await self._ring.ensure_initialized()
+            # Events are applied on the loop thread, keeping instance mutation
+            # single-threaded and consistent with select(), and keeping any
+            # DOWN-listener create_task on a running loop.
             self._watch_task = asyncio.create_task(self._watch_loop(watcher))
         except Exception:
             self._initialized = False
@@ -310,31 +320,39 @@ class AsyncServiceWatcher:
         logger.debug('async discovery: - %s@%s', wrapper.service.name, instance_id)
 
     async def _watch_loop(self, watcher: Any) -> None:
+        # Drive the SAME continue_watching() generator every iteration: recreating it
+        # per event resets the watcher's resume index and dedup mux, defeating its
+        # built-in recovery (the smite_shortlist freeze). Reopen only on
+        # exhaustion/error, with exponential backoff. Mirrors AsyncEtcdSourcesProvider.
         loop = asyncio.get_running_loop()
+        backoff = 1.0
+        watcher_iter = watcher.continue_watching()
         try:
             while True:
-                event = await loop.run_in_executor(None, self._blocking_next, watcher)
-                if event is None:
-                    break
-                if isinstance(event, etcd.IncrementalSyncUpsert):
-                    self._add_instance(Service.deserialize(event.value))
-                elif isinstance(event, etcd.IncrementalSyncDelete):
-                    self._remove_instance(Service.deserialize(event.prev_value).id)
-                elif isinstance(event, etcd.FullSyncRecursive):
-                    self._handle_full_sync(event)
+                it = watcher_iter
+                try:
+                    event = await loop.run_in_executor(None, lambda: next(it))
+                    backoff = 1.0
+                except StopIteration:
+                    watcher_iter = watcher.continue_watching()
+                    continue
+                except Exception:
+                    logger.exception('async service watcher failed for %s', self._service_name)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    watcher_iter = watcher.continue_watching()
+                    continue
+                try:
+                    if isinstance(event, etcd.IncrementalSyncUpsert):
+                        self._add_instance(Service.deserialize(event.value))
+                    elif isinstance(event, etcd.IncrementalSyncDelete):
+                        self._remove_instance(Service.deserialize(event.prev_value).id)
+                    elif isinstance(event, etcd.FullSyncRecursive):
+                        self._handle_full_sync(event)
+                except Exception:
+                    logger.exception('async service watcher failed to apply event for %s', self._service_name)
         except asyncio.CancelledError:
             pass
-        except Exception:
-            logger.exception('async service watcher failed for %s', self._service_name)
-
-    @staticmethod
-    def _blocking_next(watcher: Any) -> Any:
-        try:
-            for event in watcher.continue_watching():
-                return event
-        except Exception:
-            return None
-        return None
 
     async def stop(self) -> None:
         if self._watch_task:

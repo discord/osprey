@@ -19,6 +19,7 @@ from osprey.worker.sinks.utils.acking_contexts_base import BaseAckingContext, Ve
 
 from osprey.async_worker.adaptor.interfaces import AsyncBaseOutputSink
 from osprey.async_worker.engine import AsyncOspreyEngine
+from osprey.async_worker.lib.coordinator_input_stream import AsyncVerdictsAckingContext
 from osprey.async_worker.sinks.sink.input_stream import AsyncBaseInputStream
 
 logger = logging.getLogger(__name__)
@@ -123,11 +124,19 @@ class AsyncRulesSink:
         output_sink: AsyncBaseOutputSink,
         udf_helpers: UDFHelpers,
         max_concurrent_udfs: int = 12,
+        window: int = 1,
     ):
         self._input_stream = input_stream
         self._rules_runner = AsyncRulesRunner(engine, output_sink, udf_helpers, max_concurrent_udfs)
+        self._window = window
 
     async def run(self) -> None:
+        if self._window > 1:
+            await self._run_windowed()
+        else:
+            await self._run_serial()
+
+    async def _run_serial(self) -> None:
         async for message_context in self._input_stream:
             try:
                 with message_context as action:
@@ -165,6 +174,75 @@ class AsyncRulesSink:
                 logging.exception('Unexpected error in async rules sink')
                 metrics.increment('rules_sink.unexpected_error', tags=[f'err:{e.__class__.__name__}'])
                 sentry_sdk.capture_exception(e)
+
+    async def _run_windowed(self) -> None:
+        """Concurrent consumption: acking is decoupled from generator resume (see
+        coordinator_input_stream._gen_windowed), so each action's task acks its OWN
+        ack_id as soon as it finishes, instead of waiting for the slowest-in-flight action.
+
+        The semaphore bounds concurrency to ``self._window`` as a safety net; the input
+        stream itself is expected to honor the same window when talking to the coordinator.
+        """
+        semaphore = asyncio.Semaphore(self._window)
+        pending: set = set()
+
+        async for message_context in self._input_stream:
+            await semaphore.acquire()
+            task = asyncio.create_task(self._process_one(message_context, semaphore))
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _process_one(self, message_context: BaseAckingContext[Action], semaphore: asyncio.Semaphore) -> None:
+        verdicts = None
+        should_nack = False
+        try:
+            with message_context as action:
+                action_tags = [f'action:{action.action_name}']
+                metrics.increment('rules_sink.input_action_received', tags=action_tags)
+
+                if action.data.get('osprey_skip_async', False):
+                    metrics.increment('rules_sink.skipped', tags=action_tags)
+                else:
+                    with tracer.start_span('osprey.async.classify_one', child_of=None) as span:
+                        tracer.context_provider.activate(span.context)
+
+                        if not action.action_id and action.action_id != 0:
+                            action.action_id = generate_snowflake(retries=3).to_int()
+
+                        info_log_osprey_action(action.action_id, action.action_name, 'beginning async classify_one')
+                        result = await self._rules_runner.classify_one(
+                            action,
+                            tag='sink:async-rules-sink',
+                            parent_tracer_span=span,
+                        )
+
+                        if isinstance(message_context, VerdictsAckingContext):
+                            if result is None:
+                                metrics.increment('rules_sink.missing_result')
+                            else:
+                                verdicts = result.get_verdicts_pb2_proto()
+                                message_context.set_verdicts(verdicts)
+                                metrics.increment('rules_sink.captured_verdicts')
+
+                        info_log_osprey_action(action.action_id, action.action_name, 'async classify_one complete')
+        except asyncio.CancelledError:
+            should_nack = True
+            raise
+        except Exception as e:
+            logging.exception('Unexpected error in async rules sink (windowed)')
+            metrics.increment('rules_sink.unexpected_error', tags=[f'err:{e.__class__.__name__}'])
+            sentry_sdk.capture_exception(e)
+            should_nack = True
+        finally:
+            if isinstance(message_context, AsyncVerdictsAckingContext):
+                if should_nack:
+                    message_context.nack()
+                else:
+                    message_context.ack(verdicts=verdicts)
+            semaphore.release()
 
     async def stop(self) -> None:
         await self._input_stream.stop()

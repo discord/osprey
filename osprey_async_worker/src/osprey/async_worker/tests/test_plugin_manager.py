@@ -42,11 +42,13 @@ def test_async_stdlib_plugin_returns_async_mx_lookup() -> None:
 def test_async_stdlib_plugin_overrides_share_class_name() -> None:
     """Overrides shadow stdlib by class name — verify the assumption holds.
 
-    _deduplicate_udfs matches by __name__, so the async override class must
-    have the same __name__ as the sync class it replaces.
+    _deduplicate_udfs matches by __name__, so an async override class must have
+    the same __name__ as the sync class it replaces. MXLookup is such an override
+    and must be present. Net-new async-only UDFs (e.g. SleepUdf) shadow nothing,
+    so we only assert the override is registered, not that every UDF is an override.
     """
-    for async_udf in _async_stdlib_plugin.register_udfs():
-        assert async_udf.__name__ == 'MXLookup'  # currently the only override
+    names = {async_udf.__name__ for async_udf in _async_stdlib_plugin.register_udfs()}
+    assert 'MXLookup' in names
 
 
 def test_bootstrap_resolves_mx_lookup_to_async_version() -> None:

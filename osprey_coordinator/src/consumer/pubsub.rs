@@ -17,7 +17,9 @@ use crate::metrics::MetricsClientBuilder;
 use crate::{
     consumer::message_decoder,
     coordinator_metrics::OspreyCoordinatorMetrics,
-    priority_queue::{AckOrNack, AckableAction, PriorityQueueSender},
+    priority_queue::{
+        AckOrNack, AckableAction, Channel as PriorityQueueChannel, PriorityQueueSender,
+    },
     proto,
     pub_sub_streaming_pull::DetachedMessage,
     pub_sub_streaming_pull::{FlowControl, SpawnTaskPerMessageHandler, StreamingPullManager},
@@ -151,14 +153,13 @@ pub async fn start_pubsub_subscriber(
     snowflake_client: Arc<SnowflakeClient>,
     priority_queue_sender: PriorityQueueSender,
     metrics: Arc<OspreyCoordinatorMetrics>,
+    subscription_id: String,
+    channel: PriorityQueueChannel,
 ) -> Result<()> {
     let subscriber_client = create_pubsub_subscription_client().await;
     let subscription_name = {
         let project_id =
             std::env::var("PUBSUB_SUBSCRIPTION_PROJECT_ID").unwrap_or("osprey-dev".to_string());
-
-        let subscription_id = std::env::var("PUBSUB_SUBSCRIPTION_ID")
-            .unwrap_or("osprey-coordinator-actions".to_string());
 
         PubSubSubscription::new(project_id, subscription_id)
     };
@@ -216,6 +217,7 @@ pub async fn start_pubsub_subscriber(
             let priority_queue_sender = priority_queue_sender.clone();
             let snowflake_client = snowflake_client.clone();
             let kms_envelope = kms_envelope.clone();
+            let channel = channel;
 
             async move {
                 let ack_id: u64 = rand::thread_rng().gen();
@@ -242,7 +244,7 @@ pub async fn start_pubsub_subscriber(
                 let send_start_time = Instant::now();
                 match timeout(
                     max_time_to_send_to_async_queue,
-                    priority_queue_sender.send_async(ackable_action),
+                    priority_queue_sender.send(ackable_action, channel),
                 )
                 .await
                 {

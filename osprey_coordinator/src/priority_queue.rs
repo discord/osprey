@@ -343,6 +343,12 @@ pub fn spawn_priority_queue_metrics_worker(
                 .priority_queue_size_async
                 .set(queue_sender.len_async() as u64);
             metrics
+                .priority_queue_size_notif_steady
+                .set(queue_sender.len(Channel::NotifSteady) as u64);
+            metrics
+                .priority_queue_size_notif_batch
+                .set(queue_sender.len(Channel::NotifBatch) as u64);
+            metrics
                 .priority_queue_receiver_count_async
                 .set(queue_sender.receiver_count_async() as u64);
             metrics

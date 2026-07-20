@@ -11,6 +11,8 @@ define_metrics!(OspreyCoordinatorMetrics, [
     // How many messages are currently buffered in the priority queue
     priority_queue_size_sync => StaticGauge("priority_queue_size",["type" => "sync"]),
     priority_queue_size_async => StaticGauge("priority_queue_size",["type" => "async"]),
+    priority_queue_size_notif_steady => StaticGauge("priority_queue_size",["type" => "notif_steady"]),
+    priority_queue_size_notif_batch => StaticGauge("priority_queue_size",["type" => "notif_batch"]),
 
     // How many receivers are open for the priority queue
     // can be used as a proxy for number of connections open from the osprey worker

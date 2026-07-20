@@ -97,6 +97,11 @@ mod tests {
         let got = parse_subscriptions(None, Some("legacy-sub".into())).unwrap();
         assert_eq!(got, vec![("legacy-sub".into(), Channel::Async)]);
     }
+
+    #[test]
+    fn errors_when_no_subscription_configured() {
+        assert!(parse_subscriptions(None, None).is_err());
+    }
 }
 
 #[derive(Debug, Parser)]

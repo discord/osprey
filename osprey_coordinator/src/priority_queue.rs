@@ -80,55 +80,112 @@ impl ActionAcker {
     }
 }
 
-pub enum Priority {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
     Sync,
     Async,
+    NotifSteady,
+    NotifBatch,
+}
+
+/// Which channel class a worker connection serves, advertised in
+/// `ClientDetails.served_queue`. `Fast` (the default / legacy value) serves the
+/// existing `[sync, async]` biased path; the notif classes serve exactly one channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServedQueue {
+    Fast,
+    NotifSteady,
+    NotifBatch,
+}
+
+impl ServedQueue {
+    pub fn from_str(s: &str) -> ServedQueue {
+        match s {
+            "notif_steady" => ServedQueue::NotifSteady,
+            "notif_batch" => ServedQueue::NotifBatch,
+            // "", "fast", or any unknown value => legacy fast path (fail safe).
+            _ => ServedQueue::Fast,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct PriorityQueueSender {
     sync_sender: async_channel::Sender<AckableAction>,
     async_sender: async_channel::Sender<AckableAction>,
+    notif_steady_sender: async_channel::Sender<AckableAction>,
+    notif_batch_sender: async_channel::Sender<AckableAction>,
 }
 
 impl PriorityQueueSender {
     fn new(
         sync_sender: async_channel::Sender<AckableAction>,
         async_sender: async_channel::Sender<AckableAction>,
+        notif_steady_sender: async_channel::Sender<AckableAction>,
+        notif_batch_sender: async_channel::Sender<AckableAction>,
     ) -> PriorityQueueSender {
         PriorityQueueSender {
             sync_sender,
             async_sender,
+            notif_steady_sender,
+            notif_batch_sender,
         }
     }
 
     pub fn close(&self) {
         self.sync_sender.close();
         self.async_sender.close();
+        self.notif_steady_sender.close();
+        self.notif_batch_sender.close();
     }
     pub async fn send_sync(
         &self,
         ackable_action: AckableAction,
     ) -> Result<(), async_channel::SendError<AckableAction>> {
-        self.send(ackable_action, Priority::Sync).await
+        self.send(ackable_action, Channel::Sync).await
     }
 
     pub async fn send_async(
         &self,
         ackable_action: AckableAction,
     ) -> Result<(), async_channel::SendError<AckableAction>> {
-        self.send(ackable_action, Priority::Async).await
+        self.send(ackable_action, Channel::Async).await
     }
 
-    async fn send(
+    pub async fn send_notif_steady(
         &self,
         ackable_action: AckableAction,
-        priority: Priority,
+    ) -> Result<(), async_channel::SendError<AckableAction>> {
+        self.send(ackable_action, Channel::NotifSteady).await
+    }
+
+    pub async fn send_notif_batch(
+        &self,
+        ackable_action: AckableAction,
+    ) -> Result<(), async_channel::SendError<AckableAction>> {
+        self.send(ackable_action, Channel::NotifBatch).await
+    }
+
+    pub async fn send(
+        &self,
+        ackable_action: AckableAction,
+        channel: Channel,
     ) -> Result<(), async_channel::SendError<AckableAction>> {
         ackable_action.increment_retry_count();
-        match priority {
-            Priority::Sync => self.sync_sender.send(ackable_action).await,
-            Priority::Async => self.async_sender.send(ackable_action).await,
+        match channel {
+            Channel::Sync => self.sync_sender.send(ackable_action).await,
+            Channel::Async => self.async_sender.send(ackable_action).await,
+            Channel::NotifSteady => self.notif_steady_sender.send(ackable_action).await,
+            Channel::NotifBatch => self.notif_batch_sender.send(ackable_action).await,
+        }
+    }
+
+    pub fn len(&self, channel: Channel) -> usize {
+        match channel {
+            Channel::Sync => self.sync_sender.len(),
+            Channel::Async => self.async_sender.len(),
+            Channel::NotifSteady => self.notif_steady_sender.len(),
+            Channel::NotifBatch => self.notif_batch_sender.len(),
         }
     }
 
@@ -153,33 +210,54 @@ impl PriorityQueueSender {
 pub struct PriorityQueueReceiver {
     sync_receiver: async_channel::Receiver<AckableAction>,
     async_receiver: async_channel::Receiver<AckableAction>,
+    notif_steady_receiver: async_channel::Receiver<AckableAction>,
+    notif_batch_receiver: async_channel::Receiver<AckableAction>,
 }
 
 impl PriorityQueueReceiver {
     fn new(
         sync_receiver: async_channel::Receiver<AckableAction>,
         async_receiver: async_channel::Receiver<AckableAction>,
+        notif_steady_receiver: async_channel::Receiver<AckableAction>,
+        notif_batch_receiver: async_channel::Receiver<AckableAction>,
     ) -> PriorityQueueReceiver {
         PriorityQueueReceiver {
             sync_receiver,
             async_receiver,
+            notif_steady_receiver,
+            notif_batch_receiver,
         }
     }
+
     pub async fn recv(
         &self,
         metrics: Arc<OspreyCoordinatorMetrics>,
     ) -> Result<AckableAction, async_channel::RecvError> {
+        self.recv_for(ServedQueue::Fast, metrics).await
+    }
+
+    /// Affinity-aware receive: a connection only pulls from the channels its pool
+    /// serves. `Fast` preserves the existing biased sync>async behavior.
+    pub async fn recv_for(
+        &self,
+        served: ServedQueue,
+        metrics: Arc<OspreyCoordinatorMetrics>,
+    ) -> Result<AckableAction, async_channel::RecvError> {
         loop {
-            let result = tokio::select! {
-                biased;
-                result = self.sync_receiver.recv() => result,
-                result = self.async_receiver.recv() => match result {
-                    Ok(ackable_action) => {
-                        metrics.action_time_in_async_queue.record(Instant::now().duration_since(ackable_action.created_at));
-                        Ok(ackable_action)
-                    }
-                    Err(_) => self.sync_receiver.recv().await
+            let result = match served {
+                ServedQueue::Fast => tokio::select! {
+                    biased;
+                    result = self.sync_receiver.recv() => result,
+                    result = self.async_receiver.recv() => match result {
+                        Ok(ackable_action) => {
+                            metrics.action_time_in_async_queue.record(Instant::now().duration_since(ackable_action.created_at));
+                            Ok(ackable_action)
+                        }
+                        Err(_) => self.sync_receiver.recv().await
+                    },
                 },
+                ServedQueue::NotifSteady => self.notif_steady_receiver.recv().await,
+                ServedQueue::NotifBatch => self.notif_batch_receiver.recv().await,
             };
             match result {
                 Ok(ackable_action) => {
@@ -230,9 +308,21 @@ impl PriorityQueueReceiver {
 pub fn create_ackable_action_priority_queue() -> (PriorityQueueSender, PriorityQueueReceiver) {
     let (sync_sender, sync_receiver) = async_channel::unbounded();
     let (async_sender, async_receiver) = async_channel::unbounded();
+    let (notif_steady_sender, notif_steady_receiver) = async_channel::unbounded();
+    let (notif_batch_sender, notif_batch_receiver) = async_channel::unbounded();
     (
-        PriorityQueueSender::new(sync_sender, async_sender),
-        PriorityQueueReceiver::new(sync_receiver, async_receiver),
+        PriorityQueueSender::new(
+            sync_sender,
+            async_sender,
+            notif_steady_sender,
+            notif_batch_sender,
+        ),
+        PriorityQueueReceiver::new(
+            sync_receiver,
+            async_receiver,
+            notif_steady_receiver,
+            notif_batch_receiver,
+        ),
     )
 }
 
@@ -262,4 +352,74 @@ pub fn spawn_priority_queue_metrics_worker(
     });
 
     AbortOnDrop::new(join_handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator_metrics::OspreyCoordinatorMetrics;
+
+    fn ackable() -> (AckableAction, oneshot::Receiver<AckOrNack>) {
+        AckableAction::new(proto::OspreyCoordinatorAction::default())
+    }
+
+    #[tokio::test]
+    async fn served_queue_from_str_defaults_to_fast() {
+        assert_eq!(
+            ServedQueue::from_str("notif_steady"),
+            ServedQueue::NotifSteady
+        );
+        assert_eq!(
+            ServedQueue::from_str("notif_batch"),
+            ServedQueue::NotifBatch
+        );
+        assert_eq!(ServedQueue::from_str(""), ServedQueue::Fast);
+        assert_eq!(ServedQueue::from_str("fast"), ServedQueue::Fast);
+        assert_eq!(ServedQueue::from_str("garbage"), ServedQueue::Fast);
+    }
+
+    #[tokio::test]
+    async fn notif_steady_pool_only_sees_notif_steady() {
+        let metrics = OspreyCoordinatorMetrics::new();
+        let (tx, rx) = create_ackable_action_priority_queue();
+
+        // Put one action on async and one on notif-steady, with distinct names so
+        // we can tell which one the notif-steady pool actually received.
+        let (a_async, _r1) = AckableAction::new(proto::OspreyCoordinatorAction {
+            action_name: "async_action".into(),
+            ..Default::default()
+        });
+        let (a_steady, _r2) = AckableAction::new(proto::OspreyCoordinatorAction {
+            action_name: "notif_steady_action".into(),
+            ..Default::default()
+        });
+        tx.send(a_async, Channel::Async).await.unwrap();
+        tx.send(a_steady, Channel::NotifSteady).await.unwrap();
+
+        // A NotifSteady stream must receive ONLY the notif-steady action, never the async one.
+        let got = rx
+            .recv_for(ServedQueue::NotifSteady, metrics.clone())
+            .await
+            .unwrap();
+        assert_eq!(got.action.action_name, "notif_steady_action");
+        // async action is still queued (not drained by the notif-steady pool)
+        assert_eq!(tx.len(Channel::Async), 1);
+        assert_eq!(tx.len(Channel::NotifSteady), 0);
+    }
+
+    #[tokio::test]
+    async fn fast_pool_prefers_sync_then_async() {
+        let metrics = OspreyCoordinatorMetrics::new();
+        let (tx, rx) = create_ackable_action_priority_queue();
+        let (a_async, _r1) = ackable();
+        let (a_sync, _r2) = ackable();
+        tx.send(a_async, Channel::Async).await.unwrap();
+        tx.send(a_sync, Channel::Sync).await.unwrap();
+        // biased: sync drains first
+        rx.recv_for(ServedQueue::Fast, metrics.clone())
+            .await
+            .unwrap();
+        assert_eq!(tx.len(Channel::Sync), 0);
+        assert_eq!(tx.len(Channel::Async), 1);
+    }
 }

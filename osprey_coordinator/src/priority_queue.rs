@@ -289,6 +289,19 @@ impl PriorityQueueReceiver {
         Self::nack_all(&self.sync_receiver);
     }
 
+    /// Same as `nack_all_sync`/`nack_all_async`, but for the notif-steady
+    /// channel. Called on shutdown so queued-but-undispatched notif actions
+    /// (live traffic) are nacked promptly rather than waiting out the
+    /// pubsub lease (30-600s) for redelivery.
+    pub fn nack_all_notif_steady(&self) {
+        Self::nack_all(&self.notif_steady_receiver);
+    }
+
+    /// Same as `nack_all_notif_steady`, but for the notif-batch channel.
+    pub fn nack_all_notif_batch(&self) {
+        Self::nack_all(&self.notif_batch_receiver);
+    }
+
     fn nack_all(receiver: &async_channel::Receiver<AckableAction>) {
         loop {
             match receiver.try_recv() {
@@ -411,6 +424,30 @@ mod tests {
         // async action is still queued (not drained by the notif-steady pool)
         assert_eq!(tx.len(Channel::Async), 1);
         assert_eq!(tx.len(Channel::NotifSteady), 0);
+    }
+
+    #[tokio::test]
+    async fn nack_all_notif_steady_nacks_queued_action() {
+        let (tx, rx) = create_ackable_action_priority_queue();
+        let (action, acking_receiver) = ackable();
+        tx.send(action, Channel::NotifSteady).await.unwrap();
+
+        rx.nack_all_notif_steady();
+
+        assert!(matches!(acking_receiver.await.unwrap(), AckOrNack::Nack));
+        assert_eq!(tx.len(Channel::NotifSteady), 0);
+    }
+
+    #[tokio::test]
+    async fn nack_all_notif_batch_nacks_queued_action() {
+        let (tx, rx) = create_ackable_action_priority_queue();
+        let (action, acking_receiver) = ackable();
+        tx.send(action, Channel::NotifBatch).await.unwrap();
+
+        rx.nack_all_notif_batch();
+
+        assert!(matches!(acking_receiver.await.unwrap(), AckOrNack::Nack));
+        assert_eq!(tx.len(Channel::NotifBatch), 0);
     }
 
     #[tokio::test]

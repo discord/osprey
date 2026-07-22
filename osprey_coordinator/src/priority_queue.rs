@@ -88,9 +88,10 @@ pub enum Channel {
     NotifBatch,
 }
 
-/// Which channel class a worker connection serves, advertised in
-/// `ClientDetails.served_queue`. `Fast` (the default / legacy value) serves the
-/// existing `[sync, async]` biased path; the notif classes serve exactly one channel.
+/// Which channel class a worker connection serves, which a worker WILL
+/// advertise in `ClientDetails.served_queue` (added in a follow-up PR). `Fast`
+/// (the default / legacy value) serves the existing `[sync, async]` biased
+/// path; the notif classes serve exactly one channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServedQueue {
     Fast,
@@ -290,9 +291,11 @@ impl PriorityQueueReceiver {
     }
 
     /// Same as `nack_all_sync`/`nack_all_async`, but for the notif-steady
-    /// channel. Called on shutdown so queued-but-undispatched notif actions
-    /// (live traffic) are nacked promptly rather than waiting out the
-    /// pubsub lease (30-600s) for redelivery.
+    /// channel. Without this, a queued-but-undispatched notif action is only
+    /// released when its in-flight pubsub handler's ack-await times out at
+    /// `max_acking_receiver_wait_time` (`MAX_ACKING_RECEIVER_WAIT_TIME_MS`,
+    /// default 60s) or the channel closes and drops the sender. Nacking here
+    /// releases it immediately on shutdown instead.
     pub fn nack_all_notif_steady(&self) {
         Self::nack_all(&self.notif_steady_receiver);
     }
@@ -307,9 +310,10 @@ impl PriorityQueueReceiver {
             match receiver.try_recv() {
                 Ok(action) => match action.acking_oneshot_sender.send(AckOrNack::Nack) {
                     Ok(_) => (),
-                    Err(_) => println!(
-                        "tried to nack {:?} and the nacking receiver was dropped",
-                        action.action
+                    Err(_) => tracing::warn!(
+                        action_id = action.action.action_id,
+                        action_name = %action.action.action_name,
+                        "tried to nack an action but the nacking receiver was dropped"
                     ),
                 },
                 Err(_) => return,

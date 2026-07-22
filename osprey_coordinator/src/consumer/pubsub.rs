@@ -217,7 +217,6 @@ pub async fn start_pubsub_subscriber(
             let priority_queue_sender = priority_queue_sender.clone();
             let snowflake_client = snowflake_client.clone();
             let kms_envelope = kms_envelope.clone();
-            let channel = channel;
 
             async move {
                 let ack_id: u64 = rand::thread_rng().gen();

@@ -41,6 +41,69 @@ use tokio::join;
 use crate::osprey_bidirectional_stream::OspreyCoordinatorServer;
 use crate::proto::osprey_coordinator_service_server::OspreyCoordinatorServiceServer;
 
+/// Parse `OSPREY_COORDINATOR_SUBSCRIPTIONS` = "sub_a:async,sub_b:notif_steady".
+/// Falls back to `[(PUBSUB_SUBSCRIPTION_ID, Async)]` when unset (legacy behavior).
+fn parse_subscriptions(
+    raw: Option<String>,
+    legacy_sub: Option<String>,
+) -> Result<Vec<(String, priority_queue::Channel)>> {
+    use priority_queue::Channel;
+    if let Some(raw) = raw.filter(|s| !s.trim().is_empty()) {
+        raw.split(',')
+            .map(|pair| {
+                let (sub, chan) = pair.split_once(':').ok_or_else(|| {
+                    anyhow::anyhow!("bad subscription spec '{pair}', want 'sub:channel'")
+                })?;
+                let channel = match chan.trim() {
+                    "async" => Channel::Async,
+                    "notif_steady" => Channel::NotifSteady,
+                    "notif_batch" => Channel::NotifBatch,
+                    other => anyhow::bail!("unknown channel '{other}'"),
+                };
+                Ok((sub.trim().to_string(), channel))
+            })
+            .collect()
+    } else {
+        let sub = legacy_sub.ok_or_else(|| {
+            anyhow::anyhow!(
+                "neither OSPREY_COORDINATOR_SUBSCRIPTIONS nor PUBSUB_SUBSCRIPTION_ID set"
+            )
+        })?;
+        Ok(vec![(sub, Channel::Async)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use priority_queue::Channel;
+
+    #[test]
+    fn parses_multi_subscription_spec() {
+        let got = parse_subscriptions(Some("s1:async,s2:notif_steady,s3:notif_batch".into()), None)
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("s1".into(), Channel::Async),
+                ("s2".into(), Channel::NotifSteady),
+                ("s3".into(), Channel::NotifBatch),
+            ]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_legacy_single_sub() {
+        let got = parse_subscriptions(None, Some("legacy-sub".into())).unwrap();
+        assert_eq!(got, vec![("legacy-sub".into(), Channel::Async)]);
+    }
+
+    #[test]
+    fn errors_when_no_subscription_configured() {
+        assert!(parse_subscriptions(None, None).is_err());
+    }
+}
+
 #[derive(Debug, Parser)]
 struct CliOptions {
     #[arg(
@@ -117,12 +180,25 @@ async fn main() -> Result<()> {
                 as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
         }
         Some("pubsub") => {
-            tracing::info!("starting PubSub subscriber");
-            Box::pin(start_pubsub_subscriber(
-                snowflake_client.clone(),
-                priority_queue_sender.clone(),
-                metrics.clone(),
-            ))
+            let subs = parse_subscriptions(
+                std::env::var("OSPREY_COORDINATOR_SUBSCRIPTIONS").ok(),
+                std::env::var("PUBSUB_SUBSCRIPTION_ID").ok(),
+            )?;
+            tracing::info!(?subs, "starting PubSub subscribers");
+            let mut futs = Vec::new();
+            for (sub_id, channel) in subs {
+                futs.push(start_pubsub_subscriber(
+                    snowflake_client.clone(),
+                    priority_queue_sender.clone(),
+                    metrics.clone(),
+                    sub_id,
+                    channel,
+                ));
+            }
+            Box::pin(async move {
+                futures::future::try_join_all(futs).await?;
+                Ok(())
+            })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
         }
         Some(invalid) => {

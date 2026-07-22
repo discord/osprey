@@ -25,7 +25,9 @@ pub fn spawn_shutdown_handler(
         // pubsub redelivery rather than waiting for the lease to expire.
         priority_queue_receiver.nack_all_sync();
         priority_queue_receiver.nack_all_async();
-        tracing::info!("nacked all queued sync + async actions");
+        priority_queue_receiver.nack_all_notif_steady();
+        priority_queue_receiver.nack_all_notif_batch();
+        tracing::info!("nacked all queued sync + async + notif-steady + notif-batch actions");
         // Hold the channel open while workers ack dispatched-but-not-yet-acked
         // actions over bidi. At typical worker latencies of ~150ms p95, 30s
         // gives ~200x the processing window for in-flight actions to drain

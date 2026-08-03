@@ -40,6 +40,9 @@ message Request {
 
 message ClientDetails {
   string id = 1;
+  // Per-stream window: max actions the coordinator may have outstanding (dispatched
+  // but not yet ack/nacked) on this connection at once. 0 or 1 = legacy single-flight.
+  uint32 max_outstanding_actions = 2;
 }
 
 message Disconnect {

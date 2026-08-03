@@ -80,13 +80,19 @@ class ClientDetails(google.protobuf.message.Message):
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
     ID_FIELD_NUMBER: builtins.int
+    MAX_OUTSTANDING_ACTIONS_FIELD_NUMBER: builtins.int
     id: builtins.str
+    max_outstanding_actions: builtins.int
+    """Per-stream window: max actions the coordinator may have outstanding (dispatched
+    but not yet ack/nacked) on this connection at once. 0 or 1 = legacy single-flight.
+    """
     def __init__(
         self,
         *,
         id: builtins.str = ...,
+        max_outstanding_actions: builtins.int = ...,
     ) -> None: ...
-    def ClearField(self, field_name: typing.Literal["id", b"id"]) -> None: ...
+    def ClearField(self, field_name: typing.Literal["id", b"id", "max_outstanding_actions", b"max_outstanding_actions"]) -> None: ...
 
 global___ClientDetails = ClientDetails
 

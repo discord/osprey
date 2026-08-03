@@ -19,8 +19,9 @@ from osprey.engine.udf.base import UDFBase
 
 from osprey.async_worker.adaptor.plugin_manager import hookimpl_osprey_async
 from osprey.async_worker.stdlib_udfs.async_mx_lookup import MXLookup
+from osprey.async_worker.stdlib_udfs.sleep_udf import SleepUdf
 
 
 @hookimpl_osprey_async
 def register_udfs() -> Sequence[Type[UDFBase[Any, Any]]]:
-    return [MXLookup]
+    return [MXLookup, SleepUdf]

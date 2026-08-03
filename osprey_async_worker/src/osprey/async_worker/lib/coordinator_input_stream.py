@@ -54,6 +54,14 @@ class AsyncVerdictsAckingContext(VerdictsAckingContext[OspreyEngineAction]):
         self._stream = stream
         self._ack_id = ack_id
 
+    def ack(self, verdicts: Optional[Verdicts] = None) -> None:
+        """Explicitly ack this action by its own ack_id. Used by the windowed consumption
+        path, where acking is decoupled from the generator's yield/resume cycle."""
+        self._stream.send_ack_or_nack(self._ack_id, ack=True, verdicts=verdicts)
+
+    def nack(self) -> None:
+        self._stream.send_ack_or_nack(self._ack_id, ack=False)
+
 
 class GrpcConnectionDiscoveryPool:
     """Maintains a pool of async gRPC channels discovered via etcd service discovery."""
@@ -185,8 +193,9 @@ class OspreyCoordinatorBiDirectionalStream:
 
     HEARTBEAT_INTERVAL_SECONDS = 30
 
-    def __init__(self, client_id: str, channel: grpc.aio.Channel, service: Service) -> None:
+    def __init__(self, client_id: str, channel: grpc.aio.Channel, service: Service, window: int = 1) -> None:
         self._client_id = client_id
+        self._window = window
         self._outgoing_queue: asyncio.Queue[Optional[Request]] = asyncio.Queue()
         self._stub = OspreyCoordinatorServiceStub(channel=channel)
         self._tags = [f'coordinator_connection_address:{service.connection_address}']
@@ -253,7 +262,13 @@ class OspreyCoordinatorBiDirectionalStream:
             self._tags,
             self._client_id,
         )
-        await self._send(Request(action_request=ActionRequest(initial=ClientDetails(id=self._client_id))))
+        await self._send(
+            Request(
+                action_request=ActionRequest(
+                    initial=ClientDetails(id=self._client_id, max_outstanding_actions=self._window)
+                )
+            )
+        )
         self._last_action_request_time = time.time()
         self._connect_time = time.time()
         metrics.increment('osprey_coordinator_input_stream.connect', tags=self._tags)
@@ -294,8 +309,10 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         client_id: str,
         coordinator_service_name: str = 'osprey_coordinator',
         input_stream_ready_signaler: Optional[AsyncInputStreamReadySignaler] = None,
+        window: int = 1,
     ) -> None:
         self._client_id = client_id
+        self._window = window
         self._channel_pool = GrpcConnectionDiscoveryPool(coordinator_service_name)
         self._shutdown_event = asyncio.Event()
         self._current_execution_result: Optional[ExecutionResult] = None
@@ -308,6 +325,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         address: str,
         service_name: str = 'osprey_coordinator',
         input_stream_ready_signaler: Optional[AsyncInputStreamReadySignaler] = None,
+        window: int = 1,
     ) -> 'OspreyCoordinatorInputStream':
         """Create an input stream connected directly to a coordinator address.
 
@@ -315,6 +333,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         """
         instance = object.__new__(cls)
         instance._client_id = client_id
+        instance._window = window
         instance._shutdown_event = asyncio.Event()
         instance._current_execution_result = None
         instance._channel_pool = GrpcConnectionDiscoveryPool.from_static(address, service_name)
@@ -327,6 +346,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         client_id: str,
         service_name: str = 'osprey_coordinator',
         input_stream_ready_signaler: Optional[AsyncInputStreamReadySignaler] = None,
+        window: int = 1,
     ) -> 'OspreyCoordinatorInputStream':
         """Create an input stream using async etcd discovery (no gevent).
 
@@ -335,6 +355,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         """
         instance = object.__new__(cls)
         instance._client_id = client_id
+        instance._window = window
         instance._shutdown_event = asyncio.Event()
         instance._current_execution_result = None
         instance._channel_pool = GrpcConnectionDiscoveryPool.from_async_discovery(service_name)
@@ -428,10 +449,64 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
     # -- main loop -----------------------------------------------------------------
 
     async def _gen(self) -> AsyncIterator[BaseAckingContext[OspreyEngineAction]]:
+        """Dispatches to the windowed or serial consumption path based on the advertised window.
+
+        window<=1 preserves the legacy serial path byte-for-byte (ack coupled to generator resume).
+        window>1 uses the windowed path (ack decoupled, driven by the consumer's own completion).
+        """
+        if self._window > 1:
+            async for context in self._gen_windowed():
+                yield context
+        else:
+            async for context in self._gen_serial():
+                yield context
+
+    async def _gen_windowed(self) -> AsyncIterator[BaseAckingContext[OspreyEngineAction]]:
+        """Windowed consumption: yields contexts continuously without acking after the yield.
+
+        The coordinator proactively pushes up to ``self._window`` actions without waiting for
+        acks, so the ack for a given action must fire when ITS OWN processing finishes (via
+        ``AsyncVerdictsAckingContext.ack()/nack()``), not when this generator is next pulled.
+        Shutdown is intentionally simple here: stop reading and return. We do not replicate the
+        serial path's per-action reconnect/reload bookkeeping (uptime rotation, ready-signaler
+        pause) — in-flight tasks either finish and ack, or get nacked when the stream drops.
+        """
         while not self._shutdown_event.is_set():
             channel, service = await self._channel_pool.get_connection()
             bidirectional_stream = OspreyCoordinatorBiDirectionalStream(
-                client_id=self._client_id, channel=channel, service=service
+                client_id=self._client_id, channel=channel, service=service, window=self._window
+            )
+
+            async for osprey_coordinator_action in bidirectional_stream:
+                if self._shutdown_event.is_set():
+                    break
+
+                ack_id = osprey_coordinator_action.ack_id
+                osprey_engine_action = self._create_osprey_engine_action(osprey_coordinator_action)
+
+                if not osprey_engine_action:
+                    info_log_osprey_action(
+                        osprey_coordinator_action.action_id,
+                        osprey_coordinator_action.action_name,
+                        "nacking (couldn't create OspreyEngineAction)",
+                    )
+                    bidirectional_stream.send_ack_or_nack(ack_id, ack=False)
+                    continue
+
+                yield AsyncVerdictsAckingContext(osprey_engine_action, bidirectional_stream, ack_id)
+
+            if self._shutdown_event.is_set():
+                logger.info('shutting down (windowed)')
+                metrics.increment('osprey_coordinator_input_stream.shutdown')
+                return
+
+            logger.debug('windowed stream ended, reconnecting')
+
+    async def _gen_serial(self) -> AsyncIterator[BaseAckingContext[OspreyEngineAction]]:
+        while not self._shutdown_event.is_set():
+            channel, service = await self._channel_pool.get_connection()
+            bidirectional_stream = OspreyCoordinatorBiDirectionalStream(
+                client_id=self._client_id, channel=channel, service=service, window=self._window
             )
             max_uptime_allowed = MIN_SECONDS_BEFORE_RECONNECT + random.uniform(0, SECONDS_BEFORE_RECONNECT_JITTER)
             actions_handled = 0

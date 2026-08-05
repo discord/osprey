@@ -1,9 +1,10 @@
+from contextvars import Context, copy_context
 from typing import Optional, Union
 
 import pytest
 from osprey.engine.ast.ast_utils import filter_nodes
 from osprey.engine.ast.grammar import Call, Expression, Source
-from osprey.engine.udf.arguments import ArgumentsBase, ConstExpr
+from osprey.engine.udf.arguments import ArgumentsBase, ConstExpr, _arguments_ast_transfer
 
 StrConstExpr = ConstExpr[str]  # This being inside the below function is causing mypy to crash
 
@@ -117,6 +118,41 @@ def test_resolved_arguments_support_legacy_custom_metaclass(monkeypatch: pytest.
     assert resolved.foo == 2
     assert argument_dict_calls == [call]
     assert resolved._arguments_ast is unresolved._arguments_ast
+
+
+def test_copied_custom_constructor_context_releases_argument_ast_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copied_context: Optional[Context] = None
+
+    class Arguments(ArgumentsBase):
+        foo: int
+
+        def __init__(self, call_node: Call, arguments: dict[str, object], resolved: bool = False):
+            nonlocal copied_context
+            if resolved:
+                copied_context = copy_context()
+            super().__init__(call_node=call_node, arguments=arguments, resolved=resolved)
+
+    argument_dict_calls = _record_argument_dict_calls(monkeypatch)
+    call = _parse_call('Foo = Bar(foo=1)\n')
+    unresolved = Arguments(call_node=call, arguments={'foo': 1})
+
+    resolved = unresolved.update_with_resolved({'foo': 2})
+
+    assert argument_dict_calls == [call]
+    assert resolved._arguments_ast is unresolved._arguments_ast
+    assert _arguments_ast_transfer.get() is None
+    assert copied_context is not None
+    copied_transfer = copied_context.run(_arguments_ast_transfer.get)
+    assert copied_transfer is not None
+    if isinstance(copied_transfer, tuple):
+        retained_call, retained_arguments_ast = copied_transfer
+    else:
+        retained_call = copied_transfer.call_node
+        retained_arguments_ast = copied_transfer.arguments_ast
+    assert retained_call is None
+    assert retained_arguments_ast is None
 
 
 def test_resolved_arguments_propagate_type_error_from_custom_init() -> None:

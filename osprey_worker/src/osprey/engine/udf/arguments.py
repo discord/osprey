@@ -21,8 +21,23 @@ _dummy_span = grammar.Span(source=grammar.Source(path='<NOT A REAL PATH>', conte
 # would require all extra arguments to be ints
 EXTRA_ARGS_ATTR = 'extra_arguments'
 
+
+class _ArgumentsAstTransfer:
+    """Clearable scoped handoff for legacy custom construction hooks."""
+
+    __slots__ = ('call_node', 'arguments_ast')
+
+    def __init__(self, call_node: grammar.Call, arguments_ast: Dict[str, grammar.Expression]):
+        self.call_node: Optional[grammar.Call] = call_node
+        self.arguments_ast: Optional[Dict[str, grammar.Expression]] = arguments_ast
+
+    def clear(self) -> None:
+        self.call_node = None
+        self.arguments_ast = None
+
+
 # Custom construction hooks use their legacy signature while this scoped handoff keeps the private AST mapping.
-_arguments_ast_transfer: ContextVar[Optional[tuple[grammar.Call, Dict[str, grammar.Expression]]]] = ContextVar(
+_arguments_ast_transfer: ContextVar[Optional[_ArgumentsAstTransfer]] = ContextVar(
     'arguments_ast_transfer', default=None
 )
 
@@ -212,8 +227,8 @@ class ArgumentsBase:
         self._call_node = call_node
         if _arguments_ast is None and resolved:
             transfer = _arguments_ast_transfer.get()
-            if transfer is not None and transfer[0] is call_node:
-                _arguments_ast = transfer[1]
+            if transfer is not None and transfer.call_node is call_node:
+                _arguments_ast = transfer.arguments_ast
         self._arguments_ast = _arguments_ast if _arguments_ast is not None else call_node.argument_dict()
         self._arguments = arguments
         self._resolved = resolved
@@ -268,11 +283,13 @@ class ArgumentsBase:
                 resolved=True,
                 _arguments_ast=self._arguments_ast,
             )
-        transfer_token = _arguments_ast_transfer.set((self._call_node, self._arguments_ast))
+        transfer = _ArgumentsAstTransfer(self._call_node, self._arguments_ast)
+        transfer_token = _arguments_ast_transfer.set(transfer)
         try:
             return arguments_class(call_node=self._call_node, arguments=arguments, resolved=True)
         finally:
             _arguments_ast_transfer.reset(transfer_token)
+            transfer.clear()
 
     @classmethod
     def _traverse_mro(cls) -> Sequence[type]:

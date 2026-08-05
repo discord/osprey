@@ -59,6 +59,53 @@ def test_resolved_arguments_reuse_unresolved_argument_ast(monkeypatch: pytest.Mo
     assert argument_dict_calls == 1
 
 
+def test_resolved_arguments_support_legacy_custom_init() -> None:
+    class Arguments(ArgumentsBase):
+        foo: int
+
+        def __init__(self, call_node: Call, arguments: dict[str, object], resolved: bool = False):
+            super().__init__(call_node=call_node, arguments=arguments, resolved=resolved)
+
+    call = _parse_call('Foo = Bar(foo=1)\n')
+    unresolved = Arguments(call_node=call, arguments={'foo': 1})
+
+    resolved = unresolved.update_with_resolved({'foo': 2})
+
+    assert resolved.foo == 2
+    assert resolved.get_argument_ast('foo') is unresolved.get_argument_ast('foo')
+
+
+def test_resolved_arguments_support_legacy_custom_new() -> None:
+    class Arguments(ArgumentsBase):
+        foo: int
+
+        def __new__(cls, call_node: Call, arguments: dict[str, object], resolved: bool = False) -> 'Arguments':
+            return super().__new__(cls)
+
+    call = _parse_call('Foo = Bar(foo=1)\n')
+    unresolved = Arguments(call_node=call, arguments={'foo': 1})
+
+    resolved = unresolved.update_with_resolved({'foo': 2})
+
+    assert resolved.foo == 2
+
+
+def test_resolved_arguments_propagate_type_error_from_custom_init() -> None:
+    class Arguments(ArgumentsBase):
+        foo: int
+
+        def __init__(self, call_node: Call, arguments: dict[str, object], resolved: bool = False):
+            if resolved:
+                raise TypeError('raised inside custom constructor')
+            super().__init__(call_node=call_node, arguments=arguments, resolved=resolved)
+
+    call = _parse_call('Foo = Bar(foo=1)\n')
+    unresolved = Arguments(call_node=call, arguments={'foo': 1})
+
+    with pytest.raises(TypeError, match='raised inside custom constructor'):
+        unresolved.update_with_resolved({'foo': 2})
+
+
 def test_arguments_can_be_none() -> None:
     class Arguments(ArgumentsBase):
         optional: Optional[str]

@@ -245,12 +245,17 @@ class ArgumentsBase:
 
     def update_with_resolved(self: T_arguments, resolved: Dict[str, Any]) -> T_arguments:
         assert not self._resolved
-        return self.__class__(
-            call_node=self._call_node,
-            arguments={**self._arguments, **resolved},
-            resolved=True,
-            _arguments_ast=self._arguments_ast,
-        )
+        arguments = {**self._arguments, **resolved}
+        arguments_class = self.__class__
+        # Preserve the public constructor contract for subclasses that customize either construction hook.
+        if arguments_class.__init__ is ArgumentsBase.__init__ and arguments_class.__new__ is object.__new__:
+            return arguments_class(
+                call_node=self._call_node,
+                arguments=arguments,
+                resolved=True,
+                _arguments_ast=self._arguments_ast,
+            )
+        return arguments_class(call_node=self._call_node, arguments=arguments, resolved=True)
 
     @classmethod
     def _traverse_mro(cls) -> Sequence[type]:

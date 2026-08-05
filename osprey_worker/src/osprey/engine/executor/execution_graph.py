@@ -136,6 +136,7 @@ def compile_execution_graph(
     from osprey.engine.ast_validator.validators.validate_static_types import ValidateStaticTypes
 
     from .execution_plan import ExecutionPlan
+    from .node_executor.call_executor import CallExecutor
     from .node_executor_registry import NodeExecutorRegistry
 
     node_executor_registry = node_executor_registry or NodeExecutorRegistry.get_instance()
@@ -167,6 +168,10 @@ def compile_execution_graph(
         maybe_periodic_yield()
 
     instance._execution_plan = ExecutionPlan.from_graph(instance)
+    for chain in instance._execution_plan.chains:
+        if isinstance(chain.executor, CallExecutor):
+            chain.executor.prepare_resolution_recipe(instance)
+        maybe_periodic_yield()
     return instance
 
 

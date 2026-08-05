@@ -66,6 +66,7 @@ from result import Err, Ok, Result, UnwrapError
 
 if TYPE_CHECKING:
     from osprey.engine.ast_validator.validation_context import ValidatedSources
+    from osprey.engine.executor.node_executor.call_executor import ArgumentResolutionStep
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +228,35 @@ class ExecutionContext:
             return Ok(value.to_post_execution_value())
 
         return node_result
+
+    def resolve_call_arguments(self, recipe: Sequence['ArgumentResolutionStep']) -> Dict[str, Any]:
+        """Resolve a default UDF's kwargs from its graph-compiled lookup recipe."""
+        resolved: Dict[str, Any] = {}
+        node_values = self._resolved_node_values
+        execution_graph = self._execution_graph
+
+        for step in recipe:
+            try:
+                node_result = node_values[step.node_key]
+            except KeyError:
+                if execution_graph.is_pruned_node(step.node):
+                    node_result = Err(None)
+                else:
+                    raise
+
+            if node_result.is_err():
+                if step.return_none_on_failure:
+                    resolved[step.kwarg_name] = None
+                    continue
+                raise NodeFailurePropagationException()
+
+            value = node_result.unwrap()
+            if step.should_unwrap:
+                assert isinstance(value, PostExecutionConvertible), (value, type(value))
+                value = value.to_post_execution_value()
+            resolved[step.kwarg_name] = value
+
+        return resolved
 
     def get_name_node(self, name: Name) -> ASTNode:
         """Returns the node that is responsible for resolving a given Loaded name."""

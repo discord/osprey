@@ -123,12 +123,7 @@ class UDFBase(Generic[Arguments, RValue], ABC):
         """Resolves the arguments once all dependent nodes have completed execution. The return value of this function
         is then passed to `execute`, and can be overridden to perform specialized argument resolution behavior within
         a given UDF."""
-        resolved = {
-            k: execution_context.resolved(
-                v, return_none_for_failed_values=call_executor.unresolved_arguments.kwarg_can_be_none(k)
-            )
-            for k, v in call_executor.dependent_node_dict.items()
-        }
+        resolved = execution_context.resolve_call_arguments(call_executor.resolution_recipe)
         return cast(Arguments, call_executor.unresolved_arguments.update_with_resolved(resolved))
 
     @abstractmethod

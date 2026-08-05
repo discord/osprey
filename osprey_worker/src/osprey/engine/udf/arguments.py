@@ -201,9 +201,10 @@ class ArgumentsBase:
         call_node: grammar.Call,
         arguments: Dict[str, Any],
         resolved: bool = False,
+        _arguments_ast: Optional[Dict[str, grammar.Expression]] = None,
     ):
         self._call_node = call_node
-        self._arguments_ast = call_node.argument_dict()
+        self._arguments_ast = _arguments_ast if _arguments_ast is not None else call_node.argument_dict()
         self._arguments = arguments
         self._resolved = resolved
 
@@ -244,7 +245,12 @@ class ArgumentsBase:
 
     def update_with_resolved(self: T_arguments, resolved: Dict[str, Any]) -> T_arguments:
         assert not self._resolved
-        return self.__class__(call_node=self._call_node, arguments={**self._arguments, **resolved}, resolved=True)
+        return self.__class__(
+            call_node=self._call_node,
+            arguments={**self._arguments, **resolved},
+            resolved=True,
+            _arguments_ast=self._arguments_ast,
+        )
 
     @classmethod
     def _traverse_mro(cls) -> Sequence[type]:

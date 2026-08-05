@@ -1,8 +1,16 @@
 from typing import Optional, Union
 
+import pytest
+from osprey.engine.ast.ast_utils import filter_nodes
+from osprey.engine.ast.grammar import Call, Expression, Source
 from osprey.engine.udf.arguments import ArgumentsBase, ConstExpr
 
 StrConstExpr = ConstExpr[str]  # This being inside the below function is causing mypy to crash
+
+
+def _parse_call(contents: str) -> Call:
+    source = Source(path='<test>', contents=contents)
+    return next(iter(filter_nodes(source.ast_root, Call)))
 
 
 def test_arguments_items() -> None:
@@ -28,6 +36,27 @@ def test_arguments_items_cache_is_scoped_to_each_subclass() -> None:
     SecondArguments.items()
 
     assert FirstArguments.items() is first_items
+
+
+def test_resolved_arguments_reuse_unresolved_argument_ast(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Arguments(ArgumentsBase):
+        foo: int
+
+    argument_dict_calls = 0
+    original_argument_dict = Call.argument_dict
+
+    def counting_argument_dict(call: Call) -> dict[str, Expression]:
+        nonlocal argument_dict_calls
+        argument_dict_calls += 1
+        return original_argument_dict(call)
+
+    monkeypatch.setattr(Call, 'argument_dict', counting_argument_dict)
+    call = _parse_call('Foo = Bar(foo=1)\n')
+
+    unresolved = Arguments(call_node=call, arguments={'foo': 1})
+    unresolved.update_with_resolved({'foo': 2})
+
+    assert argument_dict_calls == 1
 
 
 def test_arguments_can_be_none() -> None:

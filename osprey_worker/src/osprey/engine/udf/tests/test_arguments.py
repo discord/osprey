@@ -13,6 +13,18 @@ def _parse_call(contents: str) -> Call:
     return next(iter(filter_nodes(source.ast_root, Call)))
 
 
+def _record_argument_dict_calls(monkeypatch: pytest.MonkeyPatch) -> list[Call]:
+    calls: list[Call] = []
+    original_argument_dict = Call.argument_dict
+
+    def recording_argument_dict(call: Call) -> dict[str, Expression]:
+        calls.append(call)
+        return original_argument_dict(call)
+
+    monkeypatch.setattr(Call, 'argument_dict', recording_argument_dict)
+    return calls
+
+
 def test_arguments_items() -> None:
     class Arguments(ArgumentsBase):
         foo: str
@@ -42,52 +54,69 @@ def test_resolved_arguments_reuse_unresolved_argument_ast(monkeypatch: pytest.Mo
     class Arguments(ArgumentsBase):
         foo: int
 
-    argument_dict_calls = 0
-    original_argument_dict = Call.argument_dict
-
-    def counting_argument_dict(call: Call) -> dict[str, Expression]:
-        nonlocal argument_dict_calls
-        argument_dict_calls += 1
-        return original_argument_dict(call)
-
-    monkeypatch.setattr(Call, 'argument_dict', counting_argument_dict)
+    argument_dict_calls = _record_argument_dict_calls(monkeypatch)
     call = _parse_call('Foo = Bar(foo=1)\n')
 
     unresolved = Arguments(call_node=call, arguments={'foo': 1})
-    unresolved.update_with_resolved({'foo': 2})
+    resolved = unresolved.update_with_resolved({'foo': 2})
 
-    assert argument_dict_calls == 1
+    assert argument_dict_calls == [call]
+    assert resolved._arguments_ast is unresolved._arguments_ast
 
 
-def test_resolved_arguments_support_legacy_custom_init() -> None:
+def test_resolved_arguments_support_legacy_custom_init(monkeypatch: pytest.MonkeyPatch) -> None:
     class Arguments(ArgumentsBase):
         foo: int
 
         def __init__(self, call_node: Call, arguments: dict[str, object], resolved: bool = False):
             super().__init__(call_node=call_node, arguments=arguments, resolved=resolved)
 
+    argument_dict_calls = _record_argument_dict_calls(monkeypatch)
     call = _parse_call('Foo = Bar(foo=1)\n')
     unresolved = Arguments(call_node=call, arguments={'foo': 1})
 
     resolved = unresolved.update_with_resolved({'foo': 2})
 
     assert resolved.foo == 2
-    assert resolved.get_argument_ast('foo') is unresolved.get_argument_ast('foo')
+    assert argument_dict_calls == [call]
+    assert resolved._arguments_ast is unresolved._arguments_ast
 
 
-def test_resolved_arguments_support_legacy_custom_new() -> None:
+def test_resolved_arguments_support_legacy_custom_new(monkeypatch: pytest.MonkeyPatch) -> None:
     class Arguments(ArgumentsBase):
         foo: int
 
         def __new__(cls, call_node: Call, arguments: dict[str, object], resolved: bool = False) -> 'Arguments':
             return super().__new__(cls)
 
+    argument_dict_calls = _record_argument_dict_calls(monkeypatch)
     call = _parse_call('Foo = Bar(foo=1)\n')
     unresolved = Arguments(call_node=call, arguments={'foo': 1})
 
     resolved = unresolved.update_with_resolved({'foo': 2})
 
     assert resolved.foo == 2
+    assert argument_dict_calls == [call]
+    assert resolved._arguments_ast is unresolved._arguments_ast
+
+
+def test_resolved_arguments_support_legacy_custom_metaclass(monkeypatch: pytest.MonkeyPatch) -> None:
+    class LegacyMeta(type):
+        def __call__(cls, call_node: Call, arguments: dict[str, object], resolved: bool = False) -> 'Arguments':
+            return super().__call__(call_node=call_node, arguments=arguments, resolved=resolved)
+
+    class Arguments(ArgumentsBase, metaclass=LegacyMeta):
+        foo: int
+
+    argument_dict_calls = _record_argument_dict_calls(monkeypatch)
+    call = _parse_call('Foo = Bar(foo=1)\n')
+    unresolved = Arguments(call_node=call, arguments={'foo': 1})
+
+    resolved = unresolved.update_with_resolved({'foo': 2})
+
+    assert resolved.foo == 2
+    assert argument_dict_calls == [call]
+    assert resolved._arguments_ast is unresolved._arguments_ast
 
 
 def test_resolved_arguments_propagate_type_error_from_custom_init() -> None:

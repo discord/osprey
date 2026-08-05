@@ -2,6 +2,7 @@ import ast
 import inspect
 import textwrap
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from typing import Any, Dict, Generic, Iterator, List, Optional, Sequence, Type, TypeVar, Union, cast, get_type_hints
 
@@ -19,6 +20,11 @@ _dummy_span = grammar.Span(source=grammar.Source(path='<NOT A REAL PATH>', conte
 # will be collected in it. The arguments will be typechecked against the value type, e.g. extra_args: Dict[str, int]
 # would require all extra arguments to be ints
 EXTRA_ARGS_ATTR = 'extra_arguments'
+
+# Custom construction hooks use their legacy signature while this scoped handoff keeps the private AST mapping.
+_arguments_ast_transfer: ContextVar[Optional[tuple[grammar.Call, Dict[str, grammar.Expression]]]] = ContextVar(
+    'arguments_ast_transfer', default=None
+)
 
 
 class ConstExpr(Generic[T]):
@@ -204,6 +210,10 @@ class ArgumentsBase:
         _arguments_ast: Optional[Dict[str, grammar.Expression]] = None,
     ):
         self._call_node = call_node
+        if _arguments_ast is None and resolved:
+            transfer = _arguments_ast_transfer.get()
+            if transfer is not None and transfer[0] is call_node:
+                _arguments_ast = transfer[1]
         self._arguments_ast = _arguments_ast if _arguments_ast is not None else call_node.argument_dict()
         self._arguments = arguments
         self._resolved = resolved
@@ -247,15 +257,22 @@ class ArgumentsBase:
         assert not self._resolved
         arguments = {**self._arguments, **resolved}
         arguments_class = self.__class__
-        # Preserve the public constructor contract for subclasses that customize either construction hook.
-        if arguments_class.__init__ is ArgumentsBase.__init__ and arguments_class.__new__ is object.__new__:
+        if (
+            type(arguments_class).__call__ is type.__call__
+            and arguments_class.__new__ is object.__new__
+            and arguments_class.__init__ is ArgumentsBase.__init__
+        ):
             return arguments_class(
                 call_node=self._call_node,
                 arguments=arguments,
                 resolved=True,
                 _arguments_ast=self._arguments_ast,
             )
-        return arguments_class(call_node=self._call_node, arguments=arguments, resolved=True)
+        transfer_token = _arguments_ast_transfer.set((self._call_node, self._arguments_ast))
+        try:
+            return arguments_class(call_node=self._call_node, arguments=arguments, resolved=True)
+        finally:
+            _arguments_ast_transfer.reset(transfer_token)
 
     @classmethod
     def _traverse_mro(cls) -> Sequence[type]:

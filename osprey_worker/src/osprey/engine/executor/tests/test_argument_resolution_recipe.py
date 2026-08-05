@@ -28,7 +28,7 @@ from osprey.engine.schema.schema_loader import ActionSchema
 from osprey.engine.udf.arguments import ArgumentsBase, ConstExpr
 from osprey.engine.udf.base import UDFBase
 from osprey.engine.udf.registry import UDFRegistry
-from result import Ok
+from result import Ok, UnwrapError
 
 
 class _IntValueArguments(ArgumentsBase):
@@ -56,6 +56,17 @@ class _Convertible(PostExecutionConvertible[str]):
 class _ConvertibleValue(UDFBase[ArgumentsBase, _Convertible]):
     def execute(self, execution_context: ExecutionContext, arguments: ArgumentsBase) -> _Convertible:
         return _Convertible('converted')
+
+
+@dataclass(frozen=True)
+class _FailingConvertible(PostExecutionConvertible[str]):
+    def to_post_execution_value(self) -> str:
+        raise UnwrapError('convert boom')
+
+
+class _FailingConvertibleValue(UDFBase[ArgumentsBase, _FailingConvertible]):
+    def execute(self, execution_context: ExecutionContext, arguments: ArgumentsBase) -> _FailingConvertible:
+        return _FailingConvertible()
 
 
 class _ResolveAllArguments(ArgumentsBase):
@@ -88,6 +99,24 @@ class _OptionalValue(UDFBase[_OptionalValueArguments, int]):
         return -1 if arguments.value is None else arguments.value
 
 
+class _OptionalConvertedArguments(ArgumentsBase):
+    value: Optional[str]
+
+
+class _OptionalConverted(UDFBase[_OptionalConvertedArguments, str]):
+    def execute(self, execution_context: ExecutionContext, arguments: _OptionalConvertedArguments) -> str:
+        return 'fallback' if arguments.value is None else arguments.value
+
+
+class _RequiredConvertedArguments(ArgumentsBase):
+    value: str
+
+
+class _RequiredConverted(UDFBase[_RequiredConvertedArguments, str]):
+    def execute(self, execution_context: ExecutionContext, arguments: _RequiredConvertedArguments) -> str:
+        return arguments.value
+
+
 class _CustomResolveArguments(ArgumentsBase):
     value: int
 
@@ -110,9 +139,12 @@ _REGISTRY = UDFRegistry.with_udfs(
     _IntValue,
     _FailValue,
     _ConvertibleValue,
+    _FailingConvertibleValue,
     _ResolveAll,
     _RequiredValue,
     _OptionalValue,
+    _OptionalConverted,
+    _RequiredConverted,
     _CustomResolve,
 )
 _VALIDATORS = ValidatorRegistry.from_validator_classes(
@@ -283,6 +315,24 @@ def test_specialized_context_uses_recipe_for_pruned_nullable_required_and_folded
     assert result.extracted_features['NullablePruned'] == -1
     assert result.extracted_features['Folded'] == 22
     assert result.extracted_features['RequiredPruned'] is None
+
+
+def test_nullable_converter_unwrap_error_becomes_none_and_execution_continues() -> None:
+    graph = _compile('Result = _OptionalConverted(value=_FailingConvertibleValue())')
+
+    result = _execute(graph)
+
+    assert result.error_infos == []
+    assert result.extracted_features['Result'] == 'fallback'
+
+
+def test_required_converter_unwrap_error_propagates_without_error_info() -> None:
+    graph = _compile('Result = _RequiredConverted(value=_FailingConvertibleValue())')
+
+    result = _execute(graph)
+
+    assert result.error_infos == []
+    assert result.extracted_features['Result'] is None
 
 
 def test_custom_resolver_keeps_its_override_path() -> None:

@@ -251,9 +251,15 @@ class ExecutionContext:
                 raise NodeFailurePropagationException()
 
             value = node_result.unwrap()
-            if step.should_unwrap:
-                assert isinstance(value, PostExecutionConvertible), (value, type(value))
-                value = value.to_post_execution_value()
+            try:
+                if step.should_unwrap:
+                    assert isinstance(value, PostExecutionConvertible), (value, type(value))
+                    value = value.to_post_execution_value()
+            except UnwrapError:
+                if step.return_none_on_failure:
+                    resolved[step.kwarg_name] = None
+                    continue
+                raise NodeFailurePropagationException()
             resolved[step.kwarg_name] = value
 
         return resolved

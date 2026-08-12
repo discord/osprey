@@ -21,8 +21,17 @@ class ProcessActionRequest(google.protobuf.message.Message):
     ACTION_NAME_FIELD_NUMBER: builtins.int
     ACTION_DATA_JSON_FIELD_NUMBER: builtins.int
     TIMESTAMP_FIELD_NUMBER: builtins.int
+    SECRET_DATA_JSON_FIELD_NUMBER: builtins.int
     action_name: builtins.str
     action_data_json: builtins.str
+    secret_data_json: builtins.str
+    """Optional JSON-encoded secret data for this action (e.g. PII such as free-text note fields).
+    Populated only for the same actions that would otherwise carry `secret_data` on the async
+    publish path. Unlike the async pubsub path, this is not envelope-encrypted in transit: this
+    RPC is a direct, single-hop call from discord_api to the coordinator, the same trust boundary
+    the coordinator already uses to forward `json_secret_data` to workers unencrypted over the
+    bidirectional stream (see osprey_coordinator/bidirectional_stream/v1/service.proto).
+    """
     @property
     def action_id(self) -> google.protobuf.wrappers_pb2.UInt64Value: ...
     @property
@@ -34,9 +43,11 @@ class ProcessActionRequest(google.protobuf.message.Message):
         action_name: builtins.str = ...,
         action_data_json: builtins.str = ...,
         timestamp: google.protobuf.timestamp_pb2.Timestamp | None = ...,
+        secret_data_json: builtins.str | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["action_id", b"action_id", "timestamp", b"timestamp"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["action_data_json", b"action_data_json", "action_id", b"action_id", "action_name", b"action_name", "timestamp", b"timestamp"]) -> None: ...
+    def HasField(self, field_name: typing.Literal["_secret_data_json", b"_secret_data_json", "action_id", b"action_id", "secret_data_json", b"secret_data_json", "timestamp", b"timestamp"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["_secret_data_json", b"_secret_data_json", "action_data_json", b"action_data_json", "action_id", b"action_id", "action_name", b"action_name", "secret_data_json", b"secret_data_json", "timestamp", b"timestamp"]) -> None: ...
+    def WhichOneof(self, oneof_group: typing.Literal["_secret_data_json", b"_secret_data_json"]) -> typing.Literal["secret_data_json"] | None: ...
 
 global___ProcessActionRequest = ProcessActionRequest
 

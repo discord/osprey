@@ -65,7 +65,14 @@ async fn create_osprey_coordinator_action(
                 action_request.action_data_json.clone().into(),
             ),
         ),
-        secret_data: None,
+        secret_data: action_request
+            .secret_data_json
+            .as_ref()
+            .map(|secret_data_json| {
+                proto::osprey_coordinator_action::SecretData::JsonSecretData(
+                    secret_data_json.clone().into(),
+                )
+            }),
         timestamp: Some(
             action_request
                 .timestamp

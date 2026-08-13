@@ -25,13 +25,6 @@ class ProcessActionRequest(google.protobuf.message.Message):
     action_name: builtins.str
     action_data_json: builtins.str
     secret_data_json: builtins.str
-    """Optional JSON-encoded secret data for this action (e.g. PII such as free-text note fields).
-    Populated only for the same actions that would otherwise carry `secret_data` on the async
-    publish path. Unlike the async pubsub path, this is not envelope-encrypted in transit: this
-    RPC is a direct, single-hop call from discord_api to the coordinator, the same trust boundary
-    the coordinator already uses to forward `json_secret_data` to workers unencrypted over the
-    bidirectional stream (see osprey_coordinator/bidirectional_stream/v1/service.proto).
-    """
     @property
     def action_id(self) -> google.protobuf.wrappers_pb2.UInt64Value: ...
     @property

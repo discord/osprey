@@ -13,7 +13,7 @@ message ProcessActionRequest {
   google.protobuf.Timestamp timestamp = 5;
 
   oneof secret_data {
-    bytes json_secret_data = 6;
+    bytes encrypted_json_secret_data = 6;
   }
 }
 

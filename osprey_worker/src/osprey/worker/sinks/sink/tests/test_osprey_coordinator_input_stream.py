@@ -31,17 +31,32 @@ def test_create_engine_action_keeps_secret_data_separate(
 ) -> None:
     stream = OspreyCoordinatorInputStream.__new__(OspreyCoordinatorInputStream)
 
-    action = stream._create_osprey_engine_action(create_coordinator_action(encoded_secret_data))
+    coordinator_action = create_coordinator_action(encoded_secret_data)
+
+    action = stream._create_osprey_engine_action(coordinator_action)
 
     assert action is not None
     assert action.data == {'public': 'value'}
     assert action.secret_data == expected_secret_data
+    assert not coordinator_action.HasField('json_secret_data')
 
 
-def test_create_engine_action_rejects_malformed_secret_json() -> None:
+def test_create_engine_action_rejects_malformed_secret_json_without_capturing_plaintext() -> None:
     stream = OspreyCoordinatorInputStream.__new__(OspreyCoordinatorInputStream)
+    coordinator_action = create_coordinator_action(b'private-secret-sentinel')
 
-    with patch('osprey.worker.sinks.sink.osprey_coordinator_input_stream.sentry_sdk.capture_exception'):
-        action = stream._create_osprey_engine_action(create_coordinator_action(b'not-json'))
+    with (
+        patch(
+            'osprey.worker.sinks.sink.osprey_coordinator_input_stream.sentry_sdk.capture_exception'
+        ) as capture_exception,
+        patch('osprey.worker.sinks.sink.osprey_coordinator_input_stream.logger.warning') as warning,
+    ):
+        action = stream._create_osprey_engine_action(coordinator_action)
 
     assert action is None
+    assert not coordinator_action.HasField('json_secret_data')
+    capture_exception.assert_not_called()
+    warning.assert_called_once_with(
+        'Error while generating input message containing secret data: %s',
+        'JSONDecodeError',
+    )

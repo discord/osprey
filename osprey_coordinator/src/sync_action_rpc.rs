@@ -1,3 +1,6 @@
+use crate::gcloud::gcp_metadata::GCPMetadataClient;
+use crate::gcloud::grpc::connection::Connection;
+use crate::gcloud::kms::{AesGcmEnvelope, GOOGLE_KMS_DOMAIN};
 use crate::metrics::counters::StaticCounter;
 use crate::metrics::histograms::StaticHistogram;
 use crate::snowflake_client::SnowflakeClient;
@@ -8,19 +11,69 @@ use crate::{
     proto::{self, osprey_coordinator_sync_action},
 };
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use osprey_coordinator_sync_action::osprey_coordinator_sync_action_service_server::OspreyCoordinatorSyncActionService;
 use osprey_coordinator_sync_action::ProcessActionRequest;
 use rand::Rng;
 
+#[async_trait]
+trait SecretDataDecryptor: Send + Sync {
+    async fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>>;
+}
+
+struct KmsSecretDataDecryptor {
+    envelope: Mutex<Option<Arc<AesGcmEnvelope>>>,
+}
+
+impl KmsSecretDataDecryptor {
+    fn new() -> Self {
+        Self {
+            envelope: Mutex::new(None),
+        }
+    }
+
+    async fn envelope(&self) -> Result<Arc<AesGcmEnvelope>> {
+        let mut envelope = self.envelope.lock().await;
+        if let Some(envelope) = envelope.as_ref() {
+            return Ok(envelope.clone());
+        }
+
+        let kek_uri = env::var("PUBSUB_ENCRYPTION_KEY_URI")
+            .context("`PUBSUB_ENCRYPTION_KEY_URI` must be set to decrypt sync action secrets")?;
+        let connection = Connection::from_metadata_client(
+            GCPMetadataClient::new("default".to_owned())?,
+            Duration::from_secs(5),
+            Duration::from_secs(24000),
+            GOOGLE_KMS_DOMAIN,
+        )
+        .await?;
+        let initialized =
+            Arc::new(connection.create_kms_aes_gcm_envelope(kek_uri, Vec::new(), true)?);
+        *envelope = Some(initialized.clone());
+        Ok(initialized)
+    }
+}
+
+#[async_trait]
+impl SecretDataDecryptor for KmsSecretDataDecryptor {
+    async fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        self.envelope().await?.decrypt(ciphertext).await
+    }
+}
+
 pub(crate) struct SyncActionServer {
     snowflake_client: Arc<SnowflakeClient>,
     priority_queue_sender: PriorityQueueSender,
     metrics: Arc<OspreyCoordinatorMetrics>,
     is_shutting_down: Arc<AtomicBool>,
+    secret_data_decryptor: Arc<dyn SecretDataDecryptor>,
 }
 
 impl SyncActionServer {
@@ -35,6 +88,24 @@ impl SyncActionServer {
             priority_queue_sender,
             metrics,
             is_shutting_down,
+            secret_data_decryptor: Arc::new(KmsSecretDataDecryptor::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_decryptor(
+        snowflake_client: Arc<SnowflakeClient>,
+        priority_queue_sender: PriorityQueueSender,
+        metrics: Arc<OspreyCoordinatorMetrics>,
+        is_shutting_down: Arc<AtomicBool>,
+        secret_data_decryptor: Arc<dyn SecretDataDecryptor>,
+    ) -> SyncActionServer {
+        SyncActionServer {
+            snowflake_client,
+            priority_queue_sender,
+            metrics,
+            is_shutting_down,
+            secret_data_decryptor,
         }
     }
 }
@@ -43,6 +114,7 @@ async fn create_osprey_coordinator_action(
     ack_id: u64,
     action_request: &osprey_coordinator_sync_action::ProcessActionRequest,
     snowflake_client: &SnowflakeClient,
+    secret_data_decryptor: &dyn SecretDataDecryptor,
 ) -> Result<proto::OspreyCoordinatorAction> {
     // generate snowflake if one is not provided, to match the behaviour in pubsub.rs
     let action_id = match action_request.action_id {
@@ -56,6 +128,21 @@ async fn create_osprey_coordinator_action(
     if action_request.action_name.is_empty() {
         return Err(anyhow!("`action_name` must not be empty"));
     }
+    let secret_data = match action_request.secret_data.as_ref() {
+        Some(
+            osprey_coordinator_sync_action::process_action_request::SecretData::EncryptedJsonSecretData(
+                encrypted_json_secret_data,
+            ),
+        ) => Some(
+            proto::osprey_coordinator_action::SecretData::JsonSecretData(
+                secret_data_decryptor
+                    .decrypt(encrypted_json_secret_data)
+                    .await
+                    .context("failed to decrypt `encrypted_json_secret_data`")?,
+            ),
+        ),
+        None => None,
+    };
     let osprey_coordinator_action = proto::OspreyCoordinatorAction {
         ack_id,
         action_id,
@@ -65,11 +152,7 @@ async fn create_osprey_coordinator_action(
                 action_request.action_data_json.clone().into(),
             ),
         ),
-        secret_data: action_request.secret_data.as_ref().map(|secret_data| match secret_data {
-            osprey_coordinator_sync_action::process_action_request::SecretData::JsonSecretData(
-                json_secret_data,
-            ) => proto::osprey_coordinator_action::SecretData::JsonSecretData(json_secret_data.clone()),
-        }),
+        secret_data,
         timestamp: Some(
             action_request
                 .timestamp
@@ -109,6 +192,7 @@ impl SyncActionServer {
             ack_id,
             action_request,
             self.snowflake_client.as_ref(),
+            self.secret_data_decryptor.as_ref(),
         )
         .await
         {
@@ -227,6 +311,19 @@ mod tests {
     use std::io;
     use std::sync::Mutex;
 
+    struct TestSecretDataDecryptor;
+
+    #[async_trait]
+    impl SecretDataDecryptor for TestSecretDataDecryptor {
+        async fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+            match ciphertext {
+                b"encrypted-secret" => Ok(br#"{"private":"secret"}"#.to_vec()),
+                b"encrypted-malformed-json" => Ok(b"not-json".to_vec()),
+                _ => Err(anyhow!("test decryption failure")),
+            }
+        }
+    }
+
     #[derive(Clone)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -250,7 +347,7 @@ mod tests {
                 seconds: 1_700_000_000,
                 nanos: 0,
             }),
-            secret_data: secret_data.map(RequestSecretData::JsonSecretData),
+            secret_data: secret_data.map(RequestSecretData::EncryptedJsonSecretData),
         }
     }
 
@@ -258,11 +355,12 @@ mod tests {
         let metrics = OspreyCoordinatorMetrics::new();
         let (priority_queue_sender, priority_queue_receiver) =
             create_ackable_action_priority_queue();
-        let server = SyncActionServer::new(
+        let server = SyncActionServer::new_with_decryptor(
             Arc::new(SnowflakeClient::new("unused".to_owned())),
             priority_queue_sender,
             metrics.clone(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(TestSecretDataDecryptor),
         );
         let request = request(secret_data);
 
@@ -302,7 +400,7 @@ mod tests {
         assert!(!output.contains("private-secret-sentinel"));
         assert!(!output.contains("ProcessActionRequest"));
         assert!(!output.contains("action_data_json"));
-        assert!(!output.contains("json_secret_data"));
+        assert!(!output.contains("encrypted_json_secret_data"));
     }
 
     #[tokio::test]
@@ -319,10 +417,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_action_forwards_secret_data_separately() {
-        let secret_data = br#"{"private":"secret"}"#.to_vec();
-
-        let action = process_request(Some(secret_data.clone())).await;
+    async fn process_action_decrypts_and_forwards_secret_data_separately() {
+        let action = process_request(Some(b"encrypted-secret".to_vec())).await;
 
         assert_eq!(
             action.action_data,
@@ -332,19 +428,39 @@ mod tests {
         );
         assert_eq!(
             action.secret_data,
-            Some(CoordinatorSecretData::JsonSecretData(secret_data))
+            Some(CoordinatorSecretData::JsonSecretData(
+                br#"{"private":"secret"}"#.to_vec()
+            ))
         );
     }
 
     #[tokio::test]
-    async fn process_action_leaves_secret_json_validation_to_the_worker() {
-        let malformed_secret_data = b"not-json".to_vec();
-
-        let action = process_request(Some(malformed_secret_data.clone())).await;
+    async fn process_action_leaves_decrypted_json_validation_to_the_worker() {
+        let action = process_request(Some(b"encrypted-malformed-json".to_vec())).await;
 
         assert_eq!(
             action.secret_data,
-            Some(CoordinatorSecretData::JsonSecretData(malformed_secret_data))
+            Some(CoordinatorSecretData::JsonSecretData(b"not-json".to_vec()))
+        );
+    }
+
+    #[tokio::test]
+    async fn process_action_rejects_secret_data_that_cannot_be_decrypted() {
+        let action_request = request(Some(b"invalid-ciphertext".to_vec()));
+        let snowflake_client = SnowflakeClient::new("unused".to_owned());
+
+        let error = create_osprey_coordinator_action(
+            1,
+            &action_request,
+            &snowflake_client,
+            &TestSecretDataDecryptor,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "failed to decrypt `encrypted_json_secret_data`"
         );
     }
 }

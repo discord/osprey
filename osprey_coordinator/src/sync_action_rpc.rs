@@ -180,6 +180,15 @@ impl SyncActionServer {
     }
 }
 
+fn log_action_request(action_request: &ProcessActionRequest) {
+    tracing::debug!(
+        action_id = ?action_request.action_id,
+        action_name = %action_request.action_name,
+        has_secret_data = action_request.secret_data.is_some(),
+        "[rpc] action request received"
+    );
+}
+
 #[tonic::async_trait]
 impl OspreyCoordinatorSyncActionService for SyncActionServer {
     async fn process_action(
@@ -189,7 +198,7 @@ impl OspreyCoordinatorSyncActionService for SyncActionServer {
     {
         self.metrics.sync_classification_action_received.incr();
         let action_request = request.into_inner();
-        tracing::debug!({action_request=?action_request}, "[rpc] action request received");
+        log_action_request(&action_request);
 
         let ack_id: u64 = {
             let mut rng = rand::thread_rng();
@@ -203,5 +212,139 @@ impl OspreyCoordinatorSyncActionService for SyncActionServer {
                 self.try_process_action(ack_id, &action_request).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::priority_queue::create_ackable_action_priority_queue;
+    use crate::proto::osprey_coordinator_action::{
+        ActionData, SecretData as CoordinatorSecretData,
+    };
+    use crate::proto::osprey_coordinator_sync_action::process_action_request::SecretData as RequestSecretData;
+    use prost_types::Timestamp;
+    use std::io;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn request(secret_data: Option<Vec<u8>>) -> ProcessActionRequest {
+        ProcessActionRequest {
+            action_id: Some(123),
+            action_name: "test_action".to_owned(),
+            action_data_json: r#"{"public":"value"}"#.to_owned(),
+            timestamp: Some(Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            }),
+            secret_data: secret_data.map(RequestSecretData::JsonSecretData),
+        }
+    }
+
+    async fn process_request(secret_data: Option<Vec<u8>>) -> proto::OspreyCoordinatorAction {
+        let metrics = OspreyCoordinatorMetrics::new();
+        let (priority_queue_sender, priority_queue_receiver) =
+            create_ackable_action_priority_queue();
+        let server = SyncActionServer::new(
+            Arc::new(SnowflakeClient::new("unused".to_owned())),
+            priority_queue_sender,
+            metrics.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let request = request(secret_data);
+
+        let response =
+            tokio::spawn(async move { server.process_action(tonic::Request::new(request)).await });
+        let ackable_action = priority_queue_receiver.recv(metrics).await.unwrap();
+        let (action, acker) = ackable_action.into_action();
+        acker.ack_or_nack(AckOrNack::Ack(None));
+        response.await.unwrap().unwrap();
+        action
+    }
+
+    #[test]
+    fn action_request_log_redacts_payloads() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = SharedWriter(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_target(false)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let secret_sentinel = b"private-secret-sentinel".to_vec();
+        let mut action_request = request(Some(secret_sentinel));
+        action_request.action_data_json = "public-data-sentinel".to_owned();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_action_request(&action_request);
+        });
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("action_id=Some(123)"));
+        assert!(output.contains("action_name=test_action"));
+        assert!(output.contains("has_secret_data=true"));
+        assert!(!output.contains("public-data-sentinel"));
+        assert!(!output.contains("private-secret-sentinel"));
+        assert!(!output.contains("ProcessActionRequest"));
+        assert!(!output.contains("action_data_json"));
+        assert!(!output.contains("json_secret_data"));
+    }
+
+    #[tokio::test]
+    async fn process_action_forwards_absent_secret_data() {
+        let action = process_request(None).await;
+
+        assert_eq!(
+            action.action_data,
+            Some(ActionData::JsonActionData(
+                br#"{"public":"value"}"#.to_vec()
+            ))
+        );
+        assert_eq!(action.secret_data, None);
+    }
+
+    #[tokio::test]
+    async fn process_action_forwards_secret_data_separately() {
+        let secret_data = br#"{"private":"secret"}"#.to_vec();
+
+        let action = process_request(Some(secret_data.clone())).await;
+
+        assert_eq!(
+            action.action_data,
+            Some(ActionData::JsonActionData(
+                br#"{"public":"value"}"#.to_vec()
+            ))
+        );
+        assert_eq!(
+            action.secret_data,
+            Some(CoordinatorSecretData::JsonSecretData(secret_data))
+        );
+    }
+
+    #[tokio::test]
+    async fn process_action_leaves_secret_json_validation_to_the_worker() {
+        let malformed_secret_data = b"not-json".to_vec();
+
+        let action = process_request(Some(malformed_secret_data.clone())).await;
+
+        assert_eq!(
+            action.secret_data,
+            Some(CoordinatorSecretData::JsonSecretData(malformed_secret_data))
+        );
     }
 }

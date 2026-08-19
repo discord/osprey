@@ -156,31 +156,19 @@ class _PublisherState:
             )
 
     async def _flush_loop(self) -> None:
-        while True:
+        while not self._stopped:
             try:
-                batch: List[bytes] = []
                 try:
-                    batch.append(
-                        await asyncio.wait_for(
-                            self._queue.get(),
-                            timeout=self._max_latency,
-                        )
+                    msg = await asyncio.wait_for(
+                        self._queue.get(),
+                        timeout=self._max_latency,
                     )
                 except asyncio.TimeoutError:
                     continue
-                while len(batch) < self._max_messages:
-                    try:
-                        batch.append(self._queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
+                batch = self._take_outer_batch(msg)
                 await self._flush_batch(batch)
             except asyncio.CancelledError:
-                remaining: List[bytes] = []
-                while not self._queue.empty():
-                    remaining.append(self._queue.get_nowait())
-                if remaining:
-                    await self._flush_batch(remaining)
-                return
+                raise
             except Exception:
                 logger.exception('Error in flush loop')
 
@@ -195,13 +183,33 @@ class _PublisherState:
             raise
         self._requeue(retry_messages)
 
+    def _record_queue_depth(self) -> None:
+        metrics.gauge(
+            'async_pubsub_publisher.queue_depth',
+            self._queue.qsize(),
+            tags=self._metric_tags,
+        )
+
+    def _take_outer_batch(self, first: bytes) -> List[bytes]:
+        batch = [first]
+        while len(batch) < self._max_messages:
+            try:
+                batch.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        self._record_queue_depth()
+        return batch
+
     def _requeue(self, messages: List[bytes]) -> None:
+        if not messages:
+            return
         for data in messages:
             self._queue.put_nowait(data)
             metrics.increment(
                 'async_pubsub_publisher.publish.retry_queued',
                 tags=self._metric_tags,
             )
+        self._record_queue_depth()
 
     def _sync_flush(self, batch: List[bytes]) -> List[bytes]:
         futures = []
@@ -250,16 +258,31 @@ class _PublisherState:
                 tags=self._metric_tags,
             )
 
+    def begin_stop(self) -> asyncio.Task[None]:
+        if self._stop_task is None:
+            self._stopped = True
+            self._stop_task = asyncio.create_task(self._drain_and_stop())
+        return self._stop_task
+
     async def stop(self) -> None:
-        if self._stopped:
-            return
-        self._stopped = True
-        if self._flush_task is not None:
+        await asyncio.shield(self.begin_stop())
+
+    async def _drain_and_stop(self) -> None:
+        if self._flush_task is not None and not self._flush_task.done():
             self._flush_task.cancel()
             try:
                 await self._flush_task
             except asyncio.CancelledError:
                 pass
+
+        pending_at_stop = self._queue.qsize()
+        while pending_at_stop > 0:
+            batch: List[bytes] = []
+            while pending_at_stop > 0 and len(batch) < self._max_messages:
+                batch.append(self._queue.get_nowait())
+                pending_at_stop -= 1
+            self._record_queue_depth()
+            await self._flush_batch(batch)
 
 
 class AsyncPubSubPublisherPool:
@@ -276,6 +299,8 @@ class AsyncPubSubPublisherPool:
         self._client: Optional[pubsub_v1.PublisherClient] = None
         self._states: dict[tuple[str, str], _PublisherState] = {}
         self._lease_counts: dict[tuple[str, str], int] = {}
+        self._drain_tasks: set[asyncio.Task[None]] = set()
+        self._stop_task: Optional[asyncio.Task[None]] = None
         self._stopped = False
         self._client_stopped = False
 
@@ -306,27 +331,50 @@ class AsyncPubSubPublisherPool:
         key, state = self._acquire_state(project_id, topic_id)
         return AsyncPubSubPublisher._from_pool(self, key, state)
 
+    def _track_drain(self, state: _PublisherState) -> asyncio.Task[None]:
+        task = state.begin_stop()
+        self._drain_tasks.add(task)
+        task.add_done_callback(self._drain_tasks.discard)
+        return task
+
     async def _release(self, key: tuple[str, str], state: _PublisherState) -> None:
         if key not in self._lease_counts:
+            await asyncio.shield(self._track_drain(state))
             return
         self._lease_counts[key] -= 1
         if self._lease_counts[key] != 0:
             return
         self._states.pop(key)
         self._lease_counts.pop(key)
-        await state.stop()
+        drain_task = self._track_drain(state)
+        await asyncio.shield(drain_task)
+
+    def begin_stop(self) -> asyncio.Task[None]:
+        if self._stop_task is None:
+            self._stopped = True
+            self._stop_task = asyncio.create_task(self._drain_states_and_stop_client())
+        return self._stop_task
 
     async def stop(self) -> None:
-        if self._stopped:
-            return
-        self._stopped = True
+        await asyncio.shield(self.begin_stop())
+
+    async def _drain_states_and_stop_client(self) -> None:
         states = list(self._states.values())
         self._states.clear()
         self._lease_counts.clear()
-        try:
-            await asyncio.gather(*(state.stop() for state in states))
-        finally:
-            await self._stop_client()
+        pending = {self._track_drain(state) for state in states}
+        pending.update(self._drain_tasks)
+        errors: list[BaseException] = []
+        while pending:
+            results = await asyncio.gather(
+                *(asyncio.shield(task) for task in pending),
+                return_exceptions=True,
+            )
+            errors.extend(result for result in results if isinstance(result, BaseException))
+            pending = {task for task in self._drain_tasks if not task.done()}
+        await self._stop_client()
+        if errors:
+            raise errors[0]
 
     async def _stop_client(self) -> None:
         if self._client is None or self._client_stopped:
@@ -389,10 +437,13 @@ class AsyncPubSubPublisher:
         self._assert_running()
         self._state.publish_bytes(data)
 
-    async def stop(self) -> None:
-        if self._stopped:
-            return
-        self._stopped = True
+    def _begin_stop(self) -> asyncio.Task[None]:
+        if self._stop_task is None:
+            self._stopped = True
+            self._stop_task = asyncio.create_task(self._release_and_stop_owned_pool())
+        return self._stop_task
+
+    async def _release_and_stop_owned_pool(self) -> None:
         if self._owned_pool is None:
             await self._pool._release(self._key, self._state)
             return
@@ -400,3 +451,6 @@ class AsyncPubSubPublisher:
             await self._pool._release(self._key, self._state)
         finally:
             await self._owned_pool.stop()
+
+    async def stop(self) -> None:
+        await asyncio.shield(self._begin_stop())

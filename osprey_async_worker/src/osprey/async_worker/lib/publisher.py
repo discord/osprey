@@ -6,7 +6,8 @@ flushing. No threading locks, no gevent, no background threads.
 
 import asyncio
 import logging
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional
 
 from google.api_core.exceptions import (
     Aborted,
@@ -57,6 +58,51 @@ _PUBLISH_RETRY = Retry(
 )
 
 
+@dataclass(frozen=True)
+class PublisherBatchSettings:
+    max_bytes: int = 2_000_000
+    max_messages: int = 250
+    transport_max_latency_seconds: float = 0.01
+
+    def google_settings(self) -> pubsub_v1.types.BatchSettings:
+        return pubsub_v1.types.BatchSettings(
+            max_bytes=self.max_bytes,
+            max_messages=self.max_messages,
+            max_latency=self.transport_max_latency_seconds,
+        )
+
+
+def _topic_metric_tags(topic_path: str) -> list[str]:
+    parts = topic_path.split('/')
+    if len(parts) != 4 or parts[0] != 'projects' or parts[2] != 'topics':
+        return [f'topic_path:{topic_path}']
+    return [f'project:{parts[1]}', f'topic:{parts[3]}']
+
+
+# google-cloud-pubsub 2.15.2 does not expose typed PublisherClient metadata.
+class _InstrumentedPublisherClient(pubsub_v1.PublisherClient):  # type: ignore[misc]
+    """Meters logical GAPIC batches, not internal physical retry attempts."""
+
+    def _gapic_publish(self, *args: Any, **kwargs: Any) -> Any:
+        topic = kwargs['topic']
+        messages = kwargs['messages']
+        tags = _topic_metric_tags(topic)
+        metrics.increment('async_pubsub_publisher.transport_batch', tags=tags)
+        metrics.histogram(
+            'async_pubsub_publisher.messages_per_transport_batch',
+            len(messages),
+            tags=tags,
+        )
+        return super()._gapic_publish(*args, **kwargs)
+
+
+PublisherClientFactory = Callable[[PublisherBatchSettings], pubsub_v1.PublisherClient]
+
+
+def _create_client(settings: PublisherBatchSettings) -> pubsub_v1.PublisherClient:
+    return _InstrumentedPublisherClient(batch_settings=settings.google_settings())
+
+
 class AsyncPubSubPublisher:
     """Publishes Pydantic models to a Pub/Sub topic with async batching.
 
@@ -72,9 +118,7 @@ class AsyncPubSubPublisher:
         max_latency_seconds: float = 1.0,
     ):
         self._topic_path = f'projects/{project_id}/topics/{topic_id}'
-        self._client = pubsub_v1.PublisherClient(
-            batch_settings=pubsub_v1.types.BatchSettings(max_messages=1),
-        )
+        self._client = _create_client(PublisherBatchSettings(max_messages=max_messages))
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._max_messages = max_messages
         self._max_latency = max_latency_seconds

@@ -1,11 +1,13 @@
 """Async Pub/Sub publisher with batching for the async worker.
 
 Uses asyncio.Queue for buffering and a background task for periodic
-flushing. No threading locks, no gevent, no background threads.
+flushing. Only the process-level client count uses a threading lock;
+message buffering uses no locks, gevent, or custom threads.
 """
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 
@@ -24,6 +26,23 @@ from osprey.worker.lib.instruments import metrics
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+_live_client_count = 0
+_live_client_count_lock = threading.Lock()
+
+
+def _change_live_client_count(delta: int) -> None:
+    global _live_client_count
+    with _live_client_count_lock:
+        next_count = _live_client_count + delta
+        if next_count < 0:
+            raise RuntimeError('live Pub/Sub client count became negative')
+        _live_client_count = next_count
+        metrics.gauge(
+            'async_pubsub_publisher.live_clients',
+            _live_client_count,
+        )
+
 
 _TRANSIENT_PUBLISH_ERRORS = (
     TimeoutError,
@@ -103,73 +122,62 @@ def _create_client(settings: PublisherBatchSettings) -> pubsub_v1.PublisherClien
     return _InstrumentedPublisherClient(batch_settings=settings.google_settings())
 
 
-class AsyncPubSubPublisher:
-    """Publishes Pydantic models to a Pub/Sub topic with async batching.
-
-    Messages are buffered in an asyncio.Queue and flushed either when
-    the batch reaches max_messages or after max_latency_seconds.
-    """
-
+class _PublisherState:
     def __init__(
         self,
+        client: pubsub_v1.PublisherClient,
         project_id: str,
         topic_id: str,
-        max_messages: int = 250,
-        max_latency_seconds: float = 1.0,
-    ):
+        max_messages: int,
+        max_latency: float,
+    ) -> None:
+        self._client = client
         self._topic_path = f'projects/{project_id}/topics/{topic_id}'
-        self._client = _create_client(PublisherBatchSettings(max_messages=max_messages))
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._max_messages = max_messages
-        self._max_latency = max_latency_seconds
-        self._flush_task: Optional[asyncio.Task[None]] = None
-        self._started = False
+        self._max_latency = max_latency
         self._metric_tags = [f'project:{project_id}', f'topic:{topic_id}']
+        self._flush_task: Optional[asyncio.Task[None]] = None
+        self._stop_task: Optional[asyncio.Task[None]] = None
+        self._started = False
+        self._stopped = False
 
     def _ensure_started(self) -> None:
-        """Start the background flush task on first publish."""
-        if not self._started:
-            self._started = True
-            try:
-                loop = asyncio.get_running_loop()
-                self._flush_task = loop.create_task(self._flush_loop())
-            except RuntimeError:
-                # No event loop. Messages will be enqueued but never flushed —
-                # surface that explicitly so dashboards can catch it.
-                metrics.increment('async_pubsub_publisher.no_event_loop', tags=self._metric_tags)
+        if self._started:
+            return
+        self._started = True
+        try:
+            loop = asyncio.get_running_loop()
+            self._flush_task = loop.create_task(self._flush_loop())
+        except RuntimeError:
+            metrics.increment(
+                'async_pubsub_publisher.no_event_loop',
+                tags=self._metric_tags,
+            )
 
     async def _flush_loop(self) -> None:
-        """Background task that flushes the buffer periodically."""
         while True:
             try:
                 batch: List[bytes] = []
-
-                # Wait for first message or timeout
                 try:
-                    msg = await asyncio.wait_for(self._queue.get(), timeout=self._max_latency)
-                    batch.append(msg)
-                except TimeoutError:
+                    batch.append(
+                        await asyncio.wait_for(
+                            self._queue.get(),
+                            timeout=self._max_latency,
+                        )
+                    )
+                except asyncio.TimeoutError:
                     continue
-
-                # Drain up to max_messages
                 while len(batch) < self._max_messages:
                     try:
-                        msg = self._queue.get_nowait()
-                        batch.append(msg)
+                        batch.append(self._queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
-
-                if batch:
-                    await self._flush_batch(batch)
-
+                await self._flush_batch(batch)
             except asyncio.CancelledError:
-                # Flush remaining on shutdown
                 remaining: List[bytes] = []
                 while not self._queue.empty():
-                    try:
-                        remaining.append(self._queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
+                    remaining.append(self._queue.get_nowait())
                 if remaining:
                     await self._flush_batch(remaining)
                 return
@@ -177,7 +185,6 @@ class AsyncPubSubPublisher:
                 logger.exception('Error in flush loop')
 
     async def _flush_batch(self, batch: List[bytes]) -> None:
-        """Publish a batch of messages. Runs sync publishes in executor."""
         loop = asyncio.get_running_loop()
         flush_future = loop.run_in_executor(None, self._sync_flush, batch)
         try:
@@ -189,54 +196,207 @@ class AsyncPubSubPublisher:
         self._requeue(retry_messages)
 
     def _requeue(self, messages: List[bytes]) -> None:
-        """Put transient publish failures back on the process-local queue."""
         for data in messages:
             self._queue.put_nowait(data)
-            metrics.increment('async_pubsub_publisher.publish.retry_queued', tags=self._metric_tags)
+            metrics.increment(
+                'async_pubsub_publisher.publish.retry_queued',
+                tags=self._metric_tags,
+            )
 
     def _sync_flush(self, batch: List[bytes]) -> List[bytes]:
-        """Synchronous batch publish."""
         futures = []
         for data in batch:
-            metrics.increment('async_pubsub_publisher.publish.attempt', tags=self._metric_tags)
-            futures.append((data, self._client.publish(self._topic_path, data, retry=_PUBLISH_RETRY)))
+            metrics.increment(
+                'async_pubsub_publisher.publish.attempt',
+                tags=self._metric_tags,
+            )
+            future = self._client.publish(
+                self._topic_path,
+                data,
+                retry=_PUBLISH_RETRY,
+            )
+            futures.append((data, future))
+
         retry_messages = []
         for data, future in futures:
             try:
-                # deadline=30s above; 35s here ensures Retry's own deadline,
-                # not this wall-clock cap, is what terminates failed attempts.
                 future.result(timeout=35)
-                metrics.increment('async_pubsub_publisher.publish.success', tags=self._metric_tags)
-            except Exception as e:
+                metrics.increment(
+                    'async_pubsub_publisher.publish.success',
+                    tags=self._metric_tags,
+                )
+            except Exception as error:
                 metrics.increment(
                     'async_pubsub_publisher.publish.failure',
-                    tags=self._metric_tags + [f'error:{e.__class__.__name__}'],
+                    tags=self._metric_tags + [f'error:{error.__class__.__name__}'],
                 )
-                if _is_transient_publish_error(e):
+                if _is_transient_publish_error(error):
                     logger.warning('Transient publish failure; requeuing', exc_info=True)
                     retry_messages.append(data)
                 else:
                     logger.exception('Failed to publish message')
         return retry_messages
 
-    def publish(self, data: BaseModel) -> None:
-        """Queue a Pydantic model for async batched publishing."""
-        self.publish_bytes(data.json(exclude_none=True).encode())
-
     def publish_bytes(self, data: bytes) -> None:
-        """Queue raw bytes for async batched publishing."""
+        if self._stopped:
+            raise RuntimeError('publisher is stopped')
         self._ensure_started()
         try:
             self._queue.put_nowait(data)
         except asyncio.QueueFull:
             logger.warning('Publisher queue full, dropping message')
-            metrics.increment('async_pubsub_publisher.queue_full', tags=self._metric_tags)
+            metrics.increment(
+                'async_pubsub_publisher.queue_full',
+                tags=self._metric_tags,
+            )
 
     async def stop(self) -> None:
-        """Flush remaining messages and stop."""
+        if self._stopped:
+            return
+        self._stopped = True
         if self._flush_task is not None:
             self._flush_task.cancel()
             try:
                 await self._flush_task
             except asyncio.CancelledError:
                 pass
+
+
+class AsyncPubSubPublisherPool:
+    def __init__(
+        self,
+        settings: PublisherBatchSettings = PublisherBatchSettings(),
+        outer_max_latency_seconds: float = 1.0,
+        client_factory: Optional[PublisherClientFactory] = None,
+    ) -> None:
+        self._settings = settings
+        self._outer_max_latency_seconds = outer_max_latency_seconds
+        # Resolve at construction time so tests can patch `_create_client`.
+        self._client_factory = client_factory or _create_client
+        self._client: Optional[pubsub_v1.PublisherClient] = None
+        self._states: dict[tuple[str, str], _PublisherState] = {}
+        self._lease_counts: dict[tuple[str, str], int] = {}
+        self._stopped = False
+        self._client_stopped = False
+
+    def _acquire_state(
+        self,
+        project_id: str,
+        topic_id: str,
+    ) -> tuple[tuple[str, str], _PublisherState]:
+        if self._stopped:
+            raise RuntimeError('publisher pool is stopped')
+        if self._client is None:
+            self._client = self._client_factory(self._settings)
+            _change_live_client_count(1)
+        key = (project_id, topic_id)
+        if key not in self._states:
+            self._states[key] = _PublisherState(
+                self._client,
+                project_id,
+                topic_id,
+                self._settings.max_messages,
+                self._outer_max_latency_seconds,
+            )
+            self._lease_counts[key] = 0
+        self._lease_counts[key] += 1
+        return key, self._states[key]
+
+    def acquire(self, project_id: str, topic_id: str) -> 'AsyncPubSubPublisher':
+        key, state = self._acquire_state(project_id, topic_id)
+        return AsyncPubSubPublisher._from_pool(self, key, state)
+
+    async def _release(self, key: tuple[str, str], state: _PublisherState) -> None:
+        if key not in self._lease_counts:
+            return
+        self._lease_counts[key] -= 1
+        if self._lease_counts[key] != 0:
+            return
+        self._states.pop(key)
+        self._lease_counts.pop(key)
+        await state.stop()
+
+    async def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        states = list(self._states.values())
+        self._states.clear()
+        self._lease_counts.clear()
+        try:
+            await asyncio.gather(*(state.stop() for state in states))
+        finally:
+            await self._stop_client()
+
+    async def _stop_client(self) -> None:
+        if self._client is None or self._client_stopped:
+            return
+        self._client_stopped = True
+        await asyncio.to_thread(self._client.stop)
+        _change_live_client_count(-1)
+
+
+class AsyncPubSubPublisher:
+    """Publishes Pydantic models to a Pub/Sub topic with async batching."""
+
+    def __init__(
+        self,
+        project_id: str,
+        topic_id: str,
+        max_messages: int = 250,
+        max_latency_seconds: float = 1.0,
+    ) -> None:
+        owned_pool = AsyncPubSubPublisherPool(
+            settings=PublisherBatchSettings(max_messages=max_messages),
+            outer_max_latency_seconds=max_latency_seconds,
+        )
+        key, state = owned_pool._acquire_state(project_id, topic_id)
+        self._initialize_lease(owned_pool, key, state, owned_pool)
+
+    @classmethod
+    def _from_pool(
+        cls,
+        pool: AsyncPubSubPublisherPool,
+        key: tuple[str, str],
+        state: _PublisherState,
+    ) -> 'AsyncPubSubPublisher':
+        lease = cls.__new__(cls)
+        lease._initialize_lease(pool, key, state, None)
+        return lease
+
+    def _initialize_lease(
+        self,
+        pool: AsyncPubSubPublisherPool,
+        key: tuple[str, str],
+        state: _PublisherState,
+        owned_pool: Optional[AsyncPubSubPublisherPool],
+    ) -> None:
+        self._pool = pool
+        self._key = key
+        self._state = state
+        self._owned_pool = owned_pool
+        self._stopped = False
+        self._stop_task: Optional[asyncio.Task[None]] = None
+
+    def _assert_running(self) -> None:
+        if self._stopped or self._state._stopped or self._pool._stopped:
+            raise RuntimeError('publisher is stopped')
+
+    def publish(self, data: BaseModel) -> None:
+        self.publish_bytes(data.json(exclude_none=True).encode())
+
+    def publish_bytes(self, data: bytes) -> None:
+        self._assert_running()
+        self._state.publish_bytes(data)
+
+    async def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        if self._owned_pool is None:
+            await self._pool._release(self._key, self._state)
+            return
+        try:
+            await self._pool._release(self._key, self._state)
+        finally:
+            await self._owned_pool.stop()

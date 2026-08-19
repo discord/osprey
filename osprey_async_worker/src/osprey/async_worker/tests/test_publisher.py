@@ -4,13 +4,15 @@ import asyncio
 import threading
 from unittest.mock import MagicMock, call, patch
 
+import osprey.async_worker.lib.publisher as publisher_module
 import pytest
-from google.api_core.exceptions import DeadlineExceeded, NotFound, RetryError
+from google.api_core.exceptions import DeadlineExceeded, NotFound, RetryError, ServiceUnavailable
 from google.auth.credentials import AnonymousCredentials
 from google.cloud import pubsub_v1
 from osprey.async_worker.lib.publisher import (
     _PUBLISH_RETRY,
     AsyncPubSubPublisher,
+    AsyncPubSubPublisherPool,
     PublisherBatchSettings,
     _create_client,
     _InstrumentedPublisherClient,
@@ -22,7 +24,7 @@ def _make_publisher():
     client = MagicMock()
     with patch('osprey.async_worker.lib.publisher._create_client', return_value=client):
         publisher = AsyncPubSubPublisher(project_id='proj', topic_id='topic')
-    assert publisher._client is client
+    assert publisher._state._client is client
     return publisher
 
 
@@ -119,15 +121,91 @@ def _make_future(result=None, exc=None):
     return future
 
 
+@pytest.mark.asyncio
+@patch('osprey.async_worker.lib.publisher.metrics')
+async def test_pool_shares_equal_topic_state_and_isolates_other_topics(mock_metrics):
+    client = MagicMock()
+    pool = AsyncPubSubPublisherPool(client_factory=lambda _settings: client)
+
+    first = pool.acquire('proj', 'topic-a')
+    second = pool.acquire('proj', 'topic-a')
+    other = pool.acquire('proj', 'topic-b')
+
+    assert first._state is second._state
+    assert first._state is not other._state
+    assert first._state._client is other._state._client is client
+    await pool.stop()
+
+
+@pytest.mark.asyncio
+@patch('osprey.async_worker.lib.publisher.metrics')
+async def test_live_clients_is_a_process_running_count(mock_metrics, monkeypatch):
+    monkeypatch.setattr(publisher_module, '_live_client_count', 0)
+    first_client = MagicMock()
+    second_client = MagicMock()
+    first_pool = AsyncPubSubPublisherPool(client_factory=lambda _settings: first_client)
+    second_pool = AsyncPubSubPublisherPool(client_factory=lambda _settings: second_client)
+
+    first = first_pool.acquire('proj', 'first')
+    second = second_pool.acquire('proj', 'second')
+    await first.stop()
+    await second.stop()
+    await first_pool.stop()
+    await second_pool.stop()
+
+    live_calls = [
+        call for call in mock_metrics.gauge.call_args_list if call.args[0] == 'async_pubsub_publisher.live_clients'
+    ]
+    assert live_calls == [
+        call('async_pubsub_publisher.live_clients', 1),
+        call('async_pubsub_publisher.live_clients', 2),
+        call('async_pubsub_publisher.live_clients', 1),
+        call('async_pubsub_publisher.live_clients', 0),
+    ]
+
+
+@pytest.mark.asyncio
+@patch('osprey.async_worker.lib.publisher.metrics')
+async def test_transient_batch_failure_requeues_every_affected_message(mock_metrics):
+    publisher = _make_publisher()
+    state = publisher._state
+    transient = ServiceUnavailable('retry this logical batch')
+    state._client.publish.side_effect = [
+        _make_future(exc=transient),
+        _make_future(exc=transient),
+    ]
+
+    retry_messages = state._sync_flush([b'one', b'two'])
+    state._requeue(retry_messages)
+
+    assert retry_messages == [b'one', b'two']
+    assert state._queue.get_nowait() == b'one'
+    assert state._queue.get_nowait() == b'two'
+    assert (
+        mock_metrics.increment.call_args_list.count(
+            call('async_pubsub_publisher.publish.retry_queued', tags=state._metric_tags)
+        )
+        == 2
+    )
+    await publisher.stop()
+
+
 @patch('osprey.async_worker.lib.publisher.metrics')
 def test_single_attempt_success(mock_metrics):
     publisher = _make_publisher()
-    publisher._client.publish.return_value = _make_future(result='msg-id-1')
+    publisher._state._client.publish.return_value = _make_future(result='msg-id-1')
 
-    publisher._sync_flush([b'hello'])
+    publisher._state._sync_flush([b'hello'])
 
-    publisher._client.publish.assert_called_once_with(publisher._topic_path, b'hello', retry=_PUBLISH_RETRY)
-    mock_metrics.increment.assert_any_call('async_pubsub_publisher.publish.success', tags=publisher._metric_tags)
+    publisher._state._client.publish.assert_called_once_with(
+        publisher._state._topic_path,
+        b'hello',
+        retry=_PUBLISH_RETRY,
+    )
+    mock_metrics.increment.assert_any_call(
+        'async_pubsub_publisher.publish.success',
+        tags=publisher._state._metric_tags,
+    )
     failure_calls = [c for c in mock_metrics.increment.call_args_list if 'failure' in c[0][0]]
     assert failure_calls == []
 
@@ -136,9 +214,9 @@ def test_single_attempt_success(mock_metrics):
 def test_permanent_failure_metric_fires(mock_metrics):
     publisher = _make_publisher()
     exc = NotFound('topic not found')
-    publisher._client.publish.return_value = _make_future(exc=exc)
+    publisher._state._client.publish.return_value = _make_future(exc=exc)
 
-    retry_messages = publisher._sync_flush([b'data'])
+    retry_messages = publisher._state._sync_flush([b'data'])
 
     assert retry_messages == []
     failure_calls = [c for c in mock_metrics.increment.call_args_list if 'failure' in c[0][0]]
@@ -155,11 +233,11 @@ def test_retry_policy_includes_observed_timeout_errors():
 @patch('osprey.async_worker.lib.publisher.metrics')
 def test_sync_flush_requeues_exhausted_transient_retry(mock_metrics):
     publisher = _make_publisher()
-    publisher._client.publish.return_value = _make_future(
+    publisher._state._client.publish.return_value = _make_future(
         exc=RetryError('deadline exceeded', DeadlineExceeded('retry me')),
     )
 
-    retry_messages = publisher._sync_flush([b'retry'])
+    retry_messages = publisher._state._sync_flush([b'retry'])
 
     assert retry_messages == [b'retry']
 
@@ -168,13 +246,13 @@ def test_sync_flush_requeues_exhausted_transient_retry(mock_metrics):
 @patch('osprey.async_worker.lib.publisher.logger')
 def test_sync_flush_returns_only_transient_failures(mock_logger, mock_metrics):
     publisher = _make_publisher()
-    publisher._client.publish.side_effect = [
+    publisher._state._client.publish.side_effect = [
         _make_future(result='msg-id-1'),
         _make_future(exc=DeadlineExceeded('retry me')),
         _make_future(exc=NotFound('drop me')),
     ]
 
-    retry_messages = publisher._sync_flush([b'success', b'retry', b'permanent'])
+    retry_messages = publisher._state._sync_flush([b'success', b'retry', b'permanent'])
 
     assert retry_messages == [b'retry']
     mock_logger.warning.assert_called_once_with('Transient publish failure; requeuing', exc_info=True)
@@ -184,16 +262,16 @@ def test_sync_flush_returns_only_transient_failures(mock_logger, mock_metrics):
 @patch('osprey.async_worker.lib.publisher.metrics')
 async def test_flush_batch_requeues_transient_failures(mock_metrics):
     publisher = _make_publisher()
-    publisher._client.publish.side_effect = [
+    publisher._state._client.publish.side_effect = [
         _make_future(result='msg-id-1'),
         _make_future(exc=DeadlineExceeded('retry me')),
     ]
 
-    await publisher._flush_batch([b'success', b'retry'])
+    await publisher._state._flush_batch([b'success', b'retry'])
 
-    assert publisher._queue.get_nowait() == b'retry'
+    assert publisher._state._queue.get_nowait() == b'retry'
     with pytest.raises(asyncio.QueueEmpty):
-        publisher._queue.get_nowait()
+        publisher._state._queue.get_nowait()
 
 
 @pytest.mark.asyncio
@@ -208,8 +286,8 @@ async def test_flush_batch_finishes_in_flight_publish_before_cancellation(mock_m
         release.wait()
         return batch
 
-    publisher._sync_flush = sync_flush
-    flush_task = asyncio.create_task(publisher._flush_batch([b'retry']))
+    publisher._state._sync_flush = sync_flush
+    flush_task = asyncio.create_task(publisher._state._flush_batch([b'retry']))
     await asyncio.to_thread(started.wait)
 
     flush_task.cancel()
@@ -217,4 +295,4 @@ async def test_flush_batch_finishes_in_flight_publish_before_cancellation(mock_m
 
     with pytest.raises(asyncio.CancelledError):
         await flush_task
-    assert publisher._queue.get_nowait() == b'retry'
+    assert publisher._state._queue.get_nowait() == b'retry'

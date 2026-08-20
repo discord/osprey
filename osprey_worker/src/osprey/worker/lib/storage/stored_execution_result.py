@@ -19,6 +19,7 @@ from google.api_core.exceptions import from_grpc_status
 from google.cloud.bigtable import row_filters, row_set
 from google.cloud.bigtable.row import DirectRow, Row
 from google.cloud.bigtable.table import DEFAULT_RETRY, Table
+from google.cloud.bigtable_v2.types.bigtable import MutateRowsRequest
 from google.rpc import code_pb2
 from minio import Minio
 from minio.error import S3Error
@@ -50,14 +51,20 @@ def _grpc_code_name(code: int) -> str:
         return str(code)
 
 
-def _encoded_request_size(rows: Iterable[DirectRow]) -> int:
-    """Bytes these rows add to a MutateRows request: row keys plus cell mutations.
+def _encoded_request_size(rows: Iterable[DirectRow], table: Optional[Table] = None) -> int:
+    """Serialized MutateRows request bytes, optionally including the table fields.
 
     Read this BEFORE the rows are committed. `Table.mutate_rows` clears the mutations of
     every row it commits, so a row that has already been through it measures as its key
     alone — about four bytes.
     """
-    return sum(len(row.row_key) + row.get_mutations_size() for row in rows)
+    entries = [MutateRowsRequest.Entry(row_key=row.row_key, mutations=row._get_mutations()) for row in rows]
+    request = MutateRowsRequest(
+        table_name=table.name if table is not None else '',
+        app_profile_id=table._app_profile_id if table is not None else None,
+        entries=entries,
+    )
+    return MutateRowsRequest.pb(request).ByteSize()
 
 
 def _classify_row_status(row_status: Optional[Any]) -> Tuple[Optional[BaseException], Tuple[str, ...]]:
@@ -97,9 +104,8 @@ class ExecutionResultWrite:
 
     @cached_property
     def payload_size_bytes(self) -> int:
-        """Encoded Bigtable size of this write (row key plus cell mutations) — the same
-        accounting `insert_many` reports as `stored_execution_result.batch_bytes`, so
-        callers sizing batches against request limits use one measure.
+        """Encoded Bigtable request-entry size of this write, excluding the request-wide
+        table fields. Callers sizing batches against request limits can sum this measure.
 
         Cached: a batching caller asks every write for its size and `insert_many` then builds
         the row again to send it, so this keeps it at one encode per write."""
@@ -296,10 +302,16 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
     # reusing retry_policy here disables mutation retries entirely.
     #
     # Bounded well inside the tightest caller budget, because DEFAULT_RETRY's own 120s deadline
-    # outlasts every caller: the async sink abandons a write after 5s (sync counterpart 2s) and
-    # runs it in asyncio.to_thread(), which cannot cancel the thread. Longer recovery is the
-    # sinks' job, not ours.
+    # outlasts every caller: both stored-result sinks abandon a write after 5s, and the async sink
+    # runs it in asyncio.to_thread(), which cannot cancel the thread. Longer recovery is the sinks'
+    # job, not ours.
     MUTATION_RETRY_DEADLINE_SECONDS = 2.0
+    MUTATION_RPC_TIMEOUT_SECONDS = 2.0
+    # google-cloud-bigtable 2.10.0 wraps this argument in ExponentialTimeout, and
+    # google-api-core 2.19.2 floors its first remaining duration to whole seconds.
+    # Pass the 2.5s midpoint: a same-tick call floors to the intended 2s maximum,
+    # while any elapsed wrapper time can only reduce it.
+    MUTATE_ROWS_TIMEOUT_ARGUMENT_SECONDS = MUTATION_RPC_TIMEOUT_SECONDS + 0.5
     mutation_retry_policy = DEFAULT_RETRY.with_delay(initial=0.1, maximum=0.5, multiplier=2.0).with_deadline(
         MUTATION_RETRY_DEADLINE_SECONDS
     )
@@ -377,7 +389,7 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
         outcomes: List[ExecutionResultPersistOutcome] = []
         for start in range(0, len(rows), self.MAX_ROWS_PER_BULK_CALL):
             chunk = rows[start : start + self.MAX_ROWS_PER_BULK_CALL]
-            encoded_bytes = _encoded_request_size(chunk)
+            encoded_bytes = _encoded_request_size(chunk, table)
             try:
                 chunk_outcomes = self._commit_rows(table, chunk, path='bulk')
             except Exception as error:
@@ -405,7 +417,11 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
         path_tag = f'path:{path}'
         started = monotonic()
         try:
-            statuses = table.mutate_rows(rows, retry=self.mutation_retry_policy)
+            statuses = table.mutate_rows(
+                rows,
+                retry=self.mutation_retry_policy,
+                timeout=self.MUTATE_ROWS_TIMEOUT_ARGUMENT_SECONDS,
+            )
         finally:
             metrics.timing('stored_execution_result.commit_ms', (monotonic() - started) * 1000, tags=[path_tag])
 

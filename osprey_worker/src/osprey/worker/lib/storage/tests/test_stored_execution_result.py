@@ -295,6 +295,25 @@ def test_bigtable_bulk_byte_metric_is_measured_before_the_client_clears_rows(
     assert MutateRowsRequest.pb(cleared_request).ByteSize() < expected_bytes
 
 
+def test_bigtable_size_measurement_failure_does_not_cost_the_batch_its_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Byte accounting is instrumentation, so a failure to measure must not drop the rows."""
+    table = make_table(monkeypatch)
+    table.mutate_rows.return_value = [status(code_pb2.OK), status(code_pb2.OK)]
+    metrics = mock_metrics(monkeypatch)
+    monkeypatch.setattr(
+        stored_result_module, '_encoded_request_size', MagicMock(side_effect=RuntimeError('cannot measure'))
+    )
+
+    outcomes = StoredExecutionResultBigTable().insert_many([make_write(1), make_write(2)])
+
+    assert [outcome.succeeded for outcome in outcomes] == [True, True]
+    table.mutate_rows.assert_called_once()
+    # batch_rows still reports the completed call; only the byte histogram is skipped.
+    metrics.histogram.assert_called_once_with('stored_execution_result.batch_rows', 2)
+
+
 def test_bigtable_bulk_chunks_at_row_cap_and_isolates_chunk_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     table = make_table(monkeypatch)
     monkeypatch.setattr(StoredExecutionResultBigTable, 'MAX_ROWS_PER_BULK_CALL', 2)

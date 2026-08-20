@@ -389,7 +389,13 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
         outcomes: List[ExecutionResultPersistOutcome] = []
         for start in range(0, len(rows), self.MAX_ROWS_PER_BULK_CALL):
             chunk = rows[start : start + self.MAX_ROWS_PER_BULK_CALL]
-            encoded_bytes = _encoded_request_size(chunk, table)
+            # Measured before the commit, since mutate_rows clears the rows it commits — but
+            # never allowed to fail the write: this is instrumentation, not persistence.
+            try:
+                encoded_bytes: Optional[int] = _encoded_request_size(chunk, table)
+            except Exception:
+                logger.exception('Failed to measure stored-result batch size')
+                encoded_bytes = None
             try:
                 chunk_outcomes = self._commit_rows(table, chunk, path='bulk')
             except Exception as error:
@@ -401,7 +407,8 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
             # Emitted only once the call has returned, so batch_rows.count counts completed
             # bulk calls and the dashboard's calls-per-row formula excludes raised ones.
             metrics.histogram('stored_execution_result.batch_rows', len(chunk))
-            metrics.histogram('stored_execution_result.batch_bytes', encoded_bytes)
+            if encoded_bytes is not None:
+                metrics.histogram('stored_execution_result.batch_bytes', encoded_bytes)
             outcomes.extend(chunk_outcomes)
         return outcomes
 

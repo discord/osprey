@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, cast
@@ -35,6 +36,50 @@ GCS_CONCURRENCY_LIMIT = 100
 MINIO_CONCURRENCY_LIMIT = 100
 
 
+@dataclass(frozen=True)
+class ExecutionResultWrite:
+    action_id: int
+    extracted_features_json: str
+    error_traces_json: str
+    timestamp: datetime
+    action_data_json: str
+
+    @classmethod
+    def from_execution_result(cls, execution_result: ExecutionResult) -> 'ExecutionResultWrite':
+        return cls(
+            action_id=execution_result.action.action_id,
+            extracted_features_json=execution_result.extracted_features_json,
+            error_traces_json=execution_result.error_traces_json,
+            timestamp=execution_result.action.timestamp,
+            action_data_json=execution_result.action.data_json,
+        )
+
+    @property
+    def payload_size_bytes(self) -> int:
+        return sum(
+            len(value.encode('utf-8'))
+            for value in (
+                self.extracted_features_json,
+                self.error_traces_json,
+                self.timestamp.isoformat(),
+                self.action_data_json,
+            )
+        )
+
+
+@dataclass(frozen=True)
+class ExecutionResultPersistOutcome:
+    error: Optional[BaseException] = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error is None
+
+    def raise_for_error(self) -> None:
+        if self.error is not None:
+            raise self.error
+
+
 class ExecutionResultStore(ABC):
     """Abstract base class for execution result storage backends."""
 
@@ -60,6 +105,23 @@ class ExecutionResultStore(ABC):
         """Insert an execution result."""
         pass
 
+    def insert_many(self, writes: Sequence[ExecutionResultWrite]) -> List[ExecutionResultPersistOutcome]:
+        outcomes: List[ExecutionResultPersistOutcome] = []
+        for write in writes:
+            try:
+                self.insert(
+                    action_id=write.action_id,
+                    extracted_features_json=write.extracted_features_json,
+                    error_traces_json=write.error_traces_json,
+                    timestamp=write.timestamp,
+                    action_data_json=write.action_data_json,
+                )
+            except Exception as error:
+                outcomes.append(ExecutionResultPersistOutcome(error=error))
+            else:
+                outcomes.append(ExecutionResultPersistOutcome())
+        return outcomes
+
 
 class ErrorTrace(BaseModel):
     rules_source_location: str
@@ -83,12 +145,13 @@ class StoredExecutionResult(BaseModel):
         cls, execution_result: ExecutionResult, storage_backend: ExecutionResultStore
     ) -> None:
         """Persist execution result using the provided storage backend."""
+        write = ExecutionResultWrite.from_execution_result(execution_result)
         storage_backend.insert(
-            action_id=execution_result.action.action_id,
-            extracted_features_json=execution_result.extracted_features_json,
-            error_traces_json=execution_result.error_traces_json,
-            action_data_json=execution_result.action.data_json,
-            timestamp=execution_result.action.timestamp,
+            action_id=write.action_id,
+            extracted_features_json=write.extracted_features_json,
+            error_traces_json=write.error_traces_json,
+            timestamp=write.timestamp,
+            action_data_json=write.action_data_json,
         )
 
     @classmethod
@@ -553,6 +616,14 @@ class ExecutionResultStorageService:
     def persist_from_execution_result(self, execution_result: ExecutionResult) -> None:
         """Persist execution result using the configured storage backend."""
         StoredExecutionResult.persist_from_execution_result(execution_result, self._storage_backend)
+
+    def persist_many_from_execution_results(
+        self, execution_results: Sequence[ExecutionResult]
+    ) -> List[ExecutionResultPersistOutcome]:
+        return self.persist_writes([ExecutionResultWrite.from_execution_result(result) for result in execution_results])
+
+    def persist_writes(self, writes: Sequence[ExecutionResultWrite]) -> List[ExecutionResultPersistOutcome]:
+        return self._storage_backend.insert_many(writes)
 
     def get_one_with_action_data(
         self, event_record_id: int, data_censor_abilities: Sequence[Optional[DataCensorAbility[Any, Any]]] = ()

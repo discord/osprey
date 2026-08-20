@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, cast
 
 import gevent
@@ -13,7 +14,9 @@ import google.cloud.storage as storage
 import pytz
 from google.api_core import retry
 from google.cloud.bigtable import row_filters, row_set
-from google.cloud.bigtable.row import Row
+from google.cloud.bigtable.row import DirectRow, Row
+from google.cloud.bigtable.table import Table
+from google.rpc import code_pb2
 from minio import Minio
 from minio.error import S3Error
 from osprey.engine.executor.execution_context import ExecutionResult
@@ -279,6 +282,75 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
 
         return results
 
+    @staticmethod
+    def _build_row(table: Table, write: ExecutionResultWrite) -> DirectRow:
+        row = table.row(StoredExecutionResultBigTable._encode_action_id(write.action_id))
+        row.set_cell(
+            'execution_result',
+            b'extracted_features',
+            write.extracted_features_json.encode(),
+            timestamp=write.timestamp,
+        )
+        row.set_cell('execution_result', b'error_traces', write.error_traces_json.encode(), timestamp=write.timestamp)
+        row.set_cell('execution_result', b'timestamp', write.timestamp.isoformat().encode(), timestamp=write.timestamp)
+        row.set_cell('execution_result', b'action_data', write.action_data_json.encode(), timestamp=write.timestamp)
+        return row
+
+    def insert_many(self, writes: Sequence[ExecutionResultWrite]) -> List[ExecutionResultPersistOutcome]:
+        if not writes:
+            return []
+
+        try:
+            table = osprey_bigtable.table('stored_execution_result')
+            rows = [self._build_row(table, write) for write in writes]
+            encoded_bytes = sum(len(row.row_key) + row.get_mutations_size() for row in rows)
+            metrics.histogram('stored_execution_result.batch_rows', len(rows))
+            metrics.histogram('stored_execution_result.batch_bytes', encoded_bytes)
+        except Exception as error:
+            metrics.increment('stored_execution_result.row_outcome', len(writes), tags=['outcome:batch_error'])
+            return [ExecutionResultPersistOutcome(error=error) for _ in writes]
+
+        started = monotonic()
+        try:
+            statuses = table.mutate_rows(rows, retry=self.retry_policy)
+        except Exception as error:
+            metrics.timing('stored_execution_result.commit_ms', (monotonic() - started) * 1000)
+            metrics.increment('stored_execution_result.row_outcome', len(writes), tags=['outcome:batch_error'])
+            return [ExecutionResultPersistOutcome(error=error) for _ in writes]
+
+        metrics.timing('stored_execution_result.commit_ms', (monotonic() - started) * 1000)
+        if len(statuses) != len(writes):
+            status_count_error = RuntimeError(f'Bigtable returned {len(statuses)} statuses for {len(writes)} rows')
+            metrics.increment('stored_execution_result.row_outcome', len(rows), tags=['outcome:status_count_error'])
+            return [ExecutionResultPersistOutcome(error=status_count_error) for _ in writes]
+
+        outcomes: List[ExecutionResultPersistOutcome] = []
+        for row_status in statuses:
+            if row_status is None:
+                metrics.increment('stored_execution_result.row_outcome', tags=['outcome:row_error', 'code:missing'])
+                outcomes.append(
+                    ExecutionResultPersistOutcome(
+                        error=RuntimeError('Bigtable stored-result mutation ended without a row status')
+                    )
+                )
+            elif row_status.code == code_pb2.OK:
+                metrics.increment('stored_execution_result.row_outcome', tags=['outcome:success'])
+                outcomes.append(ExecutionResultPersistOutcome())
+            else:
+                metrics.increment(
+                    'stored_execution_result.row_outcome',
+                    tags=['outcome:row_error', f'code:{row_status.code}'],
+                )
+                outcomes.append(
+                    ExecutionResultPersistOutcome(
+                        error=RuntimeError(
+                            f'Bigtable stored-result mutation failed: code={row_status.code} '
+                            f'message={row_status.message}'
+                        )
+                    )
+                )
+        return outcomes
+
     def insert(
         self,
         action_id: int,
@@ -287,14 +359,18 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
         timestamp: datetime,
         action_data_json: str,
     ) -> None:
-        row = osprey_bigtable.table('stored_execution_result').row(
-            StoredExecutionResultBigTable._encode_action_id(action_id)
-        )
-        row.set_cell('execution_result', b'extracted_features', extracted_features_json.encode(), timestamp=timestamp)
-        row.set_cell('execution_result', b'error_traces', error_traces_json.encode(), timestamp=timestamp)
-        row.set_cell('execution_result', b'timestamp', timestamp.isoformat().encode(), timestamp=timestamp)
-        row.set_cell('execution_result', b'action_data', action_data_json.encode(), timestamp=timestamp)
-        osprey_bigtable.table('stored_execution_result').mutate_rows([row], retry=self.retry_policy)
+        outcome = self.insert_many(
+            [
+                ExecutionResultWrite(
+                    action_id=action_id,
+                    extracted_features_json=extracted_features_json,
+                    error_traces_json=error_traces_json,
+                    timestamp=timestamp,
+                    action_data_json=action_data_json,
+                )
+            ]
+        )[0]
+        outcome.raise_for_error()
 
     @staticmethod
     def _encode_action_id(action_id_snowflake: int) -> bytes:

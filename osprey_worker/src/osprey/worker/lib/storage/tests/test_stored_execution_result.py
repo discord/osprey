@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, call
 import pytest
 from google.api_core.exceptions import ServiceUnavailable
 from google.cloud.bigtable.row import DirectRow
-from google.cloud.bigtable.table import _MAX_BULK_MUTATIONS
+from google.cloud.bigtable.table import _MAX_BULK_MUTATIONS, DEFAULT_RETRY, _BigtableRetryableError
 from google.rpc import code_pb2
 from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.worker.lib.storage import stored_execution_result as stored_result_module
@@ -156,6 +156,17 @@ def test_write_payload_size_matches_bulk_accounting_and_encodes_once(monkeypatch
     build_row.assert_called_once_with(write)
 
 
+def test_mutation_retry_matches_bigtable_errors_and_is_bounded() -> None:
+    """`mutate_rows` only signals retryable work via `_BigtableRetryableError`, and the sinks
+    abandon a write after 2s (sync) / 5s (async) without being able to cancel its thread — so the
+    in-call retry must match that error and stay well inside that budget."""
+    policy = StoredExecutionResultBigTable.mutation_retry_policy
+
+    assert policy._predicate(_BigtableRetryableError())
+    assert policy._deadline == StoredExecutionResultBigTable.MUTATION_RETRY_DEADLINE_SECONDS <= 2.0
+    assert policy._deadline < DEFAULT_RETRY._deadline
+
+
 def test_bulk_row_cap_keeps_requests_under_the_client_mutation_limit() -> None:
     """Fails if a fifth cell is added to the row format without lowering the row cap."""
     mutations_per_row = len(StoredExecutionResultBigTable._build_row(make_write(1))._get_mutations())
@@ -206,7 +217,7 @@ def test_bigtable_bulk_sends_one_request_and_aligns_partial_statuses(monkeypatch
     outcomes = StoredExecutionResultBigTable().insert_many([make_write(i) for i in (1, 2, 3)])
 
     table.mutate_rows.assert_called_once()
-    assert table.mutate_rows.call_args.kwargs == {'retry': StoredExecutionResultBigTable.retry_policy}
+    assert table.mutate_rows.call_args.kwargs == {'retry': StoredExecutionResultBigTable.mutation_retry_policy}
     assert len(sent_rows(table)) == 3
     assert [outcome.succeeded for outcome in outcomes] == [True, False, True]
     with pytest.raises(ServiceUnavailable, match='retry exhausted'):

@@ -18,7 +18,7 @@ from google.api_core import retry
 from google.api_core.exceptions import from_grpc_status
 from google.cloud.bigtable import row_filters, row_set
 from google.cloud.bigtable.row import DirectRow, Row
-from google.cloud.bigtable.table import Table
+from google.cloud.bigtable.table import DEFAULT_RETRY, Table
 from google.rpc import code_pb2
 from minio import Minio
 from minio.error import S3Error
@@ -291,6 +291,18 @@ class StoredExecutionResult(BaseModel):
 # TODO: Add tests
 class StoredExecutionResultBigTable(ExecutionResultStore):
     retry_policy = retry.Retry(initial=1.0, maximum=2.0, multiplier=1.25, deadline=120.0)
+    # mutate_rows signals retryable work only by raising _BigtableRetryableError, which
+    # DEFAULT_RETRY's predicate matches and retry_policy's transient-error predicate never does —
+    # reusing retry_policy here disables mutation retries entirely.
+    #
+    # Bounded well inside the tightest caller budget, because DEFAULT_RETRY's own 120s deadline
+    # outlasts every caller: the async sink abandons a write after 5s (sync counterpart 2s) and
+    # runs it in asyncio.to_thread(), which cannot cancel the thread. Longer recovery is the
+    # sinks' job, not ours.
+    MUTATION_RETRY_DEADLINE_SECONDS = 2.0
+    mutation_retry_policy = DEFAULT_RETRY.with_delay(initial=0.1, maximum=0.5, multiplier=2.0).with_deadline(
+        MUTATION_RETRY_DEADLINE_SECONDS
+    )
     # Bigtable rejects MutateRows requests above 100,000 mutations (google-cloud-bigtable
     # raises TooManyMutationsError client-side, which is not transient and would fail the
     # same batch on every retry); each write is four SetCell mutations.
@@ -393,7 +405,7 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
         path_tag = f'path:{path}'
         started = monotonic()
         try:
-            statuses = table.mutate_rows(rows, retry=self.retry_policy)
+            statuses = table.mutate_rows(rows, retry=self.mutation_retry_policy)
         finally:
             metrics.timing('stored_execution_result.commit_ms', (monotonic() - started) * 1000, tags=[path_tag])
 

@@ -156,6 +156,8 @@ class _PublisherState:
             )
 
     async def _flush_loop(self) -> None:
+        # Python 3.11 wait_for can consume cancellation after queue.get() completes;
+        # the stop flag prevents that interleaving from starting another wait.
         while not self._stopped:
             try:
                 try:

@@ -150,6 +150,57 @@ async def test_immediate_publish_then_stop_drains_message_exactly_once(mock_metr
 
 @pytest.mark.asyncio
 @patch('osprey.async_worker.lib.publisher.metrics')
+async def test_completed_queue_wait_during_cancellation_does_not_repoll_after_stop(
+    mock_metrics,
+    monkeypatch,
+):
+    client = MagicMock()
+    pool = AsyncPubSubPublisherPool(client_factory=lambda _settings: client)
+    publisher = pool.acquire('proj', 'topic')
+    state = publisher._state
+    original_get = state._queue.get
+    first_wait_started = asyncio.Event()
+    second_wait_started = asyncio.Event()
+    get_count = 0
+
+    async def observed_get() -> bytes:
+        nonlocal get_count
+        get_count += 1
+        if get_count == 1:
+            first_wait_started.set()
+        else:
+            second_wait_started.set()
+        return await original_get()
+
+    monkeypatch.setattr(state._queue, 'get', observed_get)
+    state._ensure_started()
+    await first_wait_started.wait()
+
+    state._queue.put_nowait(b'interleaved')
+    drain_task = state.begin_stop()
+    repoll_task = asyncio.create_task(second_wait_started.wait())
+    stopped_before_repoll = False
+    try:
+        done, _ = await asyncio.wait(
+            {drain_task, repoll_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        stopped_before_repoll = drain_task in done
+    finally:
+        if not drain_task.done():
+            assert state._flush_task is not None
+            state._flush_task.cancel()
+        await asyncio.gather(drain_task, return_exceptions=True)
+        repoll_task.cancel()
+        await asyncio.gather(repoll_task, return_exceptions=True)
+        await publisher.stop()
+        await pool.stop()
+
+    assert stopped_before_repoll
+
+
+@pytest.mark.asyncio
+@patch('osprey.async_worker.lib.publisher.metrics')
 async def test_pool_waits_for_detached_blocked_drain_before_client_stop(mock_metrics):
     client = MagicMock()
     pool = AsyncPubSubPublisherPool(client_factory=lambda _settings: client)

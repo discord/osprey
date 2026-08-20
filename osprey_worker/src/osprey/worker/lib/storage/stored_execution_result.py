@@ -40,6 +40,14 @@ GCS_CONCURRENCY_LIMIT = 100
 MINIO_CONCURRENCY_LIMIT = 100
 
 
+def _grpc_code_name(code: int) -> str:
+    """Symbolic gRPC status name for metric tags (e.g. UNAVAILABLE instead of 14)."""
+    try:
+        return code_pb2.Code.Name(code)
+    except ValueError:
+        return str(code)
+
+
 @dataclass(frozen=True)
 class ExecutionResultWrite:
     action_id: int
@@ -60,17 +68,11 @@ class ExecutionResultWrite:
 
     @property
     def payload_size_bytes(self) -> int:
-        """UTF-8 size of the four cell values only — excludes the row key and encoding
-        overhead, so callers sizing batches against request limits must leave margin."""
-        return sum(
-            len(value.encode('utf-8'))
-            for value in (
-                self.extracted_features_json,
-                self.error_traces_json,
-                self.timestamp.isoformat(),
-                self.action_data_json,
-            )
-        )
+        """Encoded Bigtable size of this write (row key plus cell mutations) — the same
+        accounting `insert_many` reports as `stored_execution_result.batch_bytes`, so
+        callers sizing batches against request limits use one measure."""
+        row = StoredExecutionResultBigTable._build_row(self)
+        return len(row.row_key) + row.get_mutations_size()
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,10 @@ class ExecutionResultStore(ABC):
 
         An outcome only reflects whether insert() raised: backends that catch and log write
         errors internally (GCS, MinIO, Postgres) always report success here.
+
+        Subclasses that override this must NOT implement insert() by delegating to their
+        insert_many(): this fallback calls insert(), so that cycle recurses infinitely the
+        moment the insert_many() override is removed.
         """
         outcomes: List[ExecutionResultPersistOutcome] = []
         for write in writes:
@@ -259,6 +265,10 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
     # DEFAULT_RETRY's predicate matches and retry_policy's transient-error predicate never does —
     # reusing retry_policy there would disable mutation retries entirely.
     mutation_retry_policy = DEFAULT_RETRY.with_delay(initial=1.0, maximum=2.0, multiplier=1.25)
+    # Bigtable rejects MutateRows requests above 100,000 mutations (google-cloud-bigtable
+    # raises TooManyMutationsError client-side, which is not transient and would fail the
+    # same batch on every retry); each write is four SetCell mutations.
+    MAX_ROWS_PER_BULK_CALL = 25_000
 
     def select_one(self, action_id: int) -> Optional[Dict[str, Any]]:
         row = osprey_bigtable.table('stored_execution_result').read_row(
@@ -294,8 +304,8 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
         return results
 
     @staticmethod
-    def _build_row(table: Table, write: ExecutionResultWrite) -> DirectRow:
-        row = table.row(StoredExecutionResultBigTable._encode_action_id(write.action_id))
+    def _build_row(write: ExecutionResultWrite, table: Optional[Table] = None) -> DirectRow:
+        row = DirectRow(StoredExecutionResultBigTable._encode_action_id(write.action_id), table)
         row.set_cell(
             'execution_result',
             b'extracted_features',
@@ -308,35 +318,57 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
         return row
 
     def insert_many(self, writes: Sequence[ExecutionResultWrite]) -> List[ExecutionResultPersistOutcome]:
-        """Sends all writes as one MutateRows call; callers must keep batches under Bigtable's
-        100,000-mutation request limit (25,000 writes at four cells each)."""
+        """Sends the writes in MutateRows calls of at most MAX_ROWS_PER_BULK_CALL rows each.
+
+        Chunking bounds the mutation count, not the request size: Bigtable also caps the
+        encoded request, so callers batching large values should size batches with
+        ExecutionResultWrite.payload_size_bytes. A call-wide exception or status-count
+        mismatch maps to every row of its chunk; aligned partial statuses stay independent.
+        """
         if not writes:
             return []
 
         try:
             table = osprey_bigtable.table('stored_execution_result')
-            rows = [self._build_row(table, write) for write in writes]
+            rows = [self._build_row(write, table) for write in writes]
         except Exception as error:
             metrics.increment('stored_execution_result.row_outcome', len(writes), tags=['outcome:batch_error'])
             return [ExecutionResultPersistOutcome(error=error) for _ in writes]
 
-        encoded_bytes = sum(len(row.row_key) + row.get_mutations_size() for row in rows)
-        metrics.histogram('stored_execution_result.batch_rows', len(rows))
-        metrics.histogram('stored_execution_result.batch_bytes', encoded_bytes)
+        outcomes: List[ExecutionResultPersistOutcome] = []
+        for start in range(0, len(rows), self.MAX_ROWS_PER_BULK_CALL):
+            chunk = rows[start : start + self.MAX_ROWS_PER_BULK_CALL]
+            try:
+                outcomes.extend(self._commit_rows(table, chunk, emit_batch_metrics=True))
+            except Exception as error:
+                metrics.increment('stored_execution_result.row_outcome', len(chunk), tags=['outcome:batch_error'])
+                outcomes.extend(ExecutionResultPersistOutcome(error=error) for _ in chunk)
+        return outcomes
 
+    def _commit_rows(
+        self, table: Table, rows: Sequence[DirectRow], *, emit_batch_metrics: bool
+    ) -> List[ExecutionResultPersistOutcome]:
+        """Issues one MutateRows call and returns outcomes aligned to `rows`.
+
+        Call-wide exceptions propagate to the caller; returned row statuses become
+        order-aligned outcomes and per-row metrics.
+        """
         started = monotonic()
         try:
             statuses = table.mutate_rows(rows, retry=self.mutation_retry_policy)
-        except Exception as error:
+        finally:
             metrics.timing('stored_execution_result.commit_ms', (monotonic() - started) * 1000)
-            metrics.increment('stored_execution_result.row_outcome', len(writes), tags=['outcome:batch_error'])
-            return [ExecutionResultPersistOutcome(error=error) for _ in writes]
+        if emit_batch_metrics:
+            # Emitted after the call returns, so batch_rows.count counts completed
+            # MutateRows calls and the dashboard calls/row formula excludes raised calls.
+            encoded_bytes = sum(len(row.row_key) + row.get_mutations_size() for row in rows)
+            metrics.histogram('stored_execution_result.batch_rows', len(rows))
+            metrics.histogram('stored_execution_result.batch_bytes', encoded_bytes)
 
-        metrics.timing('stored_execution_result.commit_ms', (monotonic() - started) * 1000)
-        if len(statuses) != len(writes):
-            status_count_error = RuntimeError(f'Bigtable returned {len(statuses)} statuses for {len(writes)} rows')
+        if len(statuses) != len(rows):
+            status_count_error = RuntimeError(f'Bigtable returned {len(statuses)} statuses for {len(rows)} rows')
             metrics.increment('stored_execution_result.row_outcome', len(rows), tags=['outcome:status_count_error'])
-            return [ExecutionResultPersistOutcome(error=status_count_error) for _ in writes]
+            return [ExecutionResultPersistOutcome(error=status_count_error) for _ in rows]
 
         outcomes: List[ExecutionResultPersistOutcome] = []
         success_count = 0
@@ -354,7 +386,7 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
             else:
                 metrics.increment(
                     'stored_execution_result.row_outcome',
-                    tags=['outcome:row_error', f'code:{row_status.code}'],
+                    tags=['outcome:row_error', f'code:{_grpc_code_name(row_status.code)}'],
                 )
                 outcomes.append(
                     ExecutionResultPersistOutcome(error=from_grpc_status(row_status.code, row_status.message))
@@ -371,18 +403,23 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
         timestamp: datetime,
         action_data_json: str,
     ) -> None:
-        outcome = self.insert_many(
-            [
-                ExecutionResultWrite(
-                    action_id=action_id,
-                    extracted_features_json=extracted_features_json,
-                    error_traces_json=error_traces_json,
-                    timestamp=timestamp,
-                    action_data_json=action_data_json,
-                )
-            ]
-        )[0]
-        outcome.raise_for_error()
+        # Deliberately not implemented via insert_many(): the base-class insert_many()
+        # fallback calls insert(), so routing insert() through insert_many() would recurse
+        # infinitely if the insert_many() override were ever removed as a rollback.
+        write = ExecutionResultWrite(
+            action_id=action_id,
+            extracted_features_json=extracted_features_json,
+            error_traces_json=error_traces_json,
+            timestamp=timestamp,
+            action_data_json=action_data_json,
+        )
+        table = osprey_bigtable.table('stored_execution_result')
+        # Preserves the pre-bulk single-row contract: call-wide Bigtable exceptions
+        # propagate into the sinks' existing retry path, while a failed returned row
+        # status is counted in row_outcome but not raised. Raising here is deferred
+        # until outcome:row_error volume has been measured in production, because each
+        # raised row failure becomes three sink write attempts plus a Sentry event.
+        self._commit_rows(table, [self._build_row(write, table)], emit_batch_metrics=False)
 
     @staticmethod
     def _encode_action_id(action_id_snowflake: int) -> bytes:

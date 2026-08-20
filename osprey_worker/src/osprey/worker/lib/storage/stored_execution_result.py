@@ -13,9 +13,10 @@ import gevent
 import google.cloud.storage as storage
 import pytz
 from google.api_core import retry
+from google.api_core.exceptions import from_grpc_status
 from google.cloud.bigtable import row_filters, row_set
 from google.cloud.bigtable.row import DirectRow, Row
-from google.cloud.bigtable.table import Table
+from google.cloud.bigtable.table import DEFAULT_RETRY, Table
 from google.rpc import code_pb2
 from minio import Minio
 from minio.error import S3Error
@@ -59,6 +60,8 @@ class ExecutionResultWrite:
 
     @property
     def payload_size_bytes(self) -> int:
+        """UTF-8 size of the four cell values only — excludes the row key and encoding
+        overhead, so callers sizing batches against request limits must leave margin."""
         return sum(
             len(value.encode('utf-8'))
             for value in (
@@ -109,6 +112,11 @@ class ExecutionResultStore(ABC):
         pass
 
     def insert_many(self, writes: Sequence[ExecutionResultWrite]) -> List[ExecutionResultPersistOutcome]:
+        """One outcome per write, aligned to input order.
+
+        An outcome only reflects whether insert() raised: backends that catch and log write
+        errors internally (GCS, MinIO, Postgres) always report success here.
+        """
         outcomes: List[ExecutionResultPersistOutcome] = []
         for write in writes:
             try:
@@ -148,13 +156,12 @@ class StoredExecutionResult(BaseModel):
         cls, execution_result: ExecutionResult, storage_backend: ExecutionResultStore
     ) -> None:
         """Persist execution result using the provided storage backend."""
-        write = ExecutionResultWrite.from_execution_result(execution_result)
         storage_backend.insert(
-            action_id=write.action_id,
-            extracted_features_json=write.extracted_features_json,
-            error_traces_json=write.error_traces_json,
-            timestamp=write.timestamp,
-            action_data_json=write.action_data_json,
+            action_id=execution_result.action.action_id,
+            extracted_features_json=execution_result.extracted_features_json,
+            error_traces_json=execution_result.error_traces_json,
+            action_data_json=execution_result.action.data_json,
+            timestamp=execution_result.action.timestamp,
         )
 
     @classmethod
@@ -248,6 +255,10 @@ class StoredExecutionResult(BaseModel):
 # TODO: Add tests
 class StoredExecutionResultBigTable(ExecutionResultStore):
     retry_policy = retry.Retry(initial=1.0, maximum=2.0, multiplier=1.25, deadline=120.0)
+    # Table.mutate_rows signals retryable work only by raising _BigtableRetryableError, which
+    # DEFAULT_RETRY's predicate matches and retry_policy's transient-error predicate never does —
+    # reusing retry_policy there would disable mutation retries entirely.
+    mutation_retry_policy = DEFAULT_RETRY.with_delay(initial=1.0, maximum=2.0, multiplier=1.25)
 
     def select_one(self, action_id: int) -> Optional[Dict[str, Any]]:
         row = osprey_bigtable.table('stored_execution_result').read_row(
@@ -297,22 +308,25 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
         return row
 
     def insert_many(self, writes: Sequence[ExecutionResultWrite]) -> List[ExecutionResultPersistOutcome]:
+        """Sends all writes as one MutateRows call; callers must keep batches under Bigtable's
+        100,000-mutation request limit (25,000 writes at four cells each)."""
         if not writes:
             return []
 
         try:
             table = osprey_bigtable.table('stored_execution_result')
             rows = [self._build_row(table, write) for write in writes]
-            encoded_bytes = sum(len(row.row_key) + row.get_mutations_size() for row in rows)
-            metrics.histogram('stored_execution_result.batch_rows', len(rows))
-            metrics.histogram('stored_execution_result.batch_bytes', encoded_bytes)
         except Exception as error:
             metrics.increment('stored_execution_result.row_outcome', len(writes), tags=['outcome:batch_error'])
             return [ExecutionResultPersistOutcome(error=error) for _ in writes]
 
+        encoded_bytes = sum(len(row.row_key) + row.get_mutations_size() for row in rows)
+        metrics.histogram('stored_execution_result.batch_rows', len(rows))
+        metrics.histogram('stored_execution_result.batch_bytes', encoded_bytes)
+
         started = monotonic()
         try:
-            statuses = table.mutate_rows(rows, retry=self.retry_policy)
+            statuses = table.mutate_rows(rows, retry=self.mutation_retry_policy)
         except Exception as error:
             metrics.timing('stored_execution_result.commit_ms', (monotonic() - started) * 1000)
             metrics.increment('stored_execution_result.row_outcome', len(writes), tags=['outcome:batch_error'])
@@ -325,6 +339,7 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
             return [ExecutionResultPersistOutcome(error=status_count_error) for _ in writes]
 
         outcomes: List[ExecutionResultPersistOutcome] = []
+        success_count = 0
         for row_status in statuses:
             if row_status is None:
                 metrics.increment('stored_execution_result.row_outcome', tags=['outcome:row_error', 'code:missing'])
@@ -334,7 +349,7 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
                     )
                 )
             elif row_status.code == code_pb2.OK:
-                metrics.increment('stored_execution_result.row_outcome', tags=['outcome:success'])
+                success_count += 1
                 outcomes.append(ExecutionResultPersistOutcome())
             else:
                 metrics.increment(
@@ -342,13 +357,10 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
                     tags=['outcome:row_error', f'code:{row_status.code}'],
                 )
                 outcomes.append(
-                    ExecutionResultPersistOutcome(
-                        error=RuntimeError(
-                            f'Bigtable stored-result mutation failed: code={row_status.code} '
-                            f'message={row_status.message}'
-                        )
-                    )
+                    ExecutionResultPersistOutcome(error=from_grpc_status(row_status.code, row_status.message))
                 )
+        if success_count:
+            metrics.increment('stored_execution_result.row_outcome', success_count, tags=['outcome:success'])
         return outcomes
 
     def insert(
@@ -692,11 +704,6 @@ class ExecutionResultStorageService:
     def persist_from_execution_result(self, execution_result: ExecutionResult) -> None:
         """Persist execution result using the configured storage backend."""
         StoredExecutionResult.persist_from_execution_result(execution_result, self._storage_backend)
-
-    def persist_many_from_execution_results(
-        self, execution_results: Sequence[ExecutionResult]
-    ) -> List[ExecutionResultPersistOutcome]:
-        return self.persist_writes([ExecutionResultWrite.from_execution_result(result) for result in execution_results])
 
     def persist_writes(self, writes: Sequence[ExecutionResultWrite]) -> List[ExecutionResultPersistOutcome]:
         return self._storage_backend.insert_many(writes)

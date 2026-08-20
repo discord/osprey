@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, call
 
 import pytest
+from google.api_core.exceptions import ServiceUnavailable
 from google.rpc import code_pb2
 from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.worker.lib.storage import stored_execution_result as stored_result_module
@@ -75,16 +76,6 @@ def test_service_persist_writes_preserves_input_order() -> None:
     assert all(outcome.succeeded for outcome in outcomes)
 
 
-def test_service_execution_result_convenience_method_delegates_to_writes() -> None:
-    store = RecordingStore()
-    service = ExecutionResultStorageService(store)
-
-    outcomes = service.persist_many_from_execution_results([make_result(2)])
-
-    assert store.inserted == [2]
-    assert outcomes[0].succeeded is False
-
-
 def test_write_from_execution_result_preserves_serialized_fields() -> None:
     write = ExecutionResultWrite.from_execution_result(make_result(1))
 
@@ -111,6 +102,12 @@ def test_write_payload_size_counts_non_ascii_utf8_bytes() -> None:
 
 def status(code: int, message: str = '') -> MagicMock:
     return MagicMock(code=code, message=message)
+
+
+def test_mutation_retry_policy_retries_bigtable_retryable_errors() -> None:
+    from google.cloud.bigtable.table import _BigtableRetryableError
+
+    assert StoredExecutionResultBigTable.mutation_retry_policy._predicate(_BigtableRetryableError())
 
 
 def test_bigtable_single_and_bulk_use_identical_row_builder(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -177,9 +174,9 @@ def test_bigtable_bulk_sends_one_request_and_aligns_partial_statuses(monkeypatch
         [ExecutionResultWrite.from_execution_result(make_result(i)) for i in (1, 2, 3)]
     )
 
-    table.mutate_rows.assert_called_once_with(rows, retry=StoredExecutionResultBigTable.retry_policy)
+    table.mutate_rows.assert_called_once_with(rows, retry=StoredExecutionResultBigTable.mutation_retry_policy)
     assert [outcome.succeeded for outcome in outcomes] == [True, False, True]
-    with pytest.raises(RuntimeError, match='code=14.*retry exhausted'):
+    with pytest.raises(ServiceUnavailable, match='retry exhausted'):
         outcomes[1].raise_for_error()
 
 
@@ -262,7 +259,7 @@ def test_bigtable_metrics_table_reuse_missing_status_and_idempotency(
         'stored_execution_result.batch_bytes',
         sum(len(row.row_key) + row.get_mutations_size() for row in rows),
     )
-    mock_metrics.increment.assert_any_call('stored_execution_result.row_outcome', tags=['outcome:success'])
+    mock_metrics.increment.assert_any_call('stored_execution_result.row_outcome', 1, tags=['outcome:success'])
     mock_metrics.increment.assert_any_call(
         'stored_execution_result.row_outcome', tags=['outcome:row_error', 'code:missing']
     )

@@ -14,16 +14,20 @@ Covered here:
   * recovery-after-empty-full-sync — an empty FullSyncRecursive wipes the set (no
     guard), and the SAME continuous generator repopulates it via incremental upserts;
   * stop() teardown — stop() cancels the watch task (and the ring's);
+  * initialization single-flight — a cancelled waiter must not abort or bypass the
+    shared initial sync, and a failed sync must stay retryable;
   * the same fix applied to _AsyncHashRing (SCALAR routing).
 """
 
 import asyncio
 import json
 import queue
+import threading
 from types import SimpleNamespace
 
 import pytest
 from osprey.async_worker.lib.discovery.async_directory import AsyncServiceWatcher, _AsyncHashRing
+from osprey.async_worker.lib.pigeon.client import RoutedClient
 from osprey.worker.lib.discovery.exceptions import ServiceUnavailable
 from osprey.worker.lib.discovery.service import Service
 from osprey.worker.lib.etcd import (
@@ -73,6 +77,21 @@ class FakeWatcher:
             if item is _UNBLOCK:
                 return
             yield item
+
+
+class GatedBeginWatcher(FakeWatcher):
+    """Blocks the initial etcd read until the test sets ``release_begin``."""
+
+    def __init__(self, initial_event):
+        super().__init__(initial_event)
+        self.begin_started = threading.Event()
+        self.release_begin = threading.Event()
+
+    def begin_watching(self):
+        self.begin_started.set()
+        if not self.release_begin.wait(timeout=2):
+            raise TimeoutError('test did not release begin_watching')
+        return super().begin_watching()
 
 
 class FakeEtcdClient:
@@ -148,6 +167,65 @@ async def _teardown_service(watcher: AsyncServiceWatcher, client: FakeEtcdClient
 
 
 # --- AsyncServiceWatcher -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_service_initialization_is_shared_when_a_waiter_is_cancelled():
+    """Cancelling one waiter must not abort or bypass the shared initial sync."""
+    svc = _svc('a', 1)
+    gated = GatedBeginWatcher(initial_event=_full_sync([svc]))
+    client = FakeEtcdClient(recursive_watchers=[gated], scalar_watchers=[FakeWatcher(_ring_full_sync([svc.id]))])
+    asw = AsyncServiceWatcher(client, '/discovery', 'smite_shortlist')
+    # RoutedClient.__init__ needs etcd/grpc; only its watcher-readiness flag is under test.
+    routed_client = object.__new__(RoutedClient)
+    routed_client._service_name = 'smite_shortlist'
+    routed_client._service_watcher = asw
+    routed_client._service_watcher_initialized = False
+
+    first = asyncio.create_task(routed_client._ensure_watcher_initialized())
+    assert await _wait_until(gated.begin_started.is_set)
+    second = asyncio.create_task(routed_client._ensure_watcher_initialized())
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    stop = asyncio.create_task(asw.stop())
+    await asyncio.sleep(0)
+
+    try:
+        assert not second.done(), 'later waiter skipped discovery still in progress'
+        assert not stop.done(), 'stop returned while discovery was still in progress'
+        gated.release_begin.set()
+        await asyncio.wait_for(asyncio.gather(second, stop), timeout=2)
+        assert gated.begin_count == 1
+        assert set(asw._instances) == {svc.id}
+        assert asw._initialized and routed_client._service_watcher_initialized
+    finally:
+        gated.release_begin.set()
+        await asyncio.gather(second, stop, return_exceptions=True)
+        await _teardown_service(asw, client)
+
+
+@pytest.mark.asyncio
+async def test_failed_service_initialization_can_retry():
+    """A failed initial sync must not pin the shared task; the next call retries."""
+    svc = _svc('a', 1)
+    client = FakeEtcdClient(
+        recursive_watchers=[FakeWatcher(_full_sync([svc])), FakeWatcher(_full_sync([svc]))],
+        scalar_watchers=[
+            FakeWatcher(FullSyncOne(key='/ring', value='invalid')),
+            FakeWatcher(_ring_full_sync([svc.id])),
+        ],
+    )
+    asw = AsyncServiceWatcher(client, '/discovery', 'smite_shortlist')
+
+    with pytest.raises(json.JSONDecodeError):
+        await asw.ensure_initialized()
+    try:
+        await asw.ensure_initialized()
+        assert set(asw._instances) == {svc.id}
+    finally:
+        await _teardown_service(asw, client)
 
 
 @pytest.mark.asyncio

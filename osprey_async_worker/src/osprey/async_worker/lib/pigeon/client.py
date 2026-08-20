@@ -161,18 +161,15 @@ class RoutedClient(Generic[T]):
         Safe to call multiple times — only initializes once.
         """
         if hasattr(self, '_service_watcher_initialized') and not self._service_watcher_initialized:
-            # Set flag before awaiting to prevent concurrent coroutines from
-            # double-initializing. Reset on failure so the next call retries.
-            self._service_watcher_initialized = True
             try:
                 await self._service_watcher.ensure_initialized()
+                self._service_watcher_initialized = True
                 logger.info(
                     'async service watcher initialized for %s: %d instances',
                     self._service_name,
                     len(self._service_watcher._instances),
                 )
             except Exception:
-                self._service_watcher_initialized = False
                 logger.exception('failed to initialize async service watcher for %s', self._service_name)
                 raise
 

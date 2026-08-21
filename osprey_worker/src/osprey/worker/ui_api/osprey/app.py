@@ -36,8 +36,14 @@ def _handle_exception(e: HTTPException) -> Response:
 
 
 def _register_with_prefix(app, blueprint):
+    # Every view is served both bare and under /api. Flask <2.1 tolerated registering the
+    # same blueprint object twice under one name; 2.1+ raises ValueError and demands an
+    # explicit `name=`. Keep the BARE registration unnamed so its endpoints keep their
+    # original names -- that is what `url_for()` resolves against, and in Flask 1.x the
+    # first registration already won the url_for build. The /api copy gets a suffixed name
+    # purely to satisfy the uniqueness check; both URL paths keep routing as before.
     app.register_blueprint(blueprint)
-    app.register_blueprint(blueprint, url_prefix='/api')
+    app.register_blueprint(blueprint, url_prefix='/api', name=f'{blueprint.name}-api')
 
 
 def health() -> Union[str, Tuple[str, int]]:

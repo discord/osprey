@@ -203,32 +203,38 @@ class AsyncServiceWatcher:
         self._ring = _AsyncHashRing(etcd_client, f'{base_key}/{service_name}/ring')
         self._listeners: List[ListenerFn] = []
         self._initialized = False
+        self._initialization_task: Optional[asyncio.Task[None]] = None
         self._watch_task: Optional[asyncio.Task[None]] = None
 
     async def ensure_initialized(self) -> None:
         if self._initialized:
             return
-        # Set early to prevent concurrent coroutines from double-initializing.
+        # Coalesce concurrent callers behind one shielded task: a caller cancelled
+        # mid-await must neither abort the initial sync nor proceed without it. A task
+        # that is already done here must have failed, since _initialize() sets the
+        # flag last, so it is safe to discard and retry.
+        task = self._initialization_task
+        if task is None or task.done():
+            task = self._initialization_task = asyncio.create_task(self._initialize())
+        await asyncio.shield(task)
+
+    async def _initialize(self) -> None:
+        loop = asyncio.get_running_loop()
+        watcher = await loop.run_in_executor(None, self._etcd_client.get_watcher, self._key, True)
+        event = await loop.run_in_executor(None, watcher.begin_watching)
+        self._handle_full_sync(event, delay_visibility=False)
+        logger.info(
+            'async watcher %s: %d instances loaded: %s',
+            self._service_name,
+            len(self._instances),
+            list(self._instances.keys()),
+        )
+        await self._ring.ensure_initialized()
+        # Events are applied on the loop thread, keeping instance mutation
+        # single-threaded and consistent with select(), and keeping any
+        # DOWN-listener create_task on a running loop.
+        self._watch_task = asyncio.create_task(self._watch_loop(watcher))
         self._initialized = True
-        try:
-            loop = asyncio.get_running_loop()
-            watcher = await loop.run_in_executor(None, self._etcd_client.get_watcher, self._key, True)
-            event = await loop.run_in_executor(None, watcher.begin_watching)
-            self._handle_full_sync(event, delay_visibility=False)
-            logger.info(
-                'async watcher %s: %d instances loaded: %s',
-                self._service_name,
-                len(self._instances),
-                list(self._instances.keys()),
-            )
-            await self._ring.ensure_initialized()
-            # Events are applied on the loop thread, keeping instance mutation
-            # single-threaded and consistent with select(), and keeping any
-            # DOWN-listener create_task on a running loop.
-            self._watch_task = asyncio.create_task(self._watch_loop(watcher))
-        except Exception:
-            self._initialized = False
-            raise
 
     def select(
         self,
@@ -356,6 +362,10 @@ class AsyncServiceWatcher:
             pass
 
     async def stop(self) -> None:
+        if self._initialization_task:
+            # An in-flight initial sync may still install a watch task, so let it
+            # settle before teardown. asyncio.wait() neither cancels nor re-raises.
+            await asyncio.wait([self._initialization_task])
         if self._watch_task:
             self._watch_task.cancel()
             try:

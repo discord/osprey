@@ -48,10 +48,8 @@ class ToolParameter:
 def build_input_schema(parameters: Sequence[ToolParameter], *, strict: bool = False) -> Dict[str, Any]:
     """Compile a list of :class:`ToolParameter` into a JSON Schema object.
 
-    Anthropic's ``strict: true`` tool mode requires ``additionalProperties: false`` and every
-    property listed in ``required``. When ``strict=True``, an optional parameter's type is
-    widened to also permit ``null`` (and its enum, if any, is widened to match) so the model can
-    signal "not provided" while still satisfying the "every property is required" constraint.
+    Strict mode (``strict=True``) requires ``additionalProperties: false`` plus every property in
+    ``required``; optional parameters are widened to also permit ``null`` so absence stays expressible.
     """
     properties: Dict[str, Any] = {}
     required: List[str] = []
@@ -72,7 +70,9 @@ def build_input_schema(parameters: Sequence[ToolParameter], *, strict: bool = Fa
             required.append(parameter.name)
 
     schema: Dict[str, Any] = {'type': 'object', 'properties': properties}
-    if required:
+    # Non-strict keeps the historical omit-if-empty behavior; strict always states `required`
+    # explicitly (even `[]`) rather than relying on a vacuous-truth reading of an absent key.
+    if required or strict:
         schema['required'] = required
     if strict:
         schema['additionalProperties'] = False

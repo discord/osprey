@@ -73,6 +73,12 @@ def test_build_input_schema_strict_sets_additional_properties_false_and_requires
     assert schema['required'] == ['query', 'limit']
 
 
+def test_build_input_schema_strict_zero_params_still_emits_required() -> None:
+    schema = build_input_schema([], strict=True)
+    assert schema['required'] == []
+    assert schema['additionalProperties'] is False
+
+
 def test_build_input_schema_strict_optional_param_becomes_nullable() -> None:
     schema = build_input_schema(
         [ToolParameter(name='limit', type='integer', description='max results', required=False, default=5)],

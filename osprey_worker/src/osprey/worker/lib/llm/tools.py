@@ -45,23 +45,37 @@ class ToolParameter:
     default: Any = None
 
 
-def build_input_schema(parameters: Sequence[ToolParameter]) -> Dict[str, Any]:
-    """Compile a list of :class:`ToolParameter` into a JSON Schema object."""
+def build_input_schema(parameters: Sequence[ToolParameter], *, strict: bool = False) -> Dict[str, Any]:
+    """Compile a list of :class:`ToolParameter` into a JSON Schema object.
+
+    Strict mode (``strict=True``) requires ``additionalProperties: false`` plus every property in
+    ``required``; optional parameters are widened to also permit ``null`` so absence stays expressible.
+    """
     properties: Dict[str, Any] = {}
     required: List[str] = []
     for parameter in parameters:
         prop: Dict[str, Any] = {'type': parameter.type, 'description': parameter.description}
         if parameter.enum is not None:
             prop['enum'] = list(parameter.enum)
-        if parameter.default is not None:
+        if strict and not parameter.required:
+            prop['type'] = [parameter.type, 'null']
+            if parameter.enum is not None:
+                prop['enum'] = [*parameter.enum, None]
+            # A strict schema always requires the property, so "default" (which implies
+            # omission is acceptable) would be incoherent here; omit it rather than emit both.
+        elif parameter.default is not None:
             prop['default'] = parameter.default
         properties[parameter.name] = prop
-        if parameter.required:
+        if parameter.required or strict:
             required.append(parameter.name)
 
     schema: Dict[str, Any] = {'type': 'object', 'properties': properties}
-    if required:
+    # Non-strict keeps the historical omit-if-empty behavior; strict always states `required`
+    # explicitly (even `[]`) rather than relying on a vacuous-truth reading of an absent key.
+    if required or strict:
         schema['required'] = required
+    if strict:
+        schema['additionalProperties'] = False
     return schema
 
 
@@ -73,13 +87,15 @@ class Tool:
     description: str
     handler: ToolHandler
     parameters: Sequence[ToolParameter] = field(default_factory=list)
+    strict: bool = False
 
     def definition(self) -> ToolDefinition:
         """The provider-facing :class:`ToolDefinition` for this tool."""
         return ToolDefinition(
             name=self.name,
             description=self.description,
-            input_schema=build_input_schema(self.parameters),
+            input_schema=build_input_schema(self.parameters, strict=self.strict),
+            strict=self.strict,
         )
 
 
@@ -110,6 +126,7 @@ class ToolRegistry:
         name: str,
         description: str,
         parameters: Optional[Sequence[ToolParameter]] = None,
+        strict: bool = False,
     ) -> Callable[[ToolHandler], ToolHandler]:
         """Decorator that registers the wrapped callable as a tool.
 
@@ -133,6 +150,7 @@ class ToolRegistry:
                     description=description,
                     handler=handler,
                     parameters=parameters or [],
+                    strict=strict,
                 )
             )
             return handler

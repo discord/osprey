@@ -28,6 +28,8 @@ class ToolDefinition:
     description: str
     input_schema: dict[str, Any]
     """JSON Schema describing the tool's input arguments."""
+    strict: bool = False
+    """Anthropic strict tool use: guarantees ``tool_use.input`` validates exactly against the schema."""
 
 
 @dataclass

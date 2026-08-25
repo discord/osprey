@@ -41,6 +41,61 @@ def test_build_input_schema_omits_required_when_none() -> None:
     assert 'required' not in schema
 
 
+def test_build_input_schema_strict_false_is_unchanged() -> None:
+    # Regression guard: strict=False must remain byte-identical to the pre-strict behaviour.
+    parameters = [
+        ToolParameter(name='query', type='string', description='the query'),
+        ToolParameter(name='limit', type='integer', description='max results', required=False, default=5),
+        ToolParameter(name='order', type='string', description='sort order', required=False, enum=['asc', 'desc']),
+    ]
+    assert build_input_schema(parameters) == build_input_schema(parameters, strict=False)
+    assert build_input_schema(parameters, strict=False) == {
+        'type': 'object',
+        'properties': {
+            'query': {'type': 'string', 'description': 'the query'},
+            'limit': {'type': 'integer', 'description': 'max results', 'default': 5},
+            'order': {'type': 'string', 'description': 'sort order', 'enum': ['asc', 'desc']},
+        },
+        'required': ['query'],
+    }
+
+
+def test_build_input_schema_strict_sets_additional_properties_false_and_requires_all() -> None:
+    schema = build_input_schema(
+        [
+            ToolParameter(name='query', type='string', description='the query'),
+            ToolParameter(name='limit', type='integer', description='max results', required=False, default=5),
+        ],
+        strict=True,
+    )
+
+    assert schema['additionalProperties'] is False
+    assert schema['required'] == ['query', 'limit']
+
+
+def test_build_input_schema_strict_optional_param_becomes_nullable() -> None:
+    schema = build_input_schema(
+        [ToolParameter(name='limit', type='integer', description='max results', required=False, default=5)],
+        strict=True,
+    )
+
+    prop = schema['properties']['limit']
+    assert prop['type'] == ['integer', 'null']
+    assert 'limit' in schema['required']
+    assert 'default' not in prop
+
+
+def test_build_input_schema_strict_optional_enum_permits_null() -> None:
+    schema = build_input_schema(
+        [ToolParameter(name='order', type='string', description='sort order', required=False, enum=['asc', 'desc'])],
+        strict=True,
+    )
+
+    prop = schema['properties']['order']
+    assert prop['enum'] == ['asc', 'desc', None]
+    assert prop['type'] == ['string', 'null']
+
+
 def test_decorator_registers_and_returns_callable() -> None:
     registry = ToolRegistry()
 

@@ -27,6 +27,7 @@ DOWN = 'down'
 
 DEFAULT_SECONDARIES = 2
 VISIBILITY_PERIOD_MAX_SEC = 15.0
+STOP_INITIALIZATION_WAIT_TIMEOUT_SEC = 5.0
 
 ListenerFn = Callable[[str, Service], None]
 
@@ -362,10 +363,20 @@ class AsyncServiceWatcher:
             pass
 
     async def stop(self) -> None:
-        if self._initialization_task:
-            # An in-flight initial sync may still install a watch task, so let it
-            # settle before teardown. asyncio.wait() neither cancels nor re-raises.
-            await asyncio.wait([self._initialization_task])
+        if self._initialization_task and not self._initialization_task.done():
+            # An in-flight initial sync may still install a watch task, so give it a
+            # bounded chance to settle before teardown rather than waiting forever.
+            done, _ = await asyncio.wait([self._initialization_task], timeout=STOP_INITIALIZATION_WAIT_TIMEOUT_SEC)
+            if not done:
+                self._initialization_task.cancel()
+                # The task awaits run_in_executor(begin_watching), which cannot be
+                # interrupted; the executor thread may keep running after this.
+                try:
+                    await self._initialization_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception('async watcher %s: initialization failed during stop()', self._service_name)
         if self._watch_task:
             self._watch_task.cancel()
             try:

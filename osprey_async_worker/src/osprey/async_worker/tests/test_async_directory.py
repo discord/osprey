@@ -26,6 +26,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from osprey.async_worker.lib.discovery import async_directory
 from osprey.async_worker.lib.discovery.async_directory import AsyncServiceWatcher, _AsyncHashRing
 from osprey.async_worker.lib.pigeon.client import RoutedClient
 from osprey.worker.lib.discovery.exceptions import ServiceUnavailable
@@ -301,6 +302,56 @@ async def test_stop_teardown():
     # Free the executor threads still parked in next() on the fake inboxes.
     for fw in client.all_watchers:
         fw.unblock()
+
+
+# --- stop() bounded wait -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_returns_within_bound_when_initialization_never_completes(monkeypatch):
+    """Regression guard: stop() must not hang forever on a stuck initial sync."""
+    monkeypatch.setattr(async_directory, 'STOP_INITIALIZATION_WAIT_TIMEOUT_SEC', 0.05)
+    asw = AsyncServiceWatcher(FakeEtcdClient(), '/discovery', 'smite_shortlist')
+    never_completes = asyncio.Event()
+    asw._initialization_task = asyncio.create_task(never_completes.wait())
+
+    await asyncio.wait_for(asw.stop(), timeout=1)
+
+    assert asw._initialization_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_stop_awaits_fast_initialization_and_tears_down_watch_task():
+    """A normal, fast initial sync still gets awaited and its watch task torn down."""
+    svc = _svc('a', 1)
+    watcher = FakeWatcher(initial_event=_full_sync([svc]))
+    client = FakeEtcdClient(recursive_watchers=[watcher])
+
+    asw = AsyncServiceWatcher(client, '/discovery', 'smite_shortlist')
+    await asw.ensure_initialized()
+    watch_task = asw._watch_task
+    assert watch_task is not None and not watch_task.done()
+
+    await asw.stop()
+
+    assert asw._initialization_task.done() and not asw._initialization_task.cancelled()
+    assert watch_task.done()
+
+    for fw in client.all_watchers:
+        fw.unblock()
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_propagate_a_failed_initialization():
+    """A failed initial sync must not raise out of stop() (matches prior asyncio.wait() behavior)."""
+    asw = AsyncServiceWatcher(FakeEtcdClient(), '/discovery', 'smite_shortlist')
+
+    async def _boom() -> None:
+        raise ValueError('etcd unreachable')
+
+    asw._initialization_task = asyncio.create_task(_boom())
+
+    await asyncio.wait_for(asw.stop(), timeout=1)
 
 
 # --- _AsyncHashRing ----------------------------------------------------------

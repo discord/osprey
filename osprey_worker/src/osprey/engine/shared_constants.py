@@ -6,6 +6,7 @@ if typing.TYPE_CHECKING:
 
 ENTITY_LABEL_MUTATION_DIMENSION_NAME = '__entity_label_mutations'
 VERDICT_DIMENSION_NAME = '__verdicts'
+CLASSIFICATIONS_DIMENSION_NAME = '__classifications'
 
 
 def ENTITY_LABEL_MUTATION_DIMENSION_VALUE(entity_type: str, label_name: str, label_status: 'LabelStatus') -> str:

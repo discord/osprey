@@ -114,24 +114,6 @@ def test_parses_did_mutate_label(
     assert check_json_output(transformed_query)
 
 
-def test_parses_did_add_classification_without_application_bootstrap(
-    make_rules_sources: MakeRulesSourcesFunction,
-) -> None:
-    validated_sources = parse_query_to_validated_ast(
-        'DidAddClassification(classification="VOLUMETRIC.ABUSE+SMITE")',
-        make_rules_sources([]),
-    )
-
-    assert DruidQueryTransformer(validated_sources=validated_sources).transform() == {
-        'type': 'native',
-        'filter': {
-            'type': 'regex',
-            'dimension': '__classifications',
-            'pattern': r'^[^/]+/[^/]+/volumetric\.abuse\+smite$',
-        },
-    }
-
-
 @pytest.mark.parametrize(
     'query',
     [

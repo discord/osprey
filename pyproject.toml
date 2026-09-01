@@ -44,7 +44,7 @@ common = [
     "gunicorn",
     "intervals==0.9.2",
     "jsonpath-rw",
-    "kafka-python==1.4.7",
+    "kafka-python==2.3.2",
     # Flask 1.1.4 / Jinja2 2.11 import `markupsafe.soft_unicode`, which was removed in
     # markupsafe 2.1.0. Pin to <2.1 until the Flask 1.x stack is upgraded.
     "markupsafe<2.1",

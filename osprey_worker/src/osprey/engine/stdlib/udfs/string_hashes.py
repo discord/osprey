@@ -3,6 +3,9 @@ from hashlib import md5, sha1, sha256, sha512
 from ._prelude import ArgumentsBase, ExecutionContext, UDFBase
 from .categories import UdfCategories
 
+SHA256_INT_BYTES = 8
+SHA256_INT_NON_NEGATIVE_MASK = (1 << 63) - 1
+
 
 class Arguments(ArgumentsBase):
     input: str
@@ -34,6 +37,20 @@ class HashSha256(UDFBase[Arguments, str]):
 
     def execute(self, execution_context: ExecutionContext, arguments: Arguments) -> str:
         return sha256(arguments.input.encode()).hexdigest()
+
+
+class HashSha256Int(UDFBase[Arguments, int]):
+    """Returns a non-negative 63-bit integer derived from a string's SHA-256 digest.
+
+    The UDF encodes the first eight SHA-256 digest bytes in big-endian order,
+    then clears the sign bit. The result is in the range ``0..2^63-1``.
+    """
+
+    category = UdfCategories.HASH
+
+    def execute(self, execution_context: ExecutionContext, arguments: Arguments) -> int:
+        digest = sha256(arguments.input.encode('utf-8')).digest()
+        return int.from_bytes(digest[:SHA256_INT_BYTES], byteorder='big') & SHA256_INT_NON_NEGATIVE_MASK
 
 
 class HashSha512(UDFBase[Arguments, str]):

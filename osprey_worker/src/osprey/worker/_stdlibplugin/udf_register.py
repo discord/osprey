@@ -52,6 +52,7 @@ from osprey.engine.stdlib.udfs.string_hashes import (
     HashMd5,
     HashSha1,
     HashSha256,
+    HashSha256Int,
     HashSha512,
 )
 from osprey.engine.stdlib.udfs.time_bucket import (
@@ -112,6 +113,7 @@ def register_udfs() -> Sequence[Type[UDFBase[Any, Any]]]:
         HashMd5,
         HashSha1,
         HashSha256,
+        HashSha256Int,
         HashSha512,
         StringLength,
         StringToLower,

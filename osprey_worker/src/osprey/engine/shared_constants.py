@@ -17,4 +17,4 @@ class OspreyEntityTypes(StrEnum):
     GUILD = 'Guild'
     MESSAGE = 'Message'
     CHANNEL = 'Channel'
-    PROVISIONAL_ACCOUNT = 'ProvisionalAccount'
+    PROVISIONAL_ACCOUNT = 'Provisional_Account'

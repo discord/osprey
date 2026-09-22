@@ -3,11 +3,13 @@ from __future__ import annotations
 import gzip
 import json
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, cast
+from uuid import uuid4
 
 import gevent
+import gevent.pool
 import google.cloud.storage as storage
 import pytz
 from google.api_core import retry
@@ -369,6 +371,200 @@ class StoredExecutionResultGCS(ExecutionResultStore):
         }
 
         action_data = data.get('action_data')
+        if action_data:
+            execution_result_dict['action_data'] = action_data
+
+        return execution_result_dict
+
+
+GCS_BATCH_CONCURRENCY_LIMIT = 100
+
+
+class StoredExecutionResultGCSBatched(ExecutionResultStore):
+    """Buffers execution results in-process and flushes many of them into a single GCS
+    object per flush, instead of `StoredExecutionResultGCS`'s one object per write.
+
+    Batch objects are keyed only by data already embedded in the action ID: a minute bucket
+    and a shard, both derived from the ID's snowflake timestamp (the same `to_key_prefix`
+    anti-hot-row trick `StoredExecutionResultBigTable` uses). A read recomputes that same key
+    from the ID it's looking for and lists objects under that prefix, so there is no separate
+    index to keep in sync -- but it does mean a point read costs a GCS list plus however many
+    objects share that prefix, not a single direct `get_blob`.
+
+    Buffering is in-process only. A write is not visible to reads, and is not durable, until
+    its batch is flushed -- by `flush()`, or by the periodic loop started with
+    `start_periodic_flush()`. A crash between insert() and the next flush loses that write,
+    same as a dropped write in `StoredExecutionResultGCS.insert()`.
+    """
+
+    def __init__(
+        self,
+        bucket_name: Optional[str] = None,
+        max_batch_size: Optional[int] = None,
+        flush_interval_seconds: Optional[float] = None,
+    ):
+        from osprey.worker.lib.singletons import CONFIG
+
+        config = CONFIG.instance()
+        self._bucket_name = bucket_name or config.get_str(
+            'OSPREY_GCS_EXECUTION_RESULTS_BATCH_BUCKET', 'osprey-execution-results-batched-stg'
+        )
+        self._max_batch_size = max_batch_size or config.get_int('OSPREY_GCS_EXECUTION_RESULTS_BATCH_MAX_SIZE', 500)
+        self._flush_interval_seconds = flush_interval_seconds or config.get_int(
+            'OSPREY_GCS_EXECUTION_RESULTS_BATCH_FLUSH_INTERVAL_SECONDS', 30
+        )
+        self._gcs_client: Optional[storage.Client] = None
+        self._buffers: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        self._flush_greenlet: Optional[gevent.Greenlet] = None
+
+    def _get_gcs_client(self) -> storage.Client:
+        if self._gcs_client is None:
+            from osprey.worker.lib.singletons import CONFIG
+
+            config = CONFIG.instance()
+            project_id = config.get_str('OSPREY_GCP_PROJECT_ID', 'osprey-dev')
+            self._gcs_client = storage.Client(project=project_id)
+        return self._gcs_client
+
+    @staticmethod
+    def _bucket_key_for_action_id(action_id: int) -> Tuple[str, str]:
+        """(minute_bucket, shard), derived only from the action id's embedded creation time,
+        so a read can recompute exactly which prefix a write landed under."""
+        snowflake = Snowflake(action_id)
+        minute_bucket = datetime.fromtimestamp(snowflake.to_timestamp(), tz=timezone.utc).strftime('%Y%m%d%H%M')
+        shard = snowflake.to_key_prefix()
+        return minute_bucket, shard
+
+    @staticmethod
+    def _object_prefix(key: Tuple[str, str]) -> str:
+        minute_bucket, shard = key
+        return f'{minute_bucket}/{shard}/'
+
+    def insert(
+        self,
+        action_id: int,
+        extracted_features_json: str,
+        error_traces_json: str,
+        timestamp: datetime,
+        action_data_json: str,
+    ) -> None:
+        key = self._bucket_key_for_action_id(action_id)
+        record = {
+            'id': action_id,
+            'extracted_features': extracted_features_json,
+            'error_traces': error_traces_json,
+            'timestamp': timestamp.isoformat(),
+            'action_data': action_data_json,
+        }
+
+        # No yield point between the buffer lookup and the append below, so this is safe
+        # without a lock under gevent's cooperative scheduling.
+        buffer = self._buffers.setdefault(key, [])
+        buffer.append(record)
+        if len(buffer) < self._max_batch_size:
+            return
+
+        del self._buffers[key]
+        self._flush_batch(key, buffer)
+
+    def flush(self) -> None:
+        """Uploads every currently-buffered batch now, regardless of size.
+
+        Not called automatically. Call directly before process shutdown so buffered-but-
+        unflushed writes aren't lost, or use `start_periodic_flush()` for a background loop.
+        """
+        pending = self._buffers
+        self._buffers = {}
+        for key, records in pending.items():
+            if records:
+                self._flush_batch(key, records)
+
+    def start_periodic_flush(self) -> None:
+        """Spawns a background greenlet that calls `flush()` every `flush_interval_seconds`.
+        Idempotent: a second call while one is already running is a no-op."""
+        if self._flush_greenlet is not None:
+            return
+        self._flush_greenlet = gevent.spawn(self._flush_loop)
+
+    def stop_periodic_flush(self) -> None:
+        """Kills the background flush loop, if running. Does not flush first -- call
+        `flush()` before this if buffered writes need to survive."""
+        if self._flush_greenlet is not None:
+            self._flush_greenlet.kill()
+            self._flush_greenlet = None
+
+    def _flush_loop(self) -> None:
+        while True:
+            gevent.sleep(self._flush_interval_seconds)
+            try:
+                self.flush()
+            except Exception:
+                logger.exception('Failed to flush buffered execution results to GCS')
+
+    def _flush_batch(self, key: Tuple[str, str], records: List[Dict[str, Any]]) -> None:
+        object_name = f'{self._object_prefix(key)}{uuid4()}.jsonl.gz'
+        body = b'\n'.join(json.dumps(record).encode('utf-8') for record in records)
+        try:
+            with metrics.timed('gcs_stored_execution_result_batched.flush'):
+                bucket = self._get_gcs_client().bucket(self._bucket_name)
+                blob = bucket.blob(object_name)
+                blob.content_encoding = 'gzip'
+                blob.upload_from_string(gzip.compress(body), content_type='application/jsonl')
+            metrics.histogram('gcs_stored_execution_result_batched.batch_rows', len(records))
+        except Exception:
+            # Best-effort, same as StoredExecutionResultGCS.insert(): the batch is already
+            # removed from self._buffers, so a failed flush drops these records.
+            logger.error(f'Failed to flush {len(records)} buffered execution results to GCS object {object_name}')
+            metrics.increment('gcs_stored_execution_result_batched.flush_error', len(records))
+
+    def select_one(self, action_id: int) -> Optional[Dict[str, Any]]:
+        results = self.select_many([action_id])
+        return results[0] if results else None
+
+    def select_many(self, action_ids: List[int]) -> List[Dict[str, Any]]:
+        if not action_ids:
+            return []
+
+        wanted_by_prefix: Dict[str, set[int]] = {}
+        for action_id in action_ids:
+            prefix = self._object_prefix(self._bucket_key_for_action_id(action_id))
+            wanted_by_prefix.setdefault(prefix, set()).add(action_id)
+
+        results: List[Dict[str, Any]] = []
+        for batch in gevent.pool.Pool(GCS_BATCH_CONCURRENCY_LIMIT).imap(
+            self._scan_prefix, ((prefix, wanted) for prefix, wanted in wanted_by_prefix.items())
+        ):
+            results.extend(batch)
+        return results
+
+    def _scan_prefix(self, prefix_and_wanted: Tuple[str, set[int]]) -> List[Dict[str, Any]]:
+        prefix, wanted = prefix_and_wanted
+        found: List[Dict[str, Any]] = []
+        try:
+            bucket = self._get_gcs_client().bucket(self._bucket_name)
+            for blob in bucket.list_blobs(prefix=prefix):
+                raw = blob.download_as_bytes()
+                for line in gzip.decompress(raw).splitlines():
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    if record['id'] in wanted:
+                        found.append(StoredExecutionResultGCSBatched._execution_result_dict_from_record(record))
+        except Exception:
+            logger.error(f'Failed to read batched execution results under GCS prefix {prefix}')
+        return found
+
+    @staticmethod
+    def _execution_result_dict_from_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        execution_result_dict = {
+            'id': record['id'],
+            'extracted_features': record['extracted_features'],
+            'error_traces': record['error_traces'],
+            'timestamp': datetime.fromisoformat(record['timestamp']),
+            'action_data': None,
+        }
+
+        action_data = record.get('action_data')
         if action_data:
             execution_result_dict['action_data'] = action_data
 

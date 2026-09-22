@@ -7,6 +7,7 @@ from osprey.worker.lib.storage.stored_execution_result import (
     ExecutionResultStore,
     StoredExecutionResultBigTable,
     StoredExecutionResultGCS,
+    StoredExecutionResultGCSBatched,
     StoredExecutionResultMinIO,
     StoredExecutionResultPostgres,
 )
@@ -24,6 +25,10 @@ def get_rules_execution_result_storage_backend(
         return StoredExecutionResultBigTable()
     elif backend_type == ExecutionResultStorageBackendType.GCS:
         return StoredExecutionResultGCS()
+    elif backend_type == ExecutionResultStorageBackendType.GCS_BATCHED:
+        store = StoredExecutionResultGCSBatched()
+        store.start_periodic_flush()
+        return store
     elif backend_type == ExecutionResultStorageBackendType.MINIO:
         endpoint = config.get_str('OSPREY_MINIO_ENDPOINT', 'minio:9000')
         access_key = config.get_str('OSPREY_MINIO_ACCESS_KEY', 'minioadmin')

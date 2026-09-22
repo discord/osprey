@@ -21,6 +21,12 @@ class ExecutionResultStorageBackendType(StrEnum):
     Google Cloud Storage execution result store
     """
 
+    GCS_BATCHED = auto()
+    """
+    Google Cloud Storage execution result store that buffers writes and flushes many of them
+    into a single object, instead of one object per write. See StoredExecutionResultGCSBatched.
+    """
+
     MINIO = auto()
     """
     Minio execution result store

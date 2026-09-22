@@ -1,4 +1,5 @@
 import gzip
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -191,12 +192,46 @@ def test_flush_error_drops_the_batch_without_raising(
 
 def test_start_periodic_flush_is_idempotent(store: StoredExecutionResultGCSBatched):
     store.start_periodic_flush()
-    greenlet = store._flush_greenlet
-    assert greenlet is not None
+    thread = store._flush_thread
+    assert thread is not None
+    assert thread.is_alive()
 
     store.start_periodic_flush()
-    assert store._flush_greenlet is greenlet
+    assert store._flush_thread is thread
 
     store.stop_periodic_flush()
-    assert store._flush_greenlet is None
-    assert greenlet.dead
+    assert store._flush_thread is None
+    assert not thread.is_alive()
+
+
+def test_concurrent_inserts_do_not_lose_or_corrupt_writes(
+    store: StoredExecutionResultGCSBatched, fake_bucket: _FakeBucket
+):
+    """Regression test for the actual deployment target: Smite's async worker dispatches
+    every insert() through asyncio.to_thread, so concurrent calls land on different real OS
+    threads, not cooperatively-scheduled greenlets. Without a lock around the buffer, two
+    threads racing the max-batch-size check both try to `del` the same buffer key and the
+    second one raises KeyError -- dropping or crashing on writes under real load.
+    """
+    thread_count = 16
+    inserts_per_thread = 25
+    action_ids = [
+        _action_id(_BASE_MINUTE_MS, sequence=(thread_index * inserts_per_thread) + i)
+        for thread_index in range(thread_count)
+        for i in range(inserts_per_thread)
+    ]
+    ids_by_thread = [action_ids[t * inserts_per_thread : (t + 1) * inserts_per_thread] for t in range(thread_count)]
+
+    def _insert_all(ids: List[int]) -> None:
+        for action_id in ids:
+            _insert(store, action_id)
+
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = [executor.submit(_insert_all, ids) for ids in ids_by_thread]
+        for future in futures:
+            future.result()  # re-raises if insert() raised on any thread
+
+    store.flush()
+
+    found_ids = {result['id'] for result in store.select_many(action_ids)}
+    assert found_ids == set(action_ids)

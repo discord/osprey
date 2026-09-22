@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, cast
 from uuid import uuid4
 
 import gevent
-import gevent.pool
 import google.cloud.storage as storage
 import pytz
 from google.api_core import retry
@@ -395,6 +396,14 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
     its batch is flushed -- by `flush()`, or by the periodic loop started with
     `start_periodic_flush()`. A crash between insert() and the next flush loses that write,
     same as a dropped write in `StoredExecutionResultGCS.insert()`.
+
+    Uses `threading`, not `gevent`, for the buffer lock and the periodic flush loop. Smite's
+    async worker calls every `ExecutionResultStore` method via `asyncio.to_thread`
+    (`AsyncStoredExecutionResultOutputSink.push`), which runs it on the event loop's real
+    `ThreadPoolExecutor` -- so concurrent `insert()` calls land on different OS threads, not
+    cooperatively-scheduled greenlets. A `gevent.spawn`-based flush loop would also never run
+    at all there: nothing in that process drives a gevent hub, so a spawned greenlet just
+    never gets scheduled.
     """
 
     def __init__(
@@ -415,7 +424,9 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
         )
         self._gcs_client: Optional[storage.Client] = None
         self._buffers: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-        self._flush_greenlet: Optional[gevent.Greenlet] = None
+        self._buffers_lock = threading.Lock()
+        self._flush_thread: Optional[threading.Thread] = None
+        self._stop_flush_thread = threading.Event()
 
     def _get_gcs_client(self) -> storage.Client:
         if self._gcs_client is None:
@@ -457,15 +468,20 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
             'action_data': action_data_json,
         }
 
-        # No yield point between the buffer lookup and the append below, so this is safe
-        # without a lock under gevent's cooperative scheduling.
-        buffer = self._buffers.setdefault(key, [])
-        buffer.append(record)
-        if len(buffer) < self._max_batch_size:
-            return
+        # Concurrent inserts for the same key land on different OS threads (see class
+        # docstring), so the lookup-append-and-maybe-remove sequence needs a real lock: without
+        # one, two threads can both see the batch at max size and both call `del` on the same
+        # key, and the second one raises KeyError.
+        flush_batch: Optional[List[Dict[str, Any]]] = None
+        with self._buffers_lock:
+            buffer = self._buffers.setdefault(key, [])
+            buffer.append(record)
+            if len(buffer) >= self._max_batch_size:
+                flush_batch = buffer
+                del self._buffers[key]
 
-        del self._buffers[key]
-        self._flush_batch(key, buffer)
+        if flush_batch is not None:
+            self._flush_batch(key, flush_batch)
 
     def flush(self) -> None:
         """Uploads every currently-buffered batch now, regardless of size.
@@ -473,29 +489,40 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
         Not called automatically. Call directly before process shutdown so buffered-but-
         unflushed writes aren't lost, or use `start_periodic_flush()` for a background loop.
         """
-        pending = self._buffers
-        self._buffers = {}
+        with self._buffers_lock:
+            pending = self._buffers
+            self._buffers = {}
         for key, records in pending.items():
             if records:
                 self._flush_batch(key, records)
 
     def start_periodic_flush(self) -> None:
-        """Spawns a background greenlet that calls `flush()` every `flush_interval_seconds`.
-        Idempotent: a second call while one is already running is a no-op."""
-        if self._flush_greenlet is not None:
+        """Spawns a daemon thread that calls `flush()` every `flush_interval_seconds`.
+        Idempotent: a second call while one is already running is a no-op.
+
+        A plain `threading.Thread`, not a gevent greenlet: it needs to run regardless of
+        whether the caller is the gevent-based sync worker or the asyncio-based async worker,
+        and neither of those runtimes' schedulers will drive a gevent greenlet on its own.
+        """
+        if self._flush_thread is not None:
             return
-        self._flush_greenlet = gevent.spawn(self._flush_loop)
+        self._stop_flush_thread.clear()
+        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._flush_thread.start()
 
     def stop_periodic_flush(self) -> None:
-        """Kills the background flush loop, if running. Does not flush first -- call
-        `flush()` before this if buffered writes need to survive."""
-        if self._flush_greenlet is not None:
-            self._flush_greenlet.kill()
-            self._flush_greenlet = None
+        """Stops the background flush loop, if running, and waits for it to exit. Does not
+        flush first -- call `flush()` before this if buffered writes need to survive."""
+        if self._flush_thread is None:
+            return
+        self._stop_flush_thread.set()
+        self._flush_thread.join()
+        self._flush_thread = None
 
     def _flush_loop(self) -> None:
-        while True:
-            gevent.sleep(self._flush_interval_seconds)
+        # Event.wait(timeout) doubles as the sleep and the stop signal, so stop_periodic_flush()
+        # doesn't block for a full flush interval waiting for this loop to notice.
+        while not self._stop_flush_thread.wait(self._flush_interval_seconds):
             try:
                 self.flush()
             except Exception:
@@ -530,11 +557,14 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
             prefix = self._object_prefix(self._bucket_key_for_action_id(action_id))
             wanted_by_prefix.setdefault(prefix, set()).add(action_id)
 
+        # A real thread pool, not gevent.pool.Pool: this method (like insert()) runs inside a
+        # single asyncio.to_thread worker thread in the async worker, where nothing drives a
+        # gevent hub to schedule cooperatively-yielded greenlets.
         results: List[Dict[str, Any]] = []
-        for batch in gevent.pool.Pool(GCS_BATCH_CONCURRENCY_LIMIT).imap(
-            self._scan_prefix, ((prefix, wanted) for prefix, wanted in wanted_by_prefix.items())
-        ):
-            results.extend(batch)
+        max_workers = min(len(wanted_by_prefix), GCS_BATCH_CONCURRENCY_LIMIT)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for batch in executor.map(self._scan_prefix, wanted_by_prefix.items()):
+                results.extend(batch)
         return results
 
     def _scan_prefix(self, prefix_and_wanted: Tuple[str, set[int]]) -> List[Dict[str, Any]]:

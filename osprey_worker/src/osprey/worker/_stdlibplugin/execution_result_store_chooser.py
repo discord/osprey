@@ -5,6 +5,7 @@ from osprey.worker.lib.singletons import CONFIG
 from osprey.worker.lib.storage import ExecutionResultStorageBackendType
 from osprey.worker.lib.storage.stored_execution_result import (
     ExecutionResultStore,
+    RoutingExecutionResultStore,
     StoredExecutionResultBigTable,
     StoredExecutionResultGCS,
     StoredExecutionResultGCSBatched,
@@ -29,6 +30,10 @@ def get_rules_execution_result_storage_backend(
         store = StoredExecutionResultGCSBatched()
         store.start()
         return store
+    elif backend_type == ExecutionResultStorageBackendType.ROUTING:
+        primary = StoredExecutionResultGCSBatched()
+        primary.start()
+        return RoutingExecutionResultStore.from_config(primary, StoredExecutionResultBigTable())
     elif backend_type == ExecutionResultStorageBackendType.MINIO:
         endpoint = config.get_str('OSPREY_MINIO_ENDPOINT', 'minio:9000')
         access_key = config.get_str('OSPREY_MINIO_ACCESS_KEY', 'minioadmin')
@@ -45,6 +50,7 @@ def get_rules_execution_result_storage_backend(
         store = bootstrap_execution_result_store(config=config)
         if store is None:
             raise AssertionError('No execution result store registered')
+        return store
     elif backend_type == ExecutionResultStorageBackendType.NONE:
         return None
 

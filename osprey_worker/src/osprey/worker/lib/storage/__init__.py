@@ -27,6 +27,12 @@ class ExecutionResultStorageBackendType(StrEnum):
     into a single object, instead of one object per write. See StoredExecutionResultGCSBatched.
     """
 
+    ROUTING = auto()
+    """
+    Writes go to BigTable and, for a configurable percent of action ids, to the batched GCS store. Reads
+    try GCS, then fall back to BigTable. See RoutingExecutionResultStore.
+    """
+
     MINIO = auto()
     """
     Minio execution result store

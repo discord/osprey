@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import itertools
 import json
 import os
@@ -72,6 +73,10 @@ class ExecutionResultStore(ABC):
     ) -> None:
         """Insert an execution result."""
         pass
+
+    def flush(self) -> None:
+        """Upload or persist buffered writes. Default: nothing buffered."""
+        return None
 
 
 class ErrorTrace(BaseModel):
@@ -952,6 +957,167 @@ class StoredExecutionResultPostgres(ExecutionResultStore):
         return execution_result_dict
 
 
+_ROUTING_METRIC = 'execution_result_routing'
+# The batched writer closes a slot about 15 s after it ends, then uploads. A sampled id older than this
+# should be readable, so a miss means lost or unreadable data rather than a write still in the buffer.
+_UNEXPECTED_MISS_AGE_SECONDS = 300
+
+
+def in_gcs_write_sample(action_id: int, percent: float) -> bool:
+    """Returns whether `action_id` falls in the GCS write sample.
+
+    Hashes the id, so writers and readers agree without shared state, and a reader can tell an expected
+    GCS miss from an unexpected one.
+    """
+    if percent <= 0:
+        return False
+    if percent >= 100:
+        return True
+    digest = hashlib.blake2b(action_id.to_bytes(8, 'big'), digest_size=4).digest()
+    return int.from_bytes(digest, 'big') % 10000 < int(percent * 100)
+
+
+class RoutingExecutionResultStore(ExecutionResultStore):
+    """Moves execution results from a legacy store (BigTable) to a primary store (batched GCS) in steps.
+
+    Writes go to the primary for a percent of action ids and to the legacy store while it stays the
+    system of record. Reads try the primary for ids at or above `cutover_id` and fall back to the legacy
+    store. Primary failures never propagate; legacy failures do, so the sink keeps its retry semantics.
+    """
+
+    def __init__(
+        self,
+        primary: ExecutionResultStore,
+        legacy: ExecutionResultStore,
+        gcs_write_percent: float,
+        legacy_write_enabled: bool,
+        legacy_read_fallback: bool,
+        cutover_id: int,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._primary = primary
+        self._legacy = legacy
+        self._gcs_write_percent = gcs_write_percent
+        self._legacy_write_enabled = legacy_write_enabled
+        self._legacy_read_fallback = legacy_read_fallback
+        self._cutover_id = cutover_id
+        self._clock = clock
+
+    @classmethod
+    def from_config(cls, primary: ExecutionResultStore, legacy: ExecutionResultStore) -> RoutingExecutionResultStore:
+        from osprey.worker.lib.singletons import CONFIG
+
+        config = CONFIG.instance()
+        return cls(
+            primary,
+            legacy,
+            gcs_write_percent=config.get_float('OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT', 0.0),
+            legacy_write_enabled=config.get_bool('OSPREY_EXECUTION_RESULT_LEGACY_WRITE_ENABLED', True),
+            legacy_read_fallback=config.get_bool('OSPREY_EXECUTION_RESULT_LEGACY_READ_FALLBACK', True),
+            cutover_id=config.get_int('OSPREY_EXECUTION_RESULT_ROUTING_CUTOVER_ID', 0),
+        )
+
+    def insert(
+        self,
+        action_id: int,
+        extracted_features_json: str,
+        error_traces_json: str,
+        timestamp: datetime,
+        action_data_json: str,
+    ) -> None:
+        outcome = 'skipped'
+        if in_gcs_write_sample(action_id, self._gcs_write_percent):
+            try:
+                self._primary.insert(
+                    action_id=action_id,
+                    extracted_features_json=extracted_features_json,
+                    error_traces_json=error_traces_json,
+                    timestamp=timestamp,
+                    action_data_json=action_data_json,
+                )
+                outcome = 'ok'
+            except Exception:
+                logger.exception(f'Failed to write execution result {action_id} to GCS')
+                outcome = 'error'
+        metrics.increment(f'{_ROUTING_METRIC}.write', tags=['target:gcs', f'outcome:{outcome}'])
+
+        if not self._legacy_write_enabled:
+            return
+        try:
+            self._legacy.insert(
+                action_id=action_id,
+                extracted_features_json=extracted_features_json,
+                error_traces_json=error_traces_json,
+                timestamp=timestamp,
+                action_data_json=action_data_json,
+            )
+        except Exception:
+            metrics.increment(f'{_ROUTING_METRIC}.write', tags=['target:legacy', 'outcome:error'])
+            raise
+        metrics.increment(f'{_ROUTING_METRIC}.write', tags=['target:legacy', 'outcome:ok'])
+
+    def select_one(self, action_id: int) -> Optional[Dict[str, Any]]:
+        results = self.select_many([action_id])
+        return results[0] if results else None
+
+    def select_many(self, action_ids: List[int]) -> List[Dict[str, Any]]:
+        action_ids = list(dict.fromkeys(action_ids))
+        # The primary holds nothing written before the cutover, so skip it for older ids. Ids are never
+        # negative, so a cutover of 0 makes every id eligible.
+        eligible = [i for i in action_ids if i >= self._cutover_id]
+        ineligible = [i for i in action_ids if i < self._cutover_id]
+
+        found: Dict[int, Dict[str, Any]] = {}
+        if eligible:
+            try:
+                with metrics.timed(f'{_ROUTING_METRIC}.read.duration', tags=['backend:gcs']):
+                    found = {record['id']: record for record in self._primary.select_many(eligible)}
+            except Exception:
+                logger.exception(f'Failed to read {len(eligible)} execution results from GCS')
+
+        misses = [i for i in eligible if i not in found]
+        now = self._clock()
+        unexpected = sum(
+            1
+            for i in misses
+            if in_gcs_write_sample(i, self._gcs_write_percent)
+            and now - Snowflake(i).to_timestamp() > _UNEXPECTED_MISS_AGE_SECONDS
+        )
+        if unexpected:
+            metrics.increment(f'{_ROUTING_METRIC}.read.gcs_unexpected_miss', unexpected)
+        if len(misses) > unexpected:
+            metrics.increment(f'{_ROUTING_METRIC}.read.gcs_expected_miss', len(misses) - unexpected)
+
+        fallback: Dict[int, Dict[str, Any]] = {}
+        if self._legacy_read_fallback and (misses or ineligible):
+            with metrics.timed(f'{_ROUTING_METRIC}.read.duration', tags=['backend:legacy']):
+                fallback = {record['id']: record for record in self._legacy.select_many(misses + ineligible)}
+
+        results: List[Dict[str, Any]] = []
+        sources = {'gcs': 0, 'legacy': 0, 'miss': 0}
+        for action_id in action_ids:
+            # During dual write both stores can hold an id; the primary's record wins.
+            if action_id in found:
+                results.append(found[action_id])
+                sources['gcs'] += 1
+            elif action_id in fallback:
+                results.append(fallback[action_id])
+                sources['legacy'] += 1
+            else:
+                sources['miss'] += 1
+        for source, count in sources.items():
+            if count:
+                metrics.increment(f'{_ROUTING_METRIC}.read.source', count, tags=[f'source:{source}'])
+        return results
+
+    def flush(self) -> None:
+        try:
+            self._primary.flush()
+        except Exception:
+            logger.exception('Failed to flush buffered execution results to GCS')
+        self._legacy.flush()
+
+
 class ExecutionResultStorageService:
     """Service class that provides execution result operations with a configured backend."""
 
@@ -975,6 +1141,10 @@ class ExecutionResultStorageService:
     ) -> List[StoredExecutionResult]:
         """Get execution results from the configured storage backend."""
         return StoredExecutionResult.get_many(action_ids, self._storage_backend, data_censor_abilities)
+
+    def flush(self) -> None:
+        """Upload or persist the backend's buffered writes."""
+        self._storage_backend.flush()
 
 
 def bootstrap_execution_result_storage_service() -> ExecutionResultStorageService:

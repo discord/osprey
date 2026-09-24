@@ -27,7 +27,7 @@ def get_rules_execution_result_storage_backend(
         return StoredExecutionResultGCS()
     elif backend_type == ExecutionResultStorageBackendType.GCS_BATCHED:
         store = StoredExecutionResultGCSBatched()
-        store.start_periodic_flush()
+        store.start()
         return store
     elif backend_type == ExecutionResultStorageBackendType.MINIO:
         endpoint = config.get_str('OSPREY_MINIO_ENDPOINT', 'minio:9000')

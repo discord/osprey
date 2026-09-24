@@ -21,4 +21,5 @@ class StoredExecutionResultOutputSink(BaseOutputSink):
         self._service.persist_from_execution_result(result)
 
     def stop(self) -> None:
-        pass
+        # Upload what a buffering backend still holds before the process exits.
+        self._service.flush()

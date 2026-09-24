@@ -16,11 +16,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
+from uuid import uuid4
 
 import gevent
 import google.cloud.storage as storage
 import pytz
 from google.api_core import retry
+from google.api_core.exceptions import PreconditionFailed
 from google.cloud.bigtable import row_filters, row_set
 from google.cloud.bigtable.row import Row
 from minio import Minio
@@ -394,10 +396,11 @@ _WRITER_ID_INVALID_CHARS = re.compile(r'[^A-Za-z0-9._-]')
 _OBJECT_SEQ = itertools.count()
 
 
-def _writer_id() -> str:
-    # Read the pid on every call so a store built before a fork still names objects per child.
+def _writer_id(token: str) -> str:
+    # A restarted container keeps its hostname and often its pid, and seq restarts at 0; the token keeps
+    # its names distinct. Read the pid on every call so a store built before a fork differs per child.
     host = os.environ.get('HOSTNAME') or socket.gethostname()
-    return _WRITER_ID_INVALID_CHARS.sub('_', f'{host}-{os.getpid()}')
+    return _WRITER_ID_INVALID_CHARS.sub('_', f'{host}-{os.getpid()}-{token}')
 
 
 def _object_prefix(day: str, slot: str) -> str:
@@ -463,6 +466,7 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
         self._client_factory = client_factory or (lambda: storage.Client(project=project_id))
         self._client: Optional[storage.Client] = None
         self._client_lock = threading.Lock()
+        self._writer_token = uuid4().hex[:8]
 
         self._lock = threading.Lock()
         self._batches: Dict[Tuple[str, str], _Batch] = {}
@@ -619,7 +623,7 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
         started = time.monotonic()
         batch.compressed += batch.compressor.flush()
         day, slot = batch.key
-        object_name = f'{_object_prefix(day, slot)}{_writer_id()}-{next(_OBJECT_SEQ):08d}.jsonl.gz'
+        object_name = f'{_object_prefix(day, slot)}{_writer_id(self._writer_token)}-{next(_OBJECT_SEQ):08d}.jsonl.gz'
         metadata = {
             'schema': '1',
             'n': str(batch.records),
@@ -633,11 +637,18 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
                 blob.metadata = metadata
                 blob.upload_from_string(body, content_type='application/gzip', if_generation_match=0)
                 break
+            except PreconditionFailed:
+                if attempt > 0:
+                    # Names are unique, so a 412 on a retry means an earlier attempt stored the object
+                    # and only its response was lost.
+                    logger.info(f'GCS object {object_name} already exists on retry; an earlier attempt stored it')
+                    break
+                # A 412 on the first attempt is a real name collision; retrying would hit it again.
+                self._drop_failed_upload(batch, object_name)
+                return
             except Exception:
                 if attempt == len(self._UPLOAD_RETRY_DELAYS_SECONDS):
-                    logger.exception(f'Failed to upload {batch.records} execution results to GCS object {object_name}')
-                    metrics.increment(f'{_BATCHED_METRIC}.flush_error', batch.records)
-                    metrics.increment(f'{_BATCHED_METRIC}.dropped_records', batch.records)
+                    self._drop_failed_upload(batch, object_name)
                     return
                 metrics.increment(f'{_BATCHED_METRIC}.upload_retry')
                 time.sleep(self._UPLOAD_RETRY_DELAYS_SECONDS[attempt])
@@ -647,6 +658,12 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
         metrics.histogram(f'{_BATCHED_METRIC}.flush.records', batch.records, tags=tags)
         metrics.histogram(f'{_BATCHED_METRIC}.flush.raw_bytes', batch.raw_bytes, tags=tags)
         metrics.histogram(f'{_BATCHED_METRIC}.flush.compressed_bytes', len(body), tags=tags)
+
+    @staticmethod
+    def _drop_failed_upload(batch: _Batch, object_name: str) -> None:
+        logger.exception(f'Failed to upload {batch.records} execution results to GCS object {object_name}')
+        metrics.increment(f'{_BATCHED_METRIC}.flush_error', batch.records)
+        metrics.increment(f'{_BATCHED_METRIC}.dropped_records', batch.records)
 
     def select_one(self, action_id: int) -> Optional[Dict[str, Any]]:
         results = self.select_many([action_id])

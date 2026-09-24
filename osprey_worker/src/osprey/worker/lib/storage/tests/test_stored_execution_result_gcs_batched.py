@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import pytest
+from google.api_core.exceptions import PreconditionFailed, ServiceUnavailable
 from osprey.worker.lib.singletons import CONFIG
 from osprey.worker.lib.storage import stored_execution_result
 from osprey.worker.lib.storage.stored_execution_result import StoredExecutionResultGCSBatched
@@ -38,6 +39,8 @@ class _FakeGCS:
         self.downloads: List[str] = []
         self.upload_threads: List[str] = []
         self.fail_uploads = False
+        # Store the next upload but raise as if its response was lost.
+        self.lose_next_response = False
         self.lock = threading.Lock()
 
 
@@ -54,8 +57,11 @@ class _FakeBlob:
             if self._gcs.fail_uploads:
                 raise RuntimeError('simulated GCS outage')
             if if_generation_match == 0 and self.name in self._gcs.objects:
-                raise RuntimeError(f'412 precondition failed: {self.name} exists')
+                raise PreconditionFailed(f'{self.name} exists')
             self._gcs.objects[self.name] = (data, dict(self.metadata or {}))
+            if self._gcs.lose_next_response:
+                self._gcs.lose_next_response = False
+                raise ServiceUnavailable('response lost after the write')
 
     def download_as_bytes(self) -> bytes:
         with self._gcs.lock:
@@ -259,10 +265,12 @@ def test_object_names_are_sanitized_and_seq_increments_without_overwrite(
     store.flush()
 
     first, second = _object_names(gcs)
-    pattern = r'^v1/20260924/1234/[A-Za-z0-9._-]+-\d{8}\.jsonl\.gz$'
-    assert re.match(pattern, first)
-    assert re.match(pattern, second)
-    assert first.startswith('v1/20260924/1234/pod_with_bad_chars-')
+    pattern = r'^v1/20260924/1234/(pod_with_bad_chars-\d+-[0-9a-f]{8})-\d{8}\.jsonl\.gz$'
+    first_match = re.match(pattern, first)
+    second_match = re.match(pattern, second)
+    assert first_match is not None and second_match is not None
+    # One store keeps one token, so only seq tells its objects apart.
+    assert first_match.group(1) == second_match.group(1)
     assert _seq(second) == _seq(first) + 1
     assert [metadata['n'] for _, metadata in gcs.objects.values()] == ['2', '2']
 
@@ -455,6 +463,44 @@ def test_upload_failure_drops_the_batch_and_counts_it(
     assert fake_metrics.total('.upload_retry') == 2
     assert fake_metrics.total('.dropped_records') == 3
     assert fake_metrics.total('.flush_error') == 3
+    assert fake_metrics.values('histogram', '.flush.records') == []
+
+
+def test_precondition_failed_on_retry_counts_as_stored(
+    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, fake_metrics: _FakeMetrics
+) -> None:
+    gcs.lose_next_response = True
+    store = make_store()
+    action_id = _action_id(_BASE)
+    _insert(store, action_id)
+    store.flush()
+
+    assert len(gcs.upload_threads) == 2
+    assert fake_metrics.total('.upload_retry') == 1
+    assert fake_metrics.total('.dropped_records') == 0
+    assert fake_metrics.total('.flush_error') == 0
+    assert fake_metrics.values('histogram', '.flush.records', 'reason:shutdown') == [1]
+    assert store.select_one(action_id) is not None
+
+
+def test_precondition_failed_on_first_attempt_drops_without_retry(
+    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    gcs: _FakeGCS,
+    fake_metrics: _FakeMetrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _collide(*_args: Any, **_kwargs: Any) -> None:
+        gcs.upload_threads.append(threading.current_thread().name)
+        raise PreconditionFailed('name collision')
+
+    monkeypatch.setattr(_FakeBlob, 'upload_from_string', _collide)
+    store = make_store()
+    _insert(store, _action_id(_BASE))
+    store.flush()
+
+    assert len(gcs.upload_threads) == 1
+    assert fake_metrics.total('.upload_retry') == 0
+    assert fake_metrics.total('.dropped_records') == 1
     assert fake_metrics.values('histogram', '.flush.records') == []
 
 

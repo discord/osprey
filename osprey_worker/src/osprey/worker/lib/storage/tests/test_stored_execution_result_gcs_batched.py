@@ -6,13 +6,13 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import pytest
 from google.api_core.exceptions import PreconditionFailed, ServiceUnavailable
 from osprey.worker.lib.singletons import CONFIG
 from osprey.worker.lib.storage import stored_execution_result
-from osprey.worker.lib.storage.stored_execution_result import StoredExecutionResultGCSBatched
+from osprey.worker.lib.storage.stored_execution_result import MAX_PENDING_BATCHES, StoredExecutionResultGCSBatched
 
 _EPOCH_MS = 1420070400000
 _METRIC = 'gcs_stored_execution_result_batched'
@@ -41,6 +41,10 @@ class _FakeGCS:
         self.fail_uploads = False
         # Store the next upload but raise as if its response was lost.
         self.lose_next_response = False
+        # Uploads wait on this gate; clear it to hold them.
+        self.upload_gate = threading.Event()
+        self.upload_gate.set()
+        self.fail_list_prefixes: Set[str] = set()
         self.lock = threading.Lock()
 
 
@@ -50,8 +54,19 @@ class _FakeBlob:
         self.name = name
         self.metadata = metadata
 
-    def upload_from_string(self, data: bytes, content_type: str, if_generation_match: Optional[int] = None) -> None:
+    def upload_from_string(
+        self,
+        data: bytes,
+        content_type: str,
+        if_generation_match: Optional[int] = None,
+        retry: Any = 'library default',
+        timeout: float = 60,
+    ) -> None:
         assert content_type == 'application/gzip'
+        # The store's loop must be the only retry, with a bounded per-request timeout.
+        assert retry is None
+        assert timeout == 30
+        assert self._gcs.upload_gate.wait(timeout=5)
         with self._gcs.lock:
             self._gcs.upload_threads.append(threading.current_thread().name)
             if self._gcs.fail_uploads:
@@ -101,6 +116,8 @@ class _FakeClient:
         assert fields == 'items(name,metadata),nextPageToken'
         with self._gcs.lock:
             self._gcs.listed_prefixes.append(prefix)
+            if prefix in self._gcs.fail_list_prefixes:
+                raise RuntimeError(f'simulated list failure for {prefix}')
             blobs = [
                 _FakeBlob(self._gcs, name, dict(metadata))
                 for name, (_, metadata) in sorted(self._gcs.objects.items())
@@ -243,7 +260,10 @@ def test_on_time_record_lands_under_its_floored_minute(
 
 
 def test_record_older_than_late_threshold_lands_under_late(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, clock: _FakeClock
+    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    gcs: _FakeGCS,
+    fake_metrics: _FakeMetrics,
+    clock: _FakeClock,
 ) -> None:
     store = make_store()
     clock.set(_BASE + timedelta(seconds=601))
@@ -252,6 +272,8 @@ def test_record_older_than_late_threshold_lands_under_late(
 
     (name,) = _object_names(gcs)
     assert name.startswith('v1/20260924/late/')
+    assert fake_metrics.total('.insert', 'slot:late') == 1
+    assert fake_metrics.total('.insert', 'slot:on_time') == 0
 
 
 def test_object_names_are_sanitized_and_seq_increments_without_overwrite(
@@ -433,6 +455,44 @@ def test_bloom_prefilter_downloads_only_candidate_objects(
     assert fake_metrics.total('.select.bloom_false_positives') == 0
 
 
+def test_unparseable_bloom_metadata_makes_only_that_blob_a_candidate(
+    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS
+) -> None:
+    store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=10)
+    for sequence in range(30):
+        _insert(store, _action_id(_BASE, sequence))
+    store.flush()
+    garbage_id = _action_id(_BASE, sequence=500)
+    garbage_line = json.dumps(
+        {'id': garbage_id, 'ts': _BASE.isoformat(), 'extracted_features': '{}', 'error_traces': '[]', 'action_data': ''}
+    )
+    garbage_name = 'v1/20260924/1234/other-writer-00000000.jsonl.gz'
+    gcs.objects[garbage_name] = (gzip.compress(garbage_line.encode()), {'bloom': 'not base64!!', 'bloom_k': '7'})
+
+    results = store.select_many([_action_id(_BASE, sequence=17), garbage_id])
+
+    assert {result['id'] for result in results} == {_action_id(_BASE, sequence=17), garbage_id}
+    # The garbage blob plus the one good blob whose filter matches.
+    assert len(gcs.downloads) == 2
+    assert garbage_name in gcs.downloads
+
+
+def test_list_failure_on_one_prefix_keeps_results_from_the_others(
+    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS
+) -> None:
+    store = make_store()
+    good_id = _action_id(_BASE)
+    unlistable_id = _action_id(_BASE + timedelta(minutes=1))
+    _insert(store, good_id)
+    _insert(store, unlistable_id)
+    store.flush()
+    gcs.fail_list_prefixes.add('v1/20260924/1235/')
+
+    results = store.select_many([good_id, unlistable_id])
+
+    assert [result['id'] for result in results] == [good_id]
+
+
 def test_duplicate_id_returns_the_latest_timestamp(make_store: Callable[..., StoredExecutionResultGCSBatched]) -> None:
     store = make_store()
     action_id = _action_id(_BASE)
@@ -502,6 +562,46 @@ def test_precondition_failed_on_first_attempt_drops_without_retry(
     assert fake_metrics.total('.upload_retry') == 0
     assert fake_metrics.total('.dropped_records') == 1
     assert fake_metrics.values('histogram', '.flush.records') == []
+
+
+def test_backlog_past_max_pending_batches_is_dropped(
+    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, fake_metrics: _FakeMetrics
+) -> None:
+    store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=1, OSPREY_GCS_EXECUTION_RESULTS_UPLOAD_THREADS=1)
+    gcs.upload_gate.clear()
+    # Each insert closes a one-record batch; the first MAX_PENDING_BATCHES fill the backlog.
+    for sequence in range(MAX_PENDING_BATCHES + 1):
+        _insert(store, _action_id(_BASE, sequence))
+    store._tick()
+
+    assert fake_metrics.last_gauge('.pending_batches') == MAX_PENDING_BATCHES
+    assert fake_metrics.total('.dropped_records') == 1
+    assert fake_metrics.total('.flush_error') == 1
+
+    gcs.upload_gate.set()
+    store.flush()
+
+    assert len(gcs.objects) == MAX_PENDING_BATCHES
+    assert fake_metrics.total('.dropped_records') == 1
+
+
+def test_unexpected_upload_error_is_counted_as_dropped(
+    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    gcs: _FakeGCS,
+    fake_metrics: _FakeMetrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _broken_writer_id(_token: str) -> str:
+        raise RuntimeError('simulated bug outside the retry loop')
+
+    monkeypatch.setattr(stored_execution_result, '_writer_id', _broken_writer_id)
+    store = make_store()
+    for sequence in range(2):
+        _insert(store, _action_id(_BASE, sequence))
+    store.flush()
+
+    assert gcs.objects == {}
+    assert fake_metrics.total('.dropped_records') == 2
 
 
 def test_object_metadata_stays_under_gcs_limit(

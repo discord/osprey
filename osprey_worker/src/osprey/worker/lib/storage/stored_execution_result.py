@@ -388,6 +388,10 @@ class StoredExecutionResultGCS(ExecutionResultStore):
         return execution_result_dict
 
 
+# Caps closed batches waiting on the uploader (about 100 MB at 3 MB each) so a GCS outage cannot grow
+# memory without bound; past it, new closes are dropped.
+MAX_PENDING_BATCHES = 32
+
 _BATCHED_METRIC = 'gcs_stored_execution_result_batched'
 _LATE_SLOT = 'late'
 _WRITER_ID_INVALID_CHARS = re.compile(r'[^A-Za-z0-9._-]')
@@ -597,22 +601,31 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
                     due.append((self._batches.pop(key), 'bucket_closed'))
             buffered_records = sum(batch.records for batch in self._batches.values())
             open_batches = len(self._batches)
+        with self._in_flight_lock:
+            pending_batches = len(self._in_flight)
         metrics.gauge(f'{_BATCHED_METRIC}.buffered_records', buffered_records)
         metrics.gauge(f'{_BATCHED_METRIC}.open_batches', open_batches)
+        metrics.gauge(f'{_BATCHED_METRIC}.pending_batches', pending_batches)
         for batch, reason in due:
             self._submit(batch, reason)
 
     def _submit(self, batch: _Batch, reason: str) -> None:
         # Never call this while holding self._lock: the future can finish before we return.
-        try:
-            future = self._uploader.submit(self._upload, batch, reason)
-        except RuntimeError:
-            # The uploader refuses work after close().
-            logger.error(f'Dropped {batch.records} execution results: the GCS uploader is shut down')
-            metrics.increment(f'{_BATCHED_METRIC}.dropped_records', batch.records)
-            return
         with self._in_flight_lock:
+            if len(self._in_flight) >= MAX_PENDING_BATCHES:
+                logger.error(f'Dropped {batch.records} execution results: {MAX_PENDING_BATCHES} batches await upload')
+                metrics.increment(f'{_BATCHED_METRIC}.flush_error', batch.records)
+                metrics.increment(f'{_BATCHED_METRIC}.dropped_records', batch.records)
+                return
+            try:
+                future = self._uploader.submit(self._upload, batch, reason)
+            except RuntimeError:
+                # The uploader refuses work after close().
+                logger.error(f'Dropped {batch.records} execution results: the GCS uploader is shut down')
+                metrics.increment(f'{_BATCHED_METRIC}.dropped_records', batch.records)
+                return
             self._in_flight.add(future)
+        # Outside the lock: if the future is already done, the callback runs here and takes the lock.
         future.add_done_callback(self._forget_upload)
 
     def _forget_upload(self, future: Future[None]) -> None:
@@ -620,6 +633,14 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
             self._in_flight.discard(future)
 
     def _upload(self, batch: _Batch, reason: str) -> None:
+        # Nobody reads the future's result, so an escaped exception would lose the batch silently.
+        try:
+            self._upload_batch(batch, reason)
+        except Exception:
+            logger.exception(f'Dropped {batch.records} execution results: unexpected error while uploading')
+            metrics.increment(f'{_BATCHED_METRIC}.dropped_records', batch.records)
+
+    def _upload_batch(self, batch: _Batch, reason: str) -> None:
         started = time.monotonic()
         batch.compressed += batch.compressor.flush()
         day, slot = batch.key
@@ -635,7 +656,11 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
             try:
                 blob = self._get_client().bucket(self._bucket_name).blob(object_name)
                 blob.metadata = metadata
-                blob.upload_from_string(body, content_type='application/gzip', if_generation_match=0)
+                # retry=None keeps this loop the only retry, so one attempt is one request and a 412 on
+                # the first attempt really is a collision.
+                blob.upload_from_string(
+                    body, content_type='application/gzip', if_generation_match=0, retry=None, timeout=30
+                )
                 break
             except PreconditionFailed:
                 if attempt > 0:
@@ -723,10 +748,13 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
 
     @staticmethod
     def _may_contain(metadata: Optional[Dict[str, str]], wanted: Set[int]) -> bool:
-        # An object without a filter could hold anything, so it stays a candidate.
+        # An object without a usable filter could hold anything, so it stays a candidate.
         if not metadata or 'bloom' not in metadata:
             return True
-        bloom = BloomFilter.from_bytes(base64.b64decode(metadata['bloom']), int(metadata['bloom_k']))
+        try:
+            bloom = BloomFilter.from_bytes(base64.b64decode(metadata['bloom']), int(metadata['bloom_k']))
+        except (KeyError, TypeError, ValueError):
+            return True
         return any(action_id in bloom for action_id in wanted)
 
     def _read_candidate(self, candidate: Tuple[Any, Set[int]]) -> List[Dict[str, Any]]:

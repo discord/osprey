@@ -27,13 +27,11 @@ def get_rules_execution_result_storage_backend(
     elif backend_type == ExecutionResultStorageBackendType.GCS:
         return StoredExecutionResultGCS()
     elif backend_type == ExecutionResultStorageBackendType.GCS_BATCHED:
-        store = StoredExecutionResultGCSBatched()
-        store.start()
-        return store
+        return StoredExecutionResultGCSBatched()
     elif backend_type == ExecutionResultStorageBackendType.ROUTING:
-        primary = StoredExecutionResultGCSBatched()
-        primary.start()
-        return RoutingExecutionResultStore.from_config(primary, StoredExecutionResultBigTable())
+        return RoutingExecutionResultStore.from_config(
+            StoredExecutionResultGCSBatched(), StoredExecutionResultBigTable()
+        )
     elif backend_type == ExecutionResultStorageBackendType.MINIO:
         endpoint = config.get_str('OSPREY_MINIO_ENDPOINT', 'minio:9000')
         access_key = config.get_str('OSPREY_MINIO_ACCESS_KEY', 'minioadmin')

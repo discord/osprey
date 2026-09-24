@@ -8,10 +8,14 @@ from osprey.worker._stdlibplugin import execution_result_store_chooser
 from osprey.worker.lib.singletons import CONFIG
 from osprey.worker.lib.storage import ExecutionResultStorageBackendType, stored_execution_result
 from osprey.worker.lib.storage.stored_execution_result import (
+    ExecutionResultReadError,
     ExecutionResultStore,
     RoutingExecutionResultStore,
+    StoredExecutionResultGCSBatched,
+    bootstrap_execution_result_storage_service,
     in_gcs_write_sample,
 )
+from osprey.worker.lib.storage.tests.test_stored_execution_result_gcs_batched import _FakeClient, _FakeGCS
 
 _EPOCH_MS = 1420070400000
 _METRIC = 'execution_result_routing'
@@ -42,6 +46,8 @@ class _FakeStore(ExecutionResultStore):
         self.flushes = 0
         self.fail_insert = False
         self.fail_select = False
+        # Raise a read error that carries the records found.
+        self.partial_select = False
 
     def insert(
         self,
@@ -69,7 +75,10 @@ class _FakeStore(ExecutionResultStore):
         self.selected.append(list(action_ids))
         if self.fail_select:
             raise RuntimeError('simulated select failure')
-        return [self.records[i] for i in action_ids if i in self.records]
+        found = [self.records[i] for i in action_ids if i in self.records]
+        if self.partial_select:
+            raise ExecutionResultReadError(partial_results=found, failed_prefixes=1)
+        return found
 
     def flush(self) -> None:
         self.flushes += 1
@@ -87,6 +96,9 @@ class _FakeMetrics:
 
     def increment(self, metric: str, value: float = 1, tags: Optional[List[str]] = None) -> None:
         self.events.append((metric, value, list(tags or [])))
+
+    # The real batched store also emits these; totals only read the routing metrics.
+    histogram = gauge = timing = increment
 
     @contextlib.contextmanager
     def timed(self, metric: str, tags: Optional[List[str]] = None) -> Iterator[None]:
@@ -301,6 +313,28 @@ def test_primary_select_failure_falls_back(primary: _FakeStore, legacy: _FakeSto
     assert fake_metrics.total('.read.gcs_expected_miss') == 0
 
 
+def test_partial_primary_read_keeps_its_results_and_falls_back_for_the_rest(
+    primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics
+) -> None:
+    primary.partial_select = True
+    in_gcs, unread = (_action_id(_NOW - timedelta(minutes=10), s) for s in range(2))
+    before = _action_id(_NOW - timedelta(hours=2))
+    primary.put(in_gcs, 'gcs')
+    for action_id in (in_gcs, unread, before):
+        legacy.put(action_id, 'legacy')
+    store = _routing(primary, legacy, cutover_id=_action_id(_NOW - timedelta(hours=1)))
+
+    results = store.select_many([in_gcs, unread, before])
+
+    assert [(r['id'], r['action_data']) for r in results] == [(in_gcs, 'gcs'), (unread, 'legacy'), (before, 'legacy')]
+    assert legacy.selected == [[unread, before]]
+    assert fake_metrics.total('.read.gcs_error') == 1
+    assert fake_metrics.total('.read.gcs_unexpected_miss') == 0
+    assert fake_metrics.total('.read.gcs_expected_miss') == 0
+    assert fake_metrics.total('.read.source', 'source:gcs') == 1
+    assert fake_metrics.total('.read.source', 'source:legacy') == 2
+
+
 def test_flush_reaches_both_stores(primary: _FakeStore, legacy: _FakeStore) -> None:
     _routing(primary, legacy).flush()
     assert (primary.flushes, legacy.flushes) == (1, 1)
@@ -346,10 +380,75 @@ def test_chooser_builds_routing_store(monkeypatch: pytest.MonkeyPatch, fake_metr
 
     assert isinstance(store, RoutingExecutionResultStore)
     [batched], [bigtable] = _FakeBatched.instances, _FakeBigTable.instances
-    assert batched.started
+    # The batched store starts its own timer on first insert.
+    assert not batched.started
     _insert(store, _OLD)
     assert list(batched.records) == [_OLD]
     assert bigtable.records == {}
+
+
+def test_chooser_builds_batched_store_without_starting_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_FakeBatched, 'instances', [])
+    monkeypatch.setattr(execution_result_store_chooser, 'StoredExecutionResultGCSBatched', _FakeBatched)
+
+    store = execution_result_store_chooser.get_rules_execution_result_storage_backend(
+        ExecutionResultStorageBackendType.GCS_BATCHED
+    )
+
+    [batched] = _FakeBatched.instances
+    assert store is batched
+    assert not batched.started
+
+
+def test_service_reads_the_real_batched_store_through_routing(
+    monkeypatch: pytest.MonkeyPatch, fake_metrics: _FakeMetrics
+) -> None:
+    gcs = _FakeGCS()
+    monkeypatch.setattr(stored_execution_result.storage, 'Client', lambda project: _FakeClient(gcs))
+    monkeypatch.setattr(_FakeBigTable, 'instances', [])
+    monkeypatch.setattr(execution_result_store_chooser, 'StoredExecutionResultBigTable', _FakeBigTable)
+    CONFIG.instance().unconfigure_for_tests()
+    CONFIG.instance().configure(
+        {
+            'SNOWFLAKE_EPOCH': _EPOCH_MS,
+            'OSPREY_EXECUTION_RESULT_STORAGE_BACKEND': 'routing',
+            'OSPREY_GCS_EXECUTION_RESULTS_BATCH_BUCKET': 'test-bucket',
+            'OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT': '100',
+        }
+    )
+
+    service = bootstrap_execution_result_storage_service()
+    routing = service._storage_backend
+    assert isinstance(routing, RoutingExecutionResultStore)
+    batched = routing._primary
+    assert isinstance(batched, StoredExecutionResultGCSBatched)
+    assert batched._timer_thread is None
+    try:
+        # Past the unexpected-miss age but not late, so the records land on time and a GCS miss would
+        # count as unexpected.
+        moment = datetime.now(timezone.utc) - timedelta(seconds=400)
+        ids = [_action_id(moment, sequence) for sequence in range(2)]
+        for action_id in ids:
+            routing.insert(action_id, '{"ActionName": "test"}', '[]', moment, '{}')
+        service.flush()
+        assert len(gcs.objects) == 1
+
+        assert sorted(result.id for result in service.get_many(ids)) == sorted(ids)
+        assert fake_metrics.total('.read.source', 'source:gcs') == 2
+
+        def _fail_list(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError('simulated GCS list outage')
+
+        monkeypatch.setattr(_FakeClient, 'list_blobs', _fail_list)
+
+        assert sorted(result.id for result in service.get_many(ids)) == sorted(ids)
+        assert fake_metrics.total('.read.gcs_error') == 1
+        assert fake_metrics.total('.read.gcs_unexpected_miss') == 0
+        assert fake_metrics.total('.read.source', 'source:legacy') == 2
+        [bigtable] = _FakeBigTable.instances
+        assert bigtable.selected == [ids]
+    finally:
+        batched.close()
 
 
 @pytest.mark.parametrize(

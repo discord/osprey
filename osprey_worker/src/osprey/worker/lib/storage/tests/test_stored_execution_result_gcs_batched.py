@@ -4,7 +4,7 @@ import json
 import random
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -12,7 +12,11 @@ import pytest
 from google.api_core.exceptions import PreconditionFailed, ServiceUnavailable
 from osprey.worker.lib.singletons import CONFIG
 from osprey.worker.lib.storage import stored_execution_result
-from osprey.worker.lib.storage.stored_execution_result import MAX_PENDING_BATCHES, StoredExecutionResultGCSBatched
+from osprey.worker.lib.storage.stored_execution_result import (
+    MAX_PENDING_BATCHES,
+    ExecutionResultReadError,
+    StoredExecutionResultGCSBatched,
+)
 
 _EPOCH_MS = 1420070400000
 _METRIC = 'gcs_stored_execution_result_batched'
@@ -271,7 +275,7 @@ def test_record_older_than_late_threshold_lands_under_late(
     store.flush()
 
     (name,) = _object_names(gcs)
-    assert name.startswith('v1/20260924/late/')
+    assert name.startswith('v1/20260924/late/12/')
     assert fake_metrics.total('.insert', 'slot:late') == 1
     assert fake_metrics.total('.insert', 'slot:on_time') == 0
 
@@ -334,7 +338,10 @@ def test_on_time_batch_closes_only_after_bucket_end_plus_grace(
     clock: _FakeClock,
 ) -> None:
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_CLOSE_GRACE_SECONDS=15)
-    _insert(store, _action_id(_BASE))
+    # Created early in the slot, so the batch is past the 60 s reopen floor before bucket end + grace.
+    action_time = datetime(2026, 9, 24, 12, 34, 5, tzinfo=timezone.utc)
+    clock.set(action_time + timedelta(seconds=5))
+    _insert(store, _action_id(action_time))
     bucket_end = datetime(2026, 9, 24, 12, 35, tzinfo=timezone.utc)
 
     clock.set(bucket_end + timedelta(seconds=14.9))
@@ -351,17 +358,20 @@ def test_on_time_batch_closes_only_after_bucket_end_plus_grace(
     assert fake_metrics.values('histogram', '.flush.records', 'reason:bucket_closed') == [1]
 
 
-def test_late_batch_closes_after_flush_tick(
+def test_reopened_slot_waits_for_the_minimum_age_before_closing(
     make_store: Callable[..., StoredExecutionResultGCSBatched],
     gcs: _FakeGCS,
     fake_metrics: _FakeMetrics,
     clock: _FakeClock,
 ) -> None:
-    store = make_store(OSPREY_GCS_EXECUTION_RESULTS_FLUSH_TICK_SECONDS=60)
-    created = _BASE + timedelta(seconds=700)
+    store = make_store(OSPREY_GCS_EXECUTION_RESULTS_CLOSE_GRACE_SECONDS=15)
+    # The 12:34 slot is already past bucket end + grace, but the record is not yet late.
+    created = datetime(2026, 9, 24, 12, 35, 30, tzinfo=timezone.utc)
     clock.set(created)
     _insert(store, _action_id(_BASE))
 
+    store._tick()
+    assert fake_metrics.last_gauge('.open_batches') == 1
     clock.set(created + timedelta(seconds=59.9))
     store._tick()
     assert fake_metrics.last_gauge('.open_batches') == 1
@@ -372,7 +382,32 @@ def test_late_batch_closes_after_flush_tick(
     store.flush()
 
     (name,) = _object_names(gcs)
-    assert name.startswith('v1/20260924/late/')
+    assert name.startswith('v1/20260924/1234/')
+    assert fake_metrics.values('histogram', '.flush.records', 'reason:bucket_closed') == [1]
+
+
+def test_late_batch_closes_after_default_flush_tick(
+    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    gcs: _FakeGCS,
+    fake_metrics: _FakeMetrics,
+    clock: _FakeClock,
+) -> None:
+    store = make_store()
+    created = _BASE + timedelta(seconds=700)
+    clock.set(created)
+    _insert(store, _action_id(_BASE))
+
+    clock.set(created + timedelta(seconds=299.9))
+    store._tick()
+    assert fake_metrics.last_gauge('.open_batches') == 1
+
+    clock.set(created + timedelta(seconds=300))
+    store._tick()
+    assert fake_metrics.last_gauge('.open_batches') == 0
+    store.flush()
+
+    (name,) = _object_names(gcs)
+    assert name.startswith('v1/20260924/late/12/')
     assert fake_metrics.values('histogram', '.flush.records', 'reason:tick') == [1]
 
 
@@ -414,20 +449,21 @@ def test_missing_id_returns_none(
     assert fake_metrics.total('.select.missing') == 1
 
 
-def test_reader_lists_minute_and_late_prefixes_and_finds_late_record(
+def test_reader_lists_minute_and_late_hour_prefixes_and_finds_late_records(
     make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, clock: _FakeClock
 ) -> None:
     store = make_store()
     clock.set(_BASE + timedelta(hours=2))
-    action_id = _action_id(_BASE)
-    _insert(store, action_id)
+    action_ids = [_action_id(_BASE), _action_id(_BASE + timedelta(minutes=1))]
+    for action_id in action_ids:
+        _insert(store, action_id)
     store.flush()
 
-    result = store.select_one(action_id)
+    results = store.select_many(action_ids)
 
-    assert result is not None
-    assert result['id'] == action_id
-    assert sorted(gcs.listed_prefixes) == ['v1/20260924/1234/', 'v1/20260924/late/']
+    assert sorted(result['id'] for result in results) == sorted(action_ids)
+    # Both ids share the 12:00 hour, so its late prefix is listed once.
+    assert sorted(gcs.listed_prefixes) == ['v1/20260924/1234/', 'v1/20260924/1235/', 'v1/20260924/late/12/']
 
 
 def test_bloom_prefilter_downloads_only_candidate_objects(
@@ -477,8 +513,8 @@ def test_unparseable_bloom_metadata_makes_only_that_blob_a_candidate(
     assert garbage_name in gcs.downloads
 
 
-def test_list_failure_on_one_prefix_keeps_results_from_the_others(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS
+def test_list_failure_raises_with_results_from_the_other_prefixes(
+    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, fake_metrics: _FakeMetrics
 ) -> None:
     store = make_store()
     good_id = _action_id(_BASE)
@@ -488,17 +524,47 @@ def test_list_failure_on_one_prefix_keeps_results_from_the_others(
     store.flush()
     gcs.fail_list_prefixes.add('v1/20260924/1235/')
 
-    results = store.select_many([good_id, unlistable_id])
+    with pytest.raises(ExecutionResultReadError) as raised:
+        store.select_many([good_id, unlistable_id])
 
-    assert [result['id'] for result in results] == [good_id]
+    assert [result['id'] for result in raised.value.partial_results] == [good_id]
+    assert raised.value.failed_prefixes == 1
+    assert fake_metrics.total('.select.found') == 1
+    assert fake_metrics.total('.select.missing') == 1
+
+
+def test_download_failure_raises_with_results_from_the_other_objects(
+    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = make_store()
+    good_id = _action_id(_BASE)
+    unreadable_id = _action_id(_BASE + timedelta(minutes=1))
+    _insert(store, good_id)
+    _insert(store, unreadable_id)
+    store.flush()
+    download = _FakeBlob.download_as_bytes
+
+    def _fail_1235(blob: _FakeBlob) -> bytes:
+        if blob.name.startswith('v1/20260924/1235/'):
+            raise RuntimeError('simulated download failure')
+        return download(blob)
+
+    monkeypatch.setattr(_FakeBlob, 'download_as_bytes', _fail_1235)
+
+    with pytest.raises(ExecutionResultReadError) as raised:
+        store.select_many([good_id, unreadable_id])
+
+    assert [result['id'] for result in raised.value.partial_results] == [good_id]
+    assert raised.value.failed_prefixes == 1
 
 
 def test_duplicate_id_returns_the_latest_timestamp(make_store: Callable[..., StoredExecutionResultGCSBatched]) -> None:
     store = make_store()
     action_id = _action_id(_BASE)
-    later = _BASE + timedelta(seconds=3)
-    # Write the later execution first so write order cannot decide the winner.
-    _insert(store, action_id, timestamp=later)
+    # A replay re-publishes the action stamped with a later publish time. Write it first so write order
+    # cannot decide the winner.
+    replayed_at = _BASE + timedelta(minutes=5)
+    _insert(store, action_id, timestamp=replayed_at, features='{"ActionName": "replay"}')
     store.flush()
     _insert(store, action_id, timestamp=_BASE)
     store.flush()
@@ -506,7 +572,25 @@ def test_duplicate_id_returns_the_latest_timestamp(make_store: Callable[..., Sto
     results = store.select_many([action_id])
 
     assert len(results) == 1
-    assert results[0]['timestamp'] == later
+    assert results[0]['timestamp'] == replayed_at
+    assert results[0]['extracted_features'] == '{"ActionName": "replay"}'
+
+
+def test_duplicate_id_with_equal_timestamp_returns_one_record(
+    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS
+) -> None:
+    store = make_store()
+    action_id = _action_id(_BASE)
+    # A re-execution keeps the action timestamp, so both copies carry the same `ts`.
+    for _ in range(2):
+        _insert(store, action_id)
+        store.flush()
+    assert len(gcs.objects) == 2
+
+    results = store.select_many([action_id])
+
+    assert len(results) == 1
+    assert results[0]['id'] == action_id
 
 
 def test_upload_failure_drops_the_batch_and_counts_it(
@@ -660,4 +744,44 @@ def test_start_is_idempotent_and_close_uploads_open_batches(
     store.close()
 
     assert not thread.is_alive()
+    assert len(gcs.objects) == 1
+
+
+def test_constructing_a_store_starts_no_thread_and_the_first_insert_starts_the_timer(
+    make_store: Callable[..., StoredExecutionResultGCSBatched],
+) -> None:
+    before = set(threading.enumerate())
+    store = make_store()
+    assert set(threading.enumerate()) - before == set()
+    assert store._timer_thread is None
+
+    _insert(store, _action_id(_BASE))
+
+    timer = store._timer_thread
+    assert timer is not None and timer.is_alive()
+    assert timer in set(threading.enumerate()) - before
+
+
+def test_close_cancels_queued_uploads_and_counts_them_as_dropped(
+    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    gcs: _FakeGCS,
+    fake_metrics: _FakeMetrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=1, OSPREY_GCS_EXECUTION_RESULTS_UPLOAD_THREADS=1)
+    gcs.upload_gate.clear()
+    # One upload runs and waits at the gate; the other two stay queued.
+    for sequence in range(3):
+        _insert(store, _action_id(_BASE, sequence))
+    uploads = list(store._in_flight)
+    monkeypatch.setattr(store, 'flush', lambda: StoredExecutionResultGCSBatched.flush(store, timeout=0.1))
+
+    store.close()
+
+    assert fake_metrics.total('.dropped_records') == 2
+    assert [upload.cancelled() for upload in uploads] == [False, True, True]
+    assert store._in_flight.keys() == {uploads[0]}
+    gcs.upload_gate.set()
+    # Only the running upload can finish; wait() never sees a cancel()led future as done.
+    wait(uploads[:1], timeout=5)
     assert len(gcs.objects) == 1

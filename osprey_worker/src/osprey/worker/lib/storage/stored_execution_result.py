@@ -49,6 +49,18 @@ GCS_CONCURRENCY_LIMIT = 100
 MINIO_CONCURRENCY_LIMIT = 100
 
 
+class ExecutionResultReadError(Exception):
+    """A read found what it could, but some objects or prefixes could not be read.
+
+    `partial_results` holds the records that were read. A missing id may still exist in the store.
+    """
+
+    def __init__(self, partial_results: List[Dict[str, Any]], failed_prefixes: int) -> None:
+        super().__init__(f'{failed_prefixes} list or download calls failed')
+        self.partial_results = partial_results
+        self.failed_prefixes = failed_prefixes
+
+
 class ExecutionResultStore(ABC):
     """Abstract base class for execution result storage backends."""
 
@@ -393,9 +405,13 @@ class StoredExecutionResultGCS(ExecutionResultStore):
         return execution_result_dict
 
 
-# Caps closed batches waiting on the uploader (about 100 MB at 3 MB each) so a GCS outage cannot grow
-# memory without bound; past it, new closes are dropped.
+# Caps closed batches waiting on the uploader so a GCS outage cannot grow memory without bound; past it,
+# new closes are dropped. The hard bound is MAX_PENDING_BATCHES x MAX_COMPRESSED_BYTES (512 MiB at the
+# defaults) plus the open batches. Typical use is far lower, because most batches close by time or count.
 MAX_PENDING_BATCHES = 32
+# An on-time batch lives at least this long. Records that lag past their slot's close re-open it, and
+# without this floor that batch would close, and upload a tiny object, on every tick.
+REOPEN_MIN_AGE_SECONDS = 60
 
 _BATCHED_METRIC = 'gcs_stored_execution_result_batched'
 _LATE_SLOT = 'late'
@@ -416,6 +432,11 @@ def _object_prefix(day: str, slot: str) -> str:
     return f'v1/{day}/{slot}/'
 
 
+def _late_slot(hhmm: str) -> str:
+    # Split a day's late objects by snowflake hour, so a read lists one hour rather than the whole day.
+    return f'{_LATE_SLOT}/{hhmm[:2]}'
+
+
 @dataclass
 class _Batch:
     key: Tuple[str, str]
@@ -433,9 +454,9 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
     """Buffers execution results in-process and writes them to GCS as gzip JSON-lines bundles.
 
     Objects live under `v1/{YYYYMMDD}/{HHMM}/` (the action id's snowflake time, floored to the bucket
-    width) or under `v1/{YYYYMMDD}/late/` when the action is older than the late threshold. Each object
-    carries a Bloom filter of its ids in custom metadata, so a reader finds a record from the id alone:
-    list two prefixes, download only the objects whose filter matches.
+    width) or under `v1/{YYYYMMDD}/late/{HH}/` (the snowflake hour) when the action is older than the late
+    threshold. Each object carries a Bloom filter of its ids in custom metadata, so a reader finds a
+    record from the id alone: list two prefixes, download only the objects whose filter matches.
 
     A write is not durable or readable until its batch uploads. A crash loses the open batches, the
     same trade-off as a dropped write in `StoredExecutionResultGCS.insert()`.
@@ -459,6 +480,7 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
         if config.get_int('SNOWFLAKE_EPOCH', 0) == 0:
             raise ValueError('SNOWFLAKE_EPOCH must be set and non-zero to use StoredExecutionResultGCSBatched')
         self._bucket_name = config.expect_str('OSPREY_GCS_EXECUTION_RESULTS_BATCH_BUCKET')
+        # Writer and reader must use the same width; changing it orphans existing objects for reads.
         self._bucket_width_minutes = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_BUCKET_WIDTH_MINUTES', 1)
         if self._bucket_width_minutes <= 0 or 60 % self._bucket_width_minutes != 0:
             raise ValueError('OSPREY_GCS_EXECUTION_RESULTS_BUCKET_WIDTH_MINUTES must divide 60')
@@ -466,7 +488,7 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
         self._max_compressed_bytes = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_MAX_COMPRESSED_BYTES', 16777216)
         self._close_grace_seconds = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_CLOSE_GRACE_SECONDS', 15)
         self._late_threshold_seconds = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_LATE_THRESHOLD_SECONDS', 600)
-        self._flush_tick_seconds = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_FLUSH_TICK_SECONDS', 60)
+        self._flush_tick_seconds = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_FLUSH_TICK_SECONDS', 300)
         upload_threads = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_UPLOAD_THREADS', 2)
         self._read_threads = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_READ_THREADS', 16)
         project_id = config.get_str('OSPREY_GCP_PROJECT_ID', 'osprey-dev')
@@ -480,7 +502,8 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
         self._lock = threading.Lock()
         self._batches: Dict[Tuple[str, str], _Batch] = {}
         self._uploader = ThreadPoolExecutor(max_workers=upload_threads, thread_name_prefix='gcs-batched-upload')
-        self._in_flight: Set[Future[None]] = set()
+        # Queued and running uploads, mapped to their record counts.
+        self._in_flight: Dict[Future[None], int] = {}
         self._in_flight_lock = threading.Lock()
         self._timer_thread: Optional[threading.Thread] = None
         self._stop_timer = threading.Event()
@@ -519,7 +542,7 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
             now = self._clock()
             day, hhmm, bucket_end = self._on_time_slot(snowflake_seconds)
             late = now - snowflake_seconds > self._late_threshold_seconds
-            key = (day, _LATE_SLOT if late else hhmm)
+            key = (day, _late_slot(hhmm) if late else hhmm)
             line = (
                 json.dumps(
                     {
@@ -535,6 +558,9 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
 
             closed: Optional[Tuple[_Batch, str]] = None
             with self._lock:
+                # Start the timer on first use, so building a store (ui-api, chooser probes) starts no thread.
+                if self._timer_thread is None:
+                    self._start_timer_locked()
                 batch = self._batches.get(key)
                 if batch is None:
                     batch = _Batch(key=key, created_at=now, bucket_end=None if late else bucket_end)
@@ -556,7 +582,11 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
             metrics.increment(f'{_BATCHED_METRIC}.dropped_records')
 
     def start(self) -> None:
-        """Starts the daemon thread that closes due batches. Idempotent."""
+        """Starts the daemon thread that closes due batches. Idempotent; the first insert also calls it."""
+        with self._lock:
+            self._start_timer_locked()
+
+    def _start_timer_locked(self) -> None:
         if self._timer_thread is not None:
             return
         self._stop_timer.clear()
@@ -565,13 +595,22 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
 
     def close(self) -> None:
         """Stops the timer, uploads every open batch, and shuts the uploader down."""
-        if self._timer_thread is not None:
+        with self._lock:
+            timer_thread, self._timer_thread = self._timer_thread, None
+        if timer_thread is not None:
+            # Join outside the lock: a running tick takes it.
             self._stop_timer.set()
-            self._timer_thread.join()
-            self._timer_thread = None
+            timer_thread.join()
         self.flush()
-        # flush() already bounded the wait; do not block again on uploads that overran it.
-        self._uploader.shutdown(wait=False)
+        # flush() already bounded the wait. Cancel the uploads still queued so interpreter exit does not
+        # block on them, and count their records as dropped.
+        with self._in_flight_lock:
+            in_flight = list(self._in_flight.items())
+        cancelled_records = sum(records for future, records in in_flight if future.cancel())
+        self._uploader.shutdown(wait=False, cancel_futures=True)
+        if cancelled_records:
+            logger.error(f'Dropped {cancelled_records} execution results: their uploads were still queued at close')
+            metrics.increment(f'{_BATCHED_METRIC}.dropped_records', cancelled_records)
 
     def flush(self, timeout: float = 25.0) -> None:
         """Uploads every open batch and waits up to `timeout` for all in-flight uploads."""
@@ -602,7 +641,9 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
                 if batch.bucket_end is None:
                     if now - batch.created_at >= self._flush_tick_seconds:
                         due.append((self._batches.pop(key), 'tick'))
-                elif now >= batch.bucket_end + self._close_grace_seconds:
+                elif now >= max(
+                    batch.bucket_end + self._close_grace_seconds, batch.created_at + REOPEN_MIN_AGE_SECONDS
+                ):
                     due.append((self._batches.pop(key), 'bucket_closed'))
             buffered_records = sum(batch.records for batch in self._batches.values())
             open_batches = len(self._batches)
@@ -629,13 +670,13 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
                 logger.error(f'Dropped {batch.records} execution results: the GCS uploader is shut down')
                 metrics.increment(f'{_BATCHED_METRIC}.dropped_records', batch.records)
                 return
-            self._in_flight.add(future)
+            self._in_flight[future] = batch.records
         # Outside the lock: if the future is already done, the callback runs here and takes the lock.
         future.add_done_callback(self._forget_upload)
 
     def _forget_upload(self, future: Future[None]) -> None:
         with self._in_flight_lock:
-            self._in_flight.discard(future)
+            self._in_flight.pop(future, None)
 
     def _upload(self, batch: _Batch, reason: str) -> None:
         # Nobody reads the future's result, so an escaped exception would lose the batch silently.
@@ -705,33 +746,42 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
 
         with metrics.timed(f'{_BATCHED_METRIC}.select.duration'):
             # The writer's clock decides on-time vs late, so the reader checks both. The late prefix
-            # covers a whole day and collects every wanted id from that day.
+            # covers the id's snowflake hour and collects every wanted id from that hour.
             wanted_by_prefix: Dict[str, Set[int]] = {}
             for action_id in action_ids:
                 day, hhmm, _ = self._on_time_slot(Snowflake(action_id).to_timestamp())
-                for slot in (hhmm, _LATE_SLOT):
+                for slot in (hhmm, _late_slot(hhmm)):
                     wanted_by_prefix.setdefault(_object_prefix(day, slot), set()).add(action_id)
 
             found: Dict[int, Dict[str, Any]] = {}
+            failures = 0
             with ThreadPoolExecutor(max_workers=self._read_threads) as pool:
-                candidates = [
-                    candidate
-                    for listed in pool.map(self._list_candidates, wanted_by_prefix.items())
-                    for candidate in listed
-                ]
+                candidates: List[Tuple[Any, Set[int]]] = []
+                for listed in pool.map(self._list_candidates, wanted_by_prefix.items()):
+                    if listed is None:
+                        failures += 1
+                    else:
+                        candidates.extend(listed)
                 metrics.increment(f'{_BATCHED_METRIC}.select.candidates', len(candidates))
                 for records in pool.map(self._read_candidate, candidates):
+                    if records is None:
+                        failures += 1
+                        continue
                     for record in records:
                         current = found.get(record['id'])
-                        # A retried action can land twice; the latest execution wins.
+                        # A record can land twice (a retried upload or a replay). `ts` is the action
+                        # timestamp, so equal `ts` keeps the first copy seen and a later `ts` wins.
                         if current is None or record['timestamp'] > current['timestamp']:
                             found[record['id']] = record
 
             metrics.increment(f'{_BATCHED_METRIC}.select.found', len(found))
             metrics.increment(f'{_BATCHED_METRIC}.select.missing', len(set(action_ids)) - len(found))
-            return list(found.values())
+        results = list(found.values())
+        if failures:
+            raise ExecutionResultReadError(partial_results=results, failed_prefixes=failures)
+        return results
 
-    def _list_candidates(self, prefix_and_wanted: Tuple[str, Set[int]]) -> List[Tuple[Any, Set[int]]]:
+    def _list_candidates(self, prefix_and_wanted: Tuple[str, Set[int]]) -> Optional[List[Tuple[Any, Set[int]]]]:
         prefix, wanted = prefix_and_wanted
         candidates: List[Tuple[Any, Set[int]]] = []
         try:
@@ -748,7 +798,7 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
                 metrics.increment(f'{_BATCHED_METRIC}.select.objects_listed', listed)
         except Exception:
             logger.exception(f'Failed to list batched execution results under GCS prefix {prefix}')
-            return []
+            return None
         return candidates
 
     @staticmethod
@@ -762,7 +812,7 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
             return True
         return any(action_id in bloom for action_id in wanted)
 
-    def _read_candidate(self, candidate: Tuple[Any, Set[int]]) -> List[Dict[str, Any]]:
+    def _read_candidate(self, candidate: Tuple[Any, Set[int]]) -> Optional[List[Dict[str, Any]]]:
         blob, wanted = candidate
         records: List[Dict[str, Any]] = []
         try:
@@ -782,7 +832,7 @@ class StoredExecutionResultGCSBatched(ExecutionResultStore):
                     )
         except Exception:
             logger.exception(f'Failed to read batched execution results from GCS object {blob.name}')
-            return []
+            return None
         if not records:
             metrics.increment(f'{_BATCHED_METRIC}.select.bloom_false_positives')
         return records
@@ -984,11 +1034,16 @@ class RoutingExecutionResultStore(ExecutionResultStore):
     system of record. Reads try the primary for ids at or above `cutover_id` and fall back to the legacy
     store. Primary failures never propagate; legacy failures do, so the sink keeps its retry semantics.
 
+    `write target:gcs outcome:error` cannot fire for the batched store, because its `insert` never
+    raises. `gcs_stored_execution_result_batched.dropped_records` is the write-failure signal.
+
     The miss metrics use the reader's current percent, so operate a ramp this way. At every increase of
     `OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT`, set `OSPREY_EXECUTION_RESULT_ROUTING_CUTOVER_ID` to a
-    current snowflake. This is safe while legacy write and legacy read fallback stay on. Change the
-    percent on the worker and the ui-api together. Otherwise `gcs_unexpected_miss` over-counts (percent
-    raised without a new cutover) or under-counts (ui-api percent lags the worker).
+    snowflake minted after the new percent is live on every worker. This is safe while legacy write and
+    legacy read fallback stay on. Once legacy read fallback is off, ids below the cutover are unreadable
+    even if GCS holds them. Change the percent on the worker and the ui-api together. Otherwise
+    `gcs_unexpected_miss` over-counts (percent raised without a new cutover) or under-counts (ui-api
+    percent lags the worker).
     """
 
     def __init__(
@@ -1086,6 +1141,16 @@ class RoutingExecutionResultStore(ExecutionResultStore):
             try:
                 with metrics.timed(f'{_ROUTING_METRIC}.read.duration', tags=['backend:gcs']):
                     found = {record['id']: record for record in self._primary.select_many(eligible)}
+            except ExecutionResultReadError as e:
+                # Keep what the primary read; the ids it could not read go to legacy below. The store
+                # already logged each failure with its traceback.
+                logger.warning(
+                    f'Read {len(e.partial_results)} of {len(eligible)} execution results from GCS; '
+                    f'{e.failed_prefixes} list or download calls failed'
+                )
+                metrics.increment(f'{_ROUTING_METRIC}.read.gcs_error')
+                found = {record['id']: record for record in e.partial_results}
+                primary_failed = True
             except Exception:
                 logger.exception(f'Failed to read {len(eligible)} execution results from GCS')
                 metrics.increment(f'{_ROUTING_METRIC}.read.gcs_error')

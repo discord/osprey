@@ -36,8 +36,30 @@ def _handle_exception(e: HTTPException) -> Response:
 
 
 def _register_with_prefix(app, blueprint):
+    """Serve every view of `blueprint` both bare and under /api.
+
+    Flask <2.1 let us register the same blueprint object twice under one name, so both
+    paths resolved to the SAME `request.endpoint`. Flask 2.1+ rejects the duplicate name.
+    Giving the /api copy its own `name=` satisfies that, but renames the endpoint for
+    every /api route, silently breaking anything keyed on `request.endpoint` -- audit /
+    exemption lookups and ddtrace span resource names among them.
+
+    So register once, then mirror each of the blueprint's rules under /api reusing the
+    same endpoint and view function. `add_url_rule` permits a repeated endpoint as long
+    as the view function is identical, and this keeps the served URL set, `url_for()`
+    output and `request.endpoint` byte-identical to the Flask 1.x behaviour.
+    """
+    known = {rule.endpoint for rule in app.url_map.iter_rules()}
     app.register_blueprint(blueprint)
-    app.register_blueprint(blueprint, url_prefix='/api')
+    for rule in [r for r in list(app.url_map.iter_rules()) if r.endpoint not in known]:
+        app.add_url_rule(
+            f'/api{rule.rule}',
+            endpoint=rule.endpoint,
+            view_func=app.view_functions[rule.endpoint],
+            methods=sorted(rule.methods - {'HEAD', 'OPTIONS'}),
+            defaults=rule.defaults,
+            strict_slashes=rule.strict_slashes,
+        )
 
 
 def health() -> Union[str, Tuple[str, int]]:

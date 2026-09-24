@@ -67,9 +67,9 @@ class TraceMiddleware:
         # Add exception handling signals. This will annotate exceptions that
         # are caught and handled in custom user code.
         # See https://github.com/DataDog/dd-trace-py/issues/390
-        if use_signals and not signals.signals_available:
-            log.debug(_blinker_not_installed_msg)
-        self.use_signals = use_signals and signals.signals_available
+        # `self.use_signals` is already set above. Flask 3.0 made blinker a hard dependency
+        # and dropped `signals.signals_available`, so there is no longer anything to
+        # feature-detect here -- signals are always available.
         timing_signals = {
             'got_request_exception': self._request_exception,
         }
@@ -290,7 +290,8 @@ def _patch_render(tracer: Tracer) -> None:
     # fall back to patching  global method
     _render = flask.templating._render  # type: ignore[attr-defined]
 
-    def _traced_render(template: Any, context: Any, app: Flask) -> Any:
+    # Flask 2.2 reordered `_render` from (template, context, app) to (app, template, context).
+    def _traced_render(app: Flask, template: Any, context: Any) -> Any:
         # python-upgrade-compat: span_type has a different type in the later version of ddtrace
         if sys.version_info < (3, 11):
             span_type = SpanTypes.TEMPLATE.value
@@ -298,7 +299,7 @@ def _patch_render(tracer: Tracer) -> None:
             span_type = SpanTypes.TEMPLATE
         with tracer.trace('flask.template', span_type=span_type) as span:
             span.set_tag('flask.template', template.name or 'string')
-            return _render(template, context, app)
+            return _render(app, template, context)
 
     flask.templating._render = _traced_render  # type: ignore[attr-defined]
 
@@ -306,6 +307,3 @@ def _patch_render(tracer: Tracer) -> None:
 def _signals_exist(names: Dict[str, Callable[[Any, Any], None]]) -> bool:
     """Return true if all of the given signals exist in this version of flask."""
     return all(getattr(signals, n, False) for n in names)
-
-
-_blinker_not_installed_msg = 'please install blinker to use flask signals. http://flask.pocoo.org/docs/0.11/signals/'

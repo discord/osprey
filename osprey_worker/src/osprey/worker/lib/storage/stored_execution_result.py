@@ -1007,7 +1007,7 @@ class StoredExecutionResultPostgres(ExecutionResultStore):
         return execution_result_dict
 
 
-_ROUTING_METRIC = 'execution_result_routing'
+_GCS_MIGRATION_METRIC = 'execution_result_gcs_migration'
 # The batched writer closes a slot about 15 s after it ends, then uploads. A sampled id older than this
 # should be readable, so a miss means lost or unreadable data rather than a write still in the buffer.
 _UNEXPECTED_MISS_AGE_SECONDS = 300
@@ -1027,7 +1027,7 @@ def in_gcs_write_sample(action_id: int, percent: float) -> bool:
     return int.from_bytes(digest, 'big') % 10000 < int(percent * 100)
 
 
-class RoutingExecutionResultStore(ExecutionResultStore):
+class StoredExecutionResultGCSMigration(ExecutionResultStore):
     """Moves execution results from a legacy store (BigTable) to a primary store (batched GCS) in steps.
 
     Writes go to the primary for a percent of action ids and to the legacy store while it stays the
@@ -1038,7 +1038,7 @@ class RoutingExecutionResultStore(ExecutionResultStore):
     raises. `gcs_stored_execution_result_batched.dropped_records` is the write-failure signal.
 
     The miss metrics use the reader's current percent, so operate a ramp this way. At every increase of
-    `OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT`, set `OSPREY_EXECUTION_RESULT_ROUTING_CUTOVER_ID` to a
+    `OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT`, set `OSPREY_EXECUTION_RESULT_GCS_CUTOVER_ID` to a
     snowflake minted after the new percent is live on every worker. This is safe while legacy write and
     legacy read fallback stay on. Once legacy read fallback is off, ids below the cutover are unreadable
     even if GCS holds them. Change the percent on the worker and the ui-api together. Otherwise
@@ -1065,7 +1065,9 @@ class RoutingExecutionResultStore(ExecutionResultStore):
         self._clock = clock
 
     @classmethod
-    def from_config(cls, primary: ExecutionResultStore, legacy: ExecutionResultStore) -> RoutingExecutionResultStore:
+    def from_config(
+        cls, primary: ExecutionResultStore, legacy: ExecutionResultStore
+    ) -> StoredExecutionResultGCSMigration:
         from osprey.worker.lib.singletons import CONFIG
 
         config = CONFIG.instance()
@@ -1082,7 +1084,7 @@ class RoutingExecutionResultStore(ExecutionResultStore):
             gcs_write_percent=gcs_write_percent,
             legacy_write_enabled=legacy_write_enabled,
             legacy_read_fallback=config.get_bool('OSPREY_EXECUTION_RESULT_LEGACY_READ_FALLBACK', True),
-            cutover_id=config.get_int('OSPREY_EXECUTION_RESULT_ROUTING_CUTOVER_ID', 0),
+            cutover_id=config.get_int('OSPREY_EXECUTION_RESULT_GCS_CUTOVER_ID', 0),
         )
 
     def insert(
@@ -1107,7 +1109,7 @@ class RoutingExecutionResultStore(ExecutionResultStore):
             except Exception:
                 logger.exception(f'Failed to write execution result {action_id} to GCS')
                 outcome = 'error'
-        metrics.increment(f'{_ROUTING_METRIC}.write', tags=['target:gcs', f'outcome:{outcome}'])
+        metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:gcs', f'outcome:{outcome}'])
 
         if not self._legacy_write_enabled:
             return
@@ -1120,9 +1122,9 @@ class RoutingExecutionResultStore(ExecutionResultStore):
                 action_data_json=action_data_json,
             )
         except Exception:
-            metrics.increment(f'{_ROUTING_METRIC}.write', tags=['target:legacy', 'outcome:error'])
+            metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:legacy', 'outcome:error'])
             raise
-        metrics.increment(f'{_ROUTING_METRIC}.write', tags=['target:legacy', 'outcome:ok'])
+        metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:legacy', 'outcome:ok'])
 
     def select_one(self, action_id: int) -> Optional[Dict[str, Any]]:
         results = self.select_many([action_id])
@@ -1139,7 +1141,7 @@ class RoutingExecutionResultStore(ExecutionResultStore):
         primary_failed = False
         if eligible:
             try:
-                with metrics.timed(f'{_ROUTING_METRIC}.read.duration', tags=['backend:gcs']):
+                with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:gcs']):
                     found = {record['id']: record for record in self._primary.select_many(eligible)}
             except ExecutionResultReadError as e:
                 # Keep what the primary read; the ids it could not read go to legacy below. The store
@@ -1148,12 +1150,12 @@ class RoutingExecutionResultStore(ExecutionResultStore):
                     f'Read {len(e.partial_results)} of {len(eligible)} execution results from GCS; '
                     f'{e.failed_prefixes} list or download calls failed'
                 )
-                metrics.increment(f'{_ROUTING_METRIC}.read.gcs_error')
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_error')
                 found = {record['id']: record for record in e.partial_results}
                 primary_failed = True
             except Exception:
                 logger.exception(f'Failed to read {len(eligible)} execution results from GCS')
-                metrics.increment(f'{_ROUTING_METRIC}.read.gcs_error')
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_error')
                 primary_failed = True
 
         misses = [i for i in eligible if i not in found]
@@ -1167,13 +1169,13 @@ class RoutingExecutionResultStore(ExecutionResultStore):
                 and now - Snowflake(i).to_timestamp() > _UNEXPECTED_MISS_AGE_SECONDS
             )
             if unexpected:
-                metrics.increment(f'{_ROUTING_METRIC}.read.gcs_unexpected_miss', unexpected)
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_unexpected_miss', unexpected)
             if len(misses) > unexpected:
-                metrics.increment(f'{_ROUTING_METRIC}.read.gcs_expected_miss', len(misses) - unexpected)
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_expected_miss', len(misses) - unexpected)
 
         fallback: Dict[int, Dict[str, Any]] = {}
         if self._legacy_read_fallback and (misses or ineligible):
-            with metrics.timed(f'{_ROUTING_METRIC}.read.duration', tags=['backend:legacy']):
+            with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:legacy']):
                 fallback = {record['id']: record for record in self._legacy.select_many(misses + ineligible)}
 
         results: List[Dict[str, Any]] = []
@@ -1190,7 +1192,7 @@ class RoutingExecutionResultStore(ExecutionResultStore):
                 sources['miss'] += 1
         for source, count in sources.items():
             if count:
-                metrics.increment(f'{_ROUTING_METRIC}.read.source', count, tags=[f'source:{source}'])
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.source', count, tags=[f'source:{source}'])
         return results
 
     def flush(self) -> None:

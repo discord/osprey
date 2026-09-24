@@ -10,15 +10,15 @@ from osprey.worker.lib.storage import ExecutionResultStorageBackendType, stored_
 from osprey.worker.lib.storage.stored_execution_result import (
     ExecutionResultReadError,
     ExecutionResultStore,
-    RoutingExecutionResultStore,
     StoredExecutionResultGCSBatched,
+    StoredExecutionResultGCSMigration,
     bootstrap_execution_result_storage_service,
     in_gcs_write_sample,
 )
 from osprey.worker.lib.storage.tests.test_stored_execution_result_gcs_batched import _FakeClient, _FakeGCS
 
 _EPOCH_MS = 1420070400000
-_METRIC = 'execution_result_routing'
+_METRIC = 'execution_result_gcs_migration'
 _NOW = datetime(2026, 9, 24, 12, 34, 20, tzinfo=timezone.utc)
 
 
@@ -97,7 +97,7 @@ class _FakeMetrics:
     def increment(self, metric: str, value: float = 1, tags: Optional[List[str]] = None) -> None:
         self.events.append((metric, value, list(tags or [])))
 
-    # The real batched store also emits these; totals only read the routing metrics.
+    # The real batched store also emits these; totals only read the gcs migration metrics.
     histogram = gauge = timing = increment
 
     @contextlib.contextmanager
@@ -142,15 +142,15 @@ def legacy() -> _FakeStore:
     return _FakeStore()
 
 
-def _routing(
+def _gcs_migration_store(
     primary: _FakeStore,
     legacy: _FakeStore,
     gcs_write_percent: float = 100.0,
     legacy_write_enabled: bool = True,
     legacy_read_fallback: bool = True,
     cutover_id: int = 0,
-) -> RoutingExecutionResultStore:
-    return RoutingExecutionResultStore(
+) -> StoredExecutionResultGCSMigration:
+    return StoredExecutionResultGCSMigration(
         primary,
         legacy,
         gcs_write_percent=gcs_write_percent,
@@ -186,7 +186,7 @@ def test_sample_golden_vectors() -> None:
 def test_insert_at_zero_percent_writes_legacy_only(
     primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics
 ) -> None:
-    _insert(_routing(primary, legacy, gcs_write_percent=0), _OLD)
+    _insert(_gcs_migration_store(primary, legacy, gcs_write_percent=0), _OLD)
     assert primary.records == {}
     assert list(legacy.records) == [_OLD]
     assert fake_metrics.total('.write', 'target:gcs', 'outcome:skipped') == 1
@@ -196,7 +196,7 @@ def test_insert_at_zero_percent_writes_legacy_only(
 def test_insert_at_full_percent_writes_both(
     primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics
 ) -> None:
-    _insert(_routing(primary, legacy), _OLD)
+    _insert(_gcs_migration_store(primary, legacy), _OLD)
     assert list(primary.records) == [_OLD]
     assert list(legacy.records) == [_OLD]
     assert fake_metrics.total('.write', 'target:gcs', 'outcome:ok') == 1
@@ -206,7 +206,7 @@ def test_primary_insert_failure_is_swallowed(
     primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics
 ) -> None:
     primary.fail_insert = True
-    _insert(_routing(primary, legacy), _OLD)
+    _insert(_gcs_migration_store(primary, legacy), _OLD)
     assert list(legacy.records) == [_OLD]
     assert fake_metrics.total('.write', 'target:gcs', 'outcome:error') == 1
     assert fake_metrics.total('.write', 'target:legacy', 'outcome:ok') == 1
@@ -215,7 +215,7 @@ def test_primary_insert_failure_is_swallowed(
 def test_legacy_insert_failure_propagates(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
     legacy.fail_insert = True
     with pytest.raises(RuntimeError, match='simulated insert failure'):
-        _insert(_routing(primary, legacy), _OLD)
+        _insert(_gcs_migration_store(primary, legacy), _OLD)
     assert list(primary.records) == [_OLD]
     assert fake_metrics.total('.write', 'target:legacy', 'outcome:error') == 1
     assert fake_metrics.total('.write', 'target:legacy', 'outcome:ok') == 0
@@ -225,7 +225,7 @@ def test_legacy_write_disabled_skips_legacy(
     primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics
 ) -> None:
     legacy.fail_insert = True
-    _insert(_routing(primary, legacy, legacy_write_enabled=False), _OLD)
+    _insert(_gcs_migration_store(primary, legacy, legacy_write_enabled=False), _OLD)
     assert list(primary.records) == [_OLD]
     assert legacy.records == {}
     assert fake_metrics.total('.write', 'target:legacy') == 0
@@ -237,7 +237,7 @@ def test_read_sources(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _Fa
     legacy.put(in_gcs, 'legacy')
     legacy.put(in_legacy, 'legacy')
 
-    results = _routing(primary, legacy).select_many([in_gcs, in_legacy, nowhere])
+    results = _gcs_migration_store(primary, legacy).select_many([in_gcs, in_legacy, nowhere])
 
     assert [(r['id'], r['action_data']) for r in results] == [(in_gcs, 'gcs'), (in_legacy, 'legacy')]
     assert primary.selected == [[in_gcs, in_legacy, nowhere]]
@@ -251,7 +251,7 @@ def test_read_sources(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _Fa
 def test_select_one_prefers_primary(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
     primary.put(_OLD, 'gcs')
     legacy.put(_OLD, 'legacy')
-    record = _routing(primary, legacy).select_one(_OLD)
+    record = _gcs_migration_store(primary, legacy).select_one(_OLD)
     assert record is not None and record['action_data'] == 'gcs'
     assert legacy.selected == []
 
@@ -265,7 +265,9 @@ def test_cutover_skips_primary_for_older_ids(
         primary.put(action_id, 'gcs')
         legacy.put(action_id, 'legacy')
 
-    results = _routing(primary, legacy, cutover_id=_action_id(_NOW - timedelta(hours=1))).select_many([before, after])
+    results = _gcs_migration_store(primary, legacy, cutover_id=_action_id(_NOW - timedelta(hours=1))).select_many(
+        [before, after]
+    )
 
     assert {r['id']: r['action_data'] for r in results} == {before: 'legacy', after: 'gcs'}
     assert primary.selected_ids() == [after]
@@ -277,7 +279,7 @@ def test_expected_and_unexpected_misses(primary: _FakeStore, legacy: _FakeStore,
     old_sampled = _find_id(_NOW - timedelta(minutes=10), sampled=True)
     old_unsampled = _find_id(_NOW - timedelta(minutes=10), sampled=False)
     young_sampled = _find_id(_NOW - timedelta(minutes=2), sampled=True)
-    store = _routing(primary, legacy, gcs_write_percent=50)
+    store = _gcs_migration_store(primary, legacy, gcs_write_percent=50)
 
     store.select_many([old_sampled])
     assert fake_metrics.total('.read.gcs_unexpected_miss') == 1
@@ -291,7 +293,9 @@ def test_expected_and_unexpected_misses(primary: _FakeStore, legacy: _FakeStore,
 def test_legacy_read_fallback_disabled(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
     legacy.put(_OLD, 'legacy')
     before = _action_id(_NOW - timedelta(hours=2))
-    store = _routing(primary, legacy, legacy_read_fallback=False, cutover_id=_action_id(_NOW - timedelta(hours=1)))
+    store = _gcs_migration_store(
+        primary, legacy, legacy_read_fallback=False, cutover_id=_action_id(_NOW - timedelta(hours=1))
+    )
     assert store.select_many([_OLD, before]) == []
     assert legacy.selected == []
     assert fake_metrics.total('.read.source', 'source:miss') == 2
@@ -303,7 +307,7 @@ def test_primary_select_failure_falls_back(primary: _FakeStore, legacy: _FakeSto
     for action_id in ids:
         legacy.put(action_id, 'legacy')
 
-    results = _routing(primary, legacy).select_many(ids)
+    results = _gcs_migration_store(primary, legacy).select_many(ids)
 
     assert [r['id'] for r in results] == ids
     assert legacy.selected == [ids]
@@ -322,7 +326,7 @@ def test_partial_primary_read_keeps_its_results_and_falls_back_for_the_rest(
     primary.put(in_gcs, 'gcs')
     for action_id in (in_gcs, unread, before):
         legacy.put(action_id, 'legacy')
-    store = _routing(primary, legacy, cutover_id=_action_id(_NOW - timedelta(hours=1)))
+    store = _gcs_migration_store(primary, legacy, cutover_id=_action_id(_NOW - timedelta(hours=1)))
 
     results = store.select_many([in_gcs, unread, before])
 
@@ -336,7 +340,7 @@ def test_partial_primary_read_keeps_its_results_and_falls_back_for_the_rest(
 
 
 def test_flush_reaches_both_stores(primary: _FakeStore, legacy: _FakeStore) -> None:
-    _routing(primary, legacy).flush()
+    _gcs_migration_store(primary, legacy).flush()
     assert (primary.flushes, legacy.flushes) == (1, 1)
 
 
@@ -360,7 +364,7 @@ class _FakeBigTable(_FakeStore):
         _FakeBigTable.instances.append(self)
 
 
-def test_chooser_builds_routing_store(monkeypatch: pytest.MonkeyPatch, fake_metrics: _FakeMetrics) -> None:
+def test_chooser_builds_gcs_migration_store(monkeypatch: pytest.MonkeyPatch, fake_metrics: _FakeMetrics) -> None:
     monkeypatch.setattr(_FakeBatched, 'instances', [])
     monkeypatch.setattr(_FakeBigTable, 'instances', [])
     monkeypatch.setattr(execution_result_store_chooser, 'StoredExecutionResultGCSBatched', _FakeBatched)
@@ -375,10 +379,10 @@ def test_chooser_builds_routing_store(monkeypatch: pytest.MonkeyPatch, fake_metr
     )
 
     store = execution_result_store_chooser.get_rules_execution_result_storage_backend(
-        ExecutionResultStorageBackendType.ROUTING
+        ExecutionResultStorageBackendType.GCS_MIGRATION
     )
 
-    assert isinstance(store, RoutingExecutionResultStore)
+    assert isinstance(store, StoredExecutionResultGCSMigration)
     [batched], [bigtable] = _FakeBatched.instances, _FakeBigTable.instances
     # The batched store starts its own timer on first insert.
     assert not batched.started
@@ -400,7 +404,7 @@ def test_chooser_builds_batched_store_without_starting_it(monkeypatch: pytest.Mo
     assert not batched.started
 
 
-def test_service_reads_the_real_batched_store_through_routing(
+def test_service_reads_the_real_batched_store_through_gcs_migration(
     monkeypatch: pytest.MonkeyPatch, fake_metrics: _FakeMetrics
 ) -> None:
     gcs = _FakeGCS()
@@ -411,16 +415,16 @@ def test_service_reads_the_real_batched_store_through_routing(
     CONFIG.instance().configure(
         {
             'SNOWFLAKE_EPOCH': _EPOCH_MS,
-            'OSPREY_EXECUTION_RESULT_STORAGE_BACKEND': 'routing',
+            'OSPREY_EXECUTION_RESULT_STORAGE_BACKEND': 'gcs_migration',
             'OSPREY_GCS_EXECUTION_RESULTS_BATCH_BUCKET': 'test-bucket',
             'OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT': '100',
         }
     )
 
     service = bootstrap_execution_result_storage_service()
-    routing = service._storage_backend
-    assert isinstance(routing, RoutingExecutionResultStore)
-    batched = routing._primary
+    gcs_migration = service._storage_backend
+    assert isinstance(gcs_migration, StoredExecutionResultGCSMigration)
+    batched = gcs_migration._primary
     assert isinstance(batched, StoredExecutionResultGCSBatched)
     assert batched._timer_thread is None
     try:
@@ -429,7 +433,7 @@ def test_service_reads_the_real_batched_store_through_routing(
         moment = datetime.now(timezone.utc) - timedelta(seconds=400)
         ids = [_action_id(moment, sequence) for sequence in range(2)]
         for action_id in ids:
-            routing.insert(action_id, '{"ActionName": "test"}', '[]', moment, '{}')
+            gcs_migration.insert(action_id, '{"ActionName": "test"}', '[]', moment, '{}')
         service.flush()
         assert len(gcs.objects) == 1
 
@@ -472,7 +476,7 @@ def test_from_config_warns_when_unsampled_ids_are_written_nowhere(
         }
     )
     with caplog.at_level(logging.WARNING):
-        RoutingExecutionResultStore.from_config(primary, legacy)
+        StoredExecutionResultGCSMigration.from_config(primary, legacy)
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING and 'written nowhere' in r.getMessage()]
     assert len(warnings) == (1 if warns else 0)
 

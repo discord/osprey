@@ -5,10 +5,10 @@ from osprey.worker.lib.singletons import CONFIG
 from osprey.worker.lib.storage import ExecutionResultStorageBackendType
 from osprey.worker.lib.storage.stored_execution_result import (
     ExecutionResultStore,
-    RoutingExecutionResultStore,
     StoredExecutionResultBigTable,
     StoredExecutionResultGCS,
     StoredExecutionResultGCSBatched,
+    StoredExecutionResultGCSMigration,
     StoredExecutionResultMinIO,
     StoredExecutionResultPostgres,
 )
@@ -28,8 +28,8 @@ def get_rules_execution_result_storage_backend(
         return StoredExecutionResultGCS()
     elif backend_type == ExecutionResultStorageBackendType.GCS_BATCHED:
         return StoredExecutionResultGCSBatched()
-    elif backend_type == ExecutionResultStorageBackendType.ROUTING:
-        return RoutingExecutionResultStore.from_config(
+    elif backend_type == ExecutionResultStorageBackendType.GCS_MIGRATION:
+        return StoredExecutionResultGCSMigration.from_config(
             StoredExecutionResultGCSBatched(), StoredExecutionResultBigTable()
         )
     elif backend_type == ExecutionResultStorageBackendType.MINIO:

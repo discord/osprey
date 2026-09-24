@@ -983,6 +983,12 @@ class RoutingExecutionResultStore(ExecutionResultStore):
     Writes go to the primary for a percent of action ids and to the legacy store while it stays the
     system of record. Reads try the primary for ids at or above `cutover_id` and fall back to the legacy
     store. Primary failures never propagate; legacy failures do, so the sink keeps its retry semantics.
+
+    The miss metrics use the reader's current percent, so operate a ramp this way. At every increase of
+    `OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT`, set `OSPREY_EXECUTION_RESULT_ROUTING_CUTOVER_ID` to a
+    current snowflake. This is safe while legacy write and legacy read fallback stay on. Change the
+    percent on the worker and the ui-api together. Otherwise `gcs_unexpected_miss` over-counts (percent
+    raised without a new cutover) or under-counts (ui-api percent lags the worker).
     """
 
     def __init__(
@@ -1008,11 +1014,18 @@ class RoutingExecutionResultStore(ExecutionResultStore):
         from osprey.worker.lib.singletons import CONFIG
 
         config = CONFIG.instance()
+        gcs_write_percent = config.get_float('OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT', 0.0)
+        legacy_write_enabled = config.get_bool('OSPREY_EXECUTION_RESULT_LEGACY_WRITE_ENABLED', True)
+        if not legacy_write_enabled and gcs_write_percent < 100:
+            logger.warning(
+                f'Legacy execution result writes are off and the GCS write percent is {gcs_write_percent}: '
+                'unsampled action ids are written nowhere'
+            )
         return cls(
             primary,
             legacy,
-            gcs_write_percent=config.get_float('OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT', 0.0),
-            legacy_write_enabled=config.get_bool('OSPREY_EXECUTION_RESULT_LEGACY_WRITE_ENABLED', True),
+            gcs_write_percent=gcs_write_percent,
+            legacy_write_enabled=legacy_write_enabled,
             legacy_read_fallback=config.get_bool('OSPREY_EXECUTION_RESULT_LEGACY_READ_FALLBACK', True),
             cutover_id=config.get_int('OSPREY_EXECUTION_RESULT_ROUTING_CUTOVER_ID', 0),
         )
@@ -1068,25 +1081,30 @@ class RoutingExecutionResultStore(ExecutionResultStore):
         ineligible = [i for i in action_ids if i < self._cutover_id]
 
         found: Dict[int, Dict[str, Any]] = {}
+        primary_failed = False
         if eligible:
             try:
                 with metrics.timed(f'{_ROUTING_METRIC}.read.duration', tags=['backend:gcs']):
                     found = {record['id']: record for record in self._primary.select_many(eligible)}
             except Exception:
                 logger.exception(f'Failed to read {len(eligible)} execution results from GCS')
+                metrics.increment(f'{_ROUTING_METRIC}.read.gcs_error')
+                primary_failed = True
 
         misses = [i for i in eligible if i not in found]
-        now = self._clock()
-        unexpected = sum(
-            1
-            for i in misses
-            if in_gcs_write_sample(i, self._gcs_write_percent)
-            and now - Snowflake(i).to_timestamp() > _UNEXPECTED_MISS_AGE_SECONDS
-        )
-        if unexpected:
-            metrics.increment(f'{_ROUTING_METRIC}.read.gcs_unexpected_miss', unexpected)
-        if len(misses) > unexpected:
-            metrics.increment(f'{_ROUTING_METRIC}.read.gcs_expected_miss', len(misses) - unexpected)
+        # A failed read says nothing about what GCS holds, so it does not count toward either miss rate.
+        if not primary_failed:
+            now = self._clock()
+            unexpected = sum(
+                1
+                for i in misses
+                if in_gcs_write_sample(i, self._gcs_write_percent)
+                and now - Snowflake(i).to_timestamp() > _UNEXPECTED_MISS_AGE_SECONDS
+            )
+            if unexpected:
+                metrics.increment(f'{_ROUTING_METRIC}.read.gcs_unexpected_miss', unexpected)
+            if len(misses) > unexpected:
+                metrics.increment(f'{_ROUTING_METRIC}.read.gcs_expected_miss', len(misses) - unexpected)
 
         fallback: Dict[int, Dict[str, Any]] = {}
         if self._legacy_read_fallback and (misses or ineligible):

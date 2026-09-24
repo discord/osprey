@@ -1,4 +1,5 @@
 import contextlib
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -161,6 +162,15 @@ def test_sample_bounds_rate_and_determinism() -> None:
     assert sampled == [i for i in ids if in_gcs_write_sample(i, 10)]
 
 
+def test_sample_golden_vectors() -> None:
+    # Buckets, blake2b(id.to_bytes(8, 'big'), digest_size=4) as a big-endian int % 10000:
+    # 1234567890123456789 -> 4329, 987654321098765432 -> 8266. A change here splits worker and ui-api.
+    assert in_gcs_write_sample(1234567890123456789, 43.3)
+    assert not in_gcs_write_sample(1234567890123456789, 43.29)
+    assert in_gcs_write_sample(987654321098765432, 82.67)
+    assert not in_gcs_write_sample(987654321098765432, 82.66)
+
+
 def test_insert_at_zero_percent_writes_legacy_only(
     primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics
 ) -> None:
@@ -286,7 +296,9 @@ def test_primary_select_failure_falls_back(primary: _FakeStore, legacy: _FakeSto
     assert [r['id'] for r in results] == ids
     assert legacy.selected == [ids]
     assert fake_metrics.total('.read.source', 'source:legacy') == 3
-    assert fake_metrics.total('.read.gcs_unexpected_miss') == 3
+    assert fake_metrics.total('.read.gcs_error') == 1
+    assert fake_metrics.total('.read.gcs_unexpected_miss') == 0
+    assert fake_metrics.total('.read.gcs_expected_miss') == 0
 
 
 def test_flush_reaches_both_stores(primary: _FakeStore, legacy: _FakeStore) -> None:
@@ -338,6 +350,32 @@ def test_chooser_builds_routing_store(monkeypatch: pytest.MonkeyPatch, fake_metr
     _insert(store, _OLD)
     assert list(batched.records) == [_OLD]
     assert bigtable.records == {}
+
+
+@pytest.mark.parametrize(
+    'percent, legacy_write, warns',
+    [('50', 'false', True), ('100', 'false', False), ('50', 'true', False)],
+)
+def test_from_config_warns_when_unsampled_ids_are_written_nowhere(
+    primary: _FakeStore,
+    legacy: _FakeStore,
+    caplog: pytest.LogCaptureFixture,
+    percent: str,
+    legacy_write: str,
+    warns: bool,
+) -> None:
+    CONFIG.instance().unconfigure_for_tests()
+    CONFIG.instance().configure(
+        {
+            'SNOWFLAKE_EPOCH': _EPOCH_MS,
+            'OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT': percent,
+            'OSPREY_EXECUTION_RESULT_LEGACY_WRITE_ENABLED': legacy_write,
+        }
+    )
+    with caplog.at_level(logging.WARNING):
+        RoutingExecutionResultStore.from_config(primary, legacy)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and 'written nowhere' in r.getMessage()]
+    assert len(warnings) == (1 if warns else 0)
 
 
 def test_chooser_returns_plugin_store(monkeypatch: pytest.MonkeyPatch) -> None:

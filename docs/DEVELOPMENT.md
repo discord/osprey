@@ -140,6 +140,10 @@ Implement any subset of these in your plugin's `register_plugins.py`:
 | `register_labels_service_or_provider` | `LabelsServiceBase \| LabelsProvider` | Single-provider (`firstresult`). |
 | `register_llm_provider` | `BaseLLMProvider` | Single-provider (`firstresult`). LLM API access for AI-assisted features. |
 
+To persist execution results from the async worker, return an `AsyncStoredExecutionResultOutputSink(store)`
+from `register_async_output_sinks`, one per `ExecutionResultStore`. Registering one per store writes the same results
+to several backends, for example while migrating between them.
+
 The `register_llm_provider` hook and the vendor-neutral tool-calling helpers
 (`@tool`, `ToolRegistry`, `run_tool_loop`) have their own page:
 [LLM provider & tool calling](llm.md).

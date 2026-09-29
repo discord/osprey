@@ -40,6 +40,7 @@ def get_rules_execution_result_storage_backend(
         store = bootstrap_execution_result_store(config=config)
         if store is None:
             raise AssertionError('No execution result store registered')
+        return store
     elif backend_type == ExecutionResultStorageBackendType.NONE:
         return None
 

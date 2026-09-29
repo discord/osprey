@@ -11,7 +11,9 @@ from osprey.async_worker.sinks.sink import rules_sink as rules_sink_module
 from osprey.async_worker.sinks.sink.input_stream import AsyncStaticInputStream
 from osprey.async_worker.sinks.sink.output_sink import AsyncMultiOutputSink, AsyncStdoutOutputSink
 from osprey.async_worker.sinks.sink.rules_sink import AsyncRulesRunner
+from osprey.async_worker.sinks.sink.stored_execution_result_output_sink import AsyncStoredExecutionResultOutputSink
 from osprey.engine.executor.execution_context import Action, ExecutionResult
+from osprey.worker.lib.storage.stored_execution_result import ExecutionResultStore
 
 
 def _make_result(action_id: int = 1, action_name: str = 'test') -> ExecutionResult:
@@ -223,3 +225,61 @@ async def test_classify_one_routes_through_engine_execute_for_dispatch():
     # The served result flows to the output sink and is returned.
     output_sink.push.assert_awaited_once_with(served)
     assert result is served
+
+
+# --- AsyncStoredExecutionResultOutputSink ---
+
+
+class RecordingStore(ExecutionResultStore):
+    """In-memory execution result store that records inserts."""
+
+    def __init__(self) -> None:
+        self.inserted: List[dict] = []
+
+    def select_one(self, action_id: int):
+        return None
+
+    def select_many(self, action_ids: List[int]):
+        return []
+
+    def insert(self, action_id, extracted_features_json, error_traces_json, timestamp, action_data_json) -> None:
+        self.inserted.append(
+            {
+                'action_id': action_id,
+                'extracted_features_json': extracted_features_json,
+                'error_traces_json': error_traces_json,
+                'timestamp': timestamp,
+                'action_data_json': action_data_json,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_stored_execution_result_sink_persists_the_full_result():
+    store = RecordingStore()
+    result = _make_result(action_id=42, action_name='message_create')
+
+    await AsyncStoredExecutionResultOutputSink(store).push(result)
+
+    assert store.inserted == [
+        {
+            'action_id': 42,
+            'extracted_features_json': result.extracted_features_json,
+            'error_traces_json': result.error_traces_json,
+            'timestamp': result.action.timestamp,
+            'action_data_json': result.action.data_json,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_one_stored_execution_result_sink_per_store_writes_every_store():
+    primary, secondary = RecordingStore(), RecordingStore()
+    multi = AsyncMultiOutputSink(
+        [AsyncStoredExecutionResultOutputSink(primary), AsyncStoredExecutionResultOutputSink(secondary)]
+    )
+
+    await multi.push(_make_result(action_id=7))
+
+    assert [row['action_id'] for row in primary.inserted] == [7]
+    assert [row['action_id'] for row in secondary.inserted] == [7]

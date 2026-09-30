@@ -10,12 +10,12 @@ from osprey.worker.lib.storage import ExecutionResultStorageBackendType, stored_
 from osprey.worker.lib.storage.stored_execution_result import (
     ExecutionResultReadError,
     ExecutionResultStore,
-    StoredExecutionResultGCSBatched,
+    StoredExecutionResultGCS,
     StoredExecutionResultGCSMigration,
     bootstrap_execution_result_storage_service,
     in_gcs_write_sample,
 )
-from osprey.worker.lib.storage.tests.test_stored_execution_result_gcs_batched import _FakeClient, _FakeGCS
+from osprey.worker.lib.storage.tests.test_stored_execution_result_gcs import _FakeClient, _FakeGCS
 
 _EPOCH_MS = 1420070400000
 _METRIC = 'execution_result_gcs_migration'
@@ -367,7 +367,7 @@ class _FakeBigTable(_FakeStore):
 def test_chooser_builds_gcs_migration_store(monkeypatch: pytest.MonkeyPatch, fake_metrics: _FakeMetrics) -> None:
     monkeypatch.setattr(_FakeBatched, 'instances', [])
     monkeypatch.setattr(_FakeBigTable, 'instances', [])
-    monkeypatch.setattr(execution_result_store_chooser, 'StoredExecutionResultGCSBatched', _FakeBatched)
+    monkeypatch.setattr(execution_result_store_chooser, 'StoredExecutionResultGCS', _FakeBatched)
     monkeypatch.setattr(execution_result_store_chooser, 'StoredExecutionResultBigTable', _FakeBigTable)
     CONFIG.instance().unconfigure_for_tests()
     CONFIG.instance().configure(
@@ -393,10 +393,10 @@ def test_chooser_builds_gcs_migration_store(monkeypatch: pytest.MonkeyPatch, fak
 
 def test_chooser_builds_batched_store_without_starting_it(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_FakeBatched, 'instances', [])
-    monkeypatch.setattr(execution_result_store_chooser, 'StoredExecutionResultGCSBatched', _FakeBatched)
+    monkeypatch.setattr(execution_result_store_chooser, 'StoredExecutionResultGCS', _FakeBatched)
 
     store = execution_result_store_chooser.get_rules_execution_result_storage_backend(
-        ExecutionResultStorageBackendType.GCS_BATCHED
+        ExecutionResultStorageBackendType.GCS
     )
 
     [batched] = _FakeBatched.instances
@@ -416,7 +416,7 @@ def test_service_reads_the_real_batched_store_through_gcs_migration(
         {
             'SNOWFLAKE_EPOCH': _EPOCH_MS,
             'OSPREY_EXECUTION_RESULT_STORAGE_BACKEND': 'gcs_migration',
-            'OSPREY_GCS_EXECUTION_RESULTS_BATCH_BUCKET': 'test-bucket',
+            'OSPREY_GCS_EXECUTION_RESULTS_BUCKET': 'test-bucket',
             'OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT': '100',
         }
     )
@@ -425,7 +425,7 @@ def test_service_reads_the_real_batched_store_through_gcs_migration(
     gcs_migration = service._storage_backend
     assert isinstance(gcs_migration, StoredExecutionResultGCSMigration)
     batched = gcs_migration._primary
-    assert isinstance(batched, StoredExecutionResultGCSBatched)
+    assert isinstance(batched, StoredExecutionResultGCS)
     assert batched._timer_thread is None
     try:
         # Past the unexpected-miss age but not late, so the records land on time and a GCS miss would

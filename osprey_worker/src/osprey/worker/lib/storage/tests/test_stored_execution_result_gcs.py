@@ -15,16 +15,16 @@ from osprey.worker.lib.storage import stored_execution_result
 from osprey.worker.lib.storage.stored_execution_result import (
     MAX_PENDING_BATCHES,
     ExecutionResultReadError,
-    StoredExecutionResultGCSBatched,
+    StoredExecutionResultGCS,
 )
 
 _EPOCH_MS = 1420070400000
-_METRIC = 'gcs_stored_execution_result_batched'
+_METRIC = 'gcs_stored_execution_result'
 # 2026-09-24 12:34:20 UTC: mid-minute, so small offsets stay in the 12:34 slot.
 _BASE = datetime(2026, 9, 24, 12, 34, 20, tzinfo=timezone.utc)
 _BASE_CONFIG: Dict[str, Any] = {
     'SNOWFLAKE_EPOCH': _EPOCH_MS,
-    'OSPREY_GCS_EXECUTION_RESULTS_BATCH_BUCKET': 'test-bucket',
+    'OSPREY_GCS_EXECUTION_RESULTS_BUCKET': 'test-bucket',
 }
 
 
@@ -202,15 +202,15 @@ def clock() -> _FakeClock:
 @pytest.fixture
 def make_store(
     gcs: _FakeGCS, fake_metrics: _FakeMetrics, clock: _FakeClock, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[Callable[..., StoredExecutionResultGCSBatched]]:
-    monkeypatch.setattr(StoredExecutionResultGCSBatched, '_UPLOAD_RETRY_DELAYS_SECONDS', (0.0, 0.0))
+) -> Iterator[Callable[..., StoredExecutionResultGCS]]:
+    monkeypatch.setattr(StoredExecutionResultGCS, '_UPLOAD_RETRY_DELAYS_SECONDS', (0.0, 0.0))
     config = CONFIG.instance()
-    stores: List[StoredExecutionResultGCSBatched] = []
+    stores: List[StoredExecutionResultGCS] = []
 
-    def _make(**config_overrides: Any) -> StoredExecutionResultGCSBatched:
+    def _make(**config_overrides: Any) -> StoredExecutionResultGCS:
         config.unconfigure_for_tests()
         config.configure({**_BASE_CONFIG, **config_overrides})
-        store = StoredExecutionResultGCSBatched(clock=clock, client_factory=lambda: _FakeClient(gcs))
+        store = StoredExecutionResultGCS(clock=clock, client_factory=lambda: _FakeClient(gcs))
         stores.append(store)
         return store
 
@@ -222,7 +222,7 @@ def make_store(
 
 
 def _insert(
-    store: StoredExecutionResultGCSBatched,
+    store: StoredExecutionResultGCS,
     action_id: int,
     timestamp: datetime = _BASE,
     features: str = '{"ActionName": "test"}',
@@ -246,14 +246,14 @@ def _seq(name: str) -> int:
     return int(match.group(1))
 
 
-def test_constructor_requires_snowflake_epoch(make_store: Callable[..., StoredExecutionResultGCSBatched]) -> None:
+def test_constructor_requires_snowflake_epoch(make_store: Callable[..., StoredExecutionResultGCS]) -> None:
     with pytest.raises(ValueError, match='SNOWFLAKE_EPOCH'):
         make_store(SNOWFLAKE_EPOCH=0)
 
 
 @pytest.mark.parametrize('width, expected_prefix', [(1, 'v1/20260924/1234/'), (5, 'v1/20260924/1230/')])
 def test_on_time_record_lands_under_its_floored_minute(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, width: int, expected_prefix: str
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, width: int, expected_prefix: str
 ) -> None:
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_BUCKET_WIDTH_MINUTES=width)
     _insert(store, _action_id(_BASE))
@@ -264,7 +264,7 @@ def test_on_time_record_lands_under_its_floored_minute(
 
 
 def test_record_older_than_late_threshold_lands_under_late(
-    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    make_store: Callable[..., StoredExecutionResultGCS],
     gcs: _FakeGCS,
     fake_metrics: _FakeMetrics,
     clock: _FakeClock,
@@ -281,7 +281,7 @@ def test_record_older_than_late_threshold_lands_under_late(
 
 
 def test_object_names_are_sanitized_and_seq_increments_without_overwrite(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, monkeypatch: pytest.MonkeyPatch
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv('HOSTNAME', 'pod/with:bad chars')
     # One upload thread keeps seq assignment in submission order.
@@ -302,7 +302,7 @@ def test_object_names_are_sanitized_and_seq_increments_without_overwrite(
 
 
 def test_max_records_closes_the_batch_off_the_caller_thread(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, fake_metrics: _FakeMetrics
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, fake_metrics: _FakeMetrics
 ) -> None:
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=3)
     for sequence in range(3):
@@ -317,7 +317,7 @@ def test_max_records_closes_the_batch_off_the_caller_thread(
 
 
 def test_max_compressed_bytes_closes_the_batch(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, fake_metrics: _FakeMetrics
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, fake_metrics: _FakeMetrics
 ) -> None:
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_COMPRESSED_BYTES=1)
     rng = random.Random(0)
@@ -332,7 +332,7 @@ def test_max_compressed_bytes_closes_the_batch(
 
 
 def test_on_time_batch_closes_only_after_bucket_end_plus_grace(
-    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    make_store: Callable[..., StoredExecutionResultGCS],
     gcs: _FakeGCS,
     fake_metrics: _FakeMetrics,
     clock: _FakeClock,
@@ -359,7 +359,7 @@ def test_on_time_batch_closes_only_after_bucket_end_plus_grace(
 
 
 def test_reopened_slot_waits_for_the_minimum_age_before_closing(
-    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    make_store: Callable[..., StoredExecutionResultGCS],
     gcs: _FakeGCS,
     fake_metrics: _FakeMetrics,
     clock: _FakeClock,
@@ -387,7 +387,7 @@ def test_reopened_slot_waits_for_the_minimum_age_before_closing(
 
 
 def test_late_batch_closes_after_default_flush_tick(
-    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    make_store: Callable[..., StoredExecutionResultGCS],
     gcs: _FakeGCS,
     fake_metrics: _FakeMetrics,
     clock: _FakeClock,
@@ -412,7 +412,7 @@ def test_late_batch_closes_after_default_flush_tick(
 
 
 def test_every_inserted_record_round_trips_after_flush(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], fake_metrics: _FakeMetrics
+    make_store: Callable[..., StoredExecutionResultGCS], fake_metrics: _FakeMetrics
 ) -> None:
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=4)
     moments = [_BASE, _BASE + timedelta(minutes=3)]
@@ -438,7 +438,7 @@ def test_every_inserted_record_round_trips_after_flush(
 
 
 def test_missing_id_returns_none(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], fake_metrics: _FakeMetrics
+    make_store: Callable[..., StoredExecutionResultGCS], fake_metrics: _FakeMetrics
 ) -> None:
     store = make_store()
     _insert(store, _action_id(_BASE))
@@ -450,7 +450,7 @@ def test_missing_id_returns_none(
 
 
 def test_reader_lists_minute_and_late_hour_prefixes_and_finds_late_records(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, clock: _FakeClock
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, clock: _FakeClock
 ) -> None:
     store = make_store()
     clock.set(_BASE + timedelta(hours=2))
@@ -467,7 +467,7 @@ def test_reader_lists_minute_and_late_hour_prefixes_and_finds_late_records(
 
 
 def test_bloom_prefilter_downloads_only_candidate_objects(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, fake_metrics: _FakeMetrics
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, fake_metrics: _FakeMetrics
 ) -> None:
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=10)
     other_minute = _BASE + timedelta(minutes=1)
@@ -492,7 +492,7 @@ def test_bloom_prefilter_downloads_only_candidate_objects(
 
 
 def test_unparseable_bloom_metadata_makes_only_that_blob_a_candidate(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS
 ) -> None:
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=10)
     for sequence in range(30):
@@ -514,7 +514,7 @@ def test_unparseable_bloom_metadata_makes_only_that_blob_a_candidate(
 
 
 def test_list_failure_raises_with_results_from_the_other_prefixes(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, fake_metrics: _FakeMetrics
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, fake_metrics: _FakeMetrics
 ) -> None:
     store = make_store()
     good_id = _action_id(_BASE)
@@ -534,7 +534,7 @@ def test_list_failure_raises_with_results_from_the_other_prefixes(
 
 
 def test_download_failure_raises_with_results_from_the_other_objects(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, monkeypatch: pytest.MonkeyPatch
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = make_store()
     good_id = _action_id(_BASE)
@@ -558,7 +558,7 @@ def test_download_failure_raises_with_results_from_the_other_objects(
     assert raised.value.failed_prefixes == 1
 
 
-def test_duplicate_id_returns_the_latest_timestamp(make_store: Callable[..., StoredExecutionResultGCSBatched]) -> None:
+def test_duplicate_id_returns_the_latest_timestamp(make_store: Callable[..., StoredExecutionResultGCS]) -> None:
     store = make_store()
     action_id = _action_id(_BASE)
     # A replay re-publishes the action stamped with a later publish time. Write it first so write order
@@ -577,7 +577,7 @@ def test_duplicate_id_returns_the_latest_timestamp(make_store: Callable[..., Sto
 
 
 def test_duplicate_id_with_equal_timestamp_returns_one_record(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS
 ) -> None:
     store = make_store()
     action_id = _action_id(_BASE)
@@ -594,7 +594,7 @@ def test_duplicate_id_with_equal_timestamp_returns_one_record(
 
 
 def test_upload_failure_drops_the_batch_and_counts_it(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, fake_metrics: _FakeMetrics
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, fake_metrics: _FakeMetrics
 ) -> None:
     gcs.fail_uploads = True
     store = make_store()
@@ -611,7 +611,7 @@ def test_upload_failure_drops_the_batch_and_counts_it(
 
 
 def test_precondition_failed_on_retry_counts_as_stored(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, fake_metrics: _FakeMetrics
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, fake_metrics: _FakeMetrics
 ) -> None:
     gcs.lose_next_response = True
     store = make_store()
@@ -628,7 +628,7 @@ def test_precondition_failed_on_retry_counts_as_stored(
 
 
 def test_precondition_failed_on_first_attempt_drops_without_retry(
-    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    make_store: Callable[..., StoredExecutionResultGCS],
     gcs: _FakeGCS,
     fake_metrics: _FakeMetrics,
     monkeypatch: pytest.MonkeyPatch,
@@ -649,7 +649,7 @@ def test_precondition_failed_on_first_attempt_drops_without_retry(
 
 
 def test_backlog_past_max_pending_batches_is_dropped(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS, fake_metrics: _FakeMetrics
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, fake_metrics: _FakeMetrics
 ) -> None:
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=1, OSPREY_GCS_EXECUTION_RESULTS_UPLOAD_THREADS=1)
     gcs.upload_gate.clear()
@@ -670,7 +670,7 @@ def test_backlog_past_max_pending_batches_is_dropped(
 
 
 def test_unexpected_upload_error_is_counted_as_dropped(
-    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    make_store: Callable[..., StoredExecutionResultGCS],
     gcs: _FakeGCS,
     fake_metrics: _FakeMetrics,
     monkeypatch: pytest.MonkeyPatch,
@@ -689,7 +689,7 @@ def test_unexpected_upload_error_is_counted_as_dropped(
 
 
 def test_object_metadata_stays_under_gcs_limit(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS
 ) -> None:
     store = make_store()
     for sequence in range(1000):
@@ -705,7 +705,7 @@ def test_object_metadata_stays_under_gcs_limit(
 
 
 def test_concurrent_inserts_do_not_lose_writes(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS
 ) -> None:
     """The async worker calls insert() through asyncio.to_thread, so inserts race on real OS threads."""
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=7)
@@ -731,7 +731,7 @@ def test_concurrent_inserts_do_not_lose_writes(
 
 
 def test_start_is_idempotent_and_close_uploads_open_batches(
-    make_store: Callable[..., StoredExecutionResultGCSBatched], gcs: _FakeGCS
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS
 ) -> None:
     store = make_store()
     store.start()
@@ -748,7 +748,7 @@ def test_start_is_idempotent_and_close_uploads_open_batches(
 
 
 def test_constructing_a_store_starts_no_thread_and_the_first_insert_starts_the_timer(
-    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    make_store: Callable[..., StoredExecutionResultGCS],
 ) -> None:
     before = set(threading.enumerate())
     store = make_store()
@@ -763,7 +763,7 @@ def test_constructing_a_store_starts_no_thread_and_the_first_insert_starts_the_t
 
 
 def test_close_cancels_queued_uploads_and_counts_them_as_dropped(
-    make_store: Callable[..., StoredExecutionResultGCSBatched],
+    make_store: Callable[..., StoredExecutionResultGCS],
     gcs: _FakeGCS,
     fake_metrics: _FakeMetrics,
     monkeypatch: pytest.MonkeyPatch,
@@ -774,7 +774,7 @@ def test_close_cancels_queued_uploads_and_counts_them_as_dropped(
     for sequence in range(3):
         _insert(store, _action_id(_BASE, sequence))
     uploads = list(store._in_flight)
-    monkeypatch.setattr(store, 'flush', lambda: StoredExecutionResultGCSBatched.flush(store, timeout=0.1))
+    monkeypatch.setattr(store, 'flush', lambda: StoredExecutionResultGCS.flush(store, timeout=0.1))
 
     store.close()
 

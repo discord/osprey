@@ -898,8 +898,8 @@ class StoredExecutionResultPostgres(ExecutionResultStore):
 
 
 _GCS_MIGRATION_METRIC = 'execution_result_gcs_migration'
-# The GCS writer closes a slot about 15 s after it ends, then uploads. An id at or past the cutover and
-# older than this should be readable, so a miss means lost or unreadable data rather than a buffered write.
+# The GCS writer closes a slot about 15 s after it ends, then uploads. A miss on an id older than this is
+# not a buffered write: the id predates dual write, or GCS lost it.
 _UNEXPECTED_MISS_AGE_SECONDS = 300
 
 
@@ -907,13 +907,11 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
     """Moves execution results from a legacy store (BigTable) to a primary store (GCS).
 
     Every write goes to the primary, and to the legacy store while `legacy_write_enabled` is on. Reads try
-    the primary for ids at or past `cutover_id` and fall back to the legacy store. Primary failures never
-    propagate; legacy failures do, so the sink keeps its retry semantics.
+    the primary and fall back to the legacy store. Primary failures never propagate; legacy failures do,
+    so the sink keeps its retry semantics.
 
-    Rollout: turn on dual write, then set `OSPREY_EXECUTION_RESULT_GCS_CUTOVER_ID` once, to a snowflake
-    minted after dual write is live on every worker. Ids before it skip GCS, so `gcs_unexpected_miss`
-    counts only data GCS should hold. Once that metric is stable, turn legacy write off. After the
-    legacy store's 90-day retention, switch the backend to `gcs`.
+    Rollout: turn on dual write. Once reads are stable, turn legacy write off. After the legacy store's
+    90-day retention, switch the backend to `gcs`.
 
     `write target:gcs outcome:error` cannot fire for the GCS store, because its `insert` never raises.
     `gcs_stored_execution_result.dropped_records` is the write-failure signal.
@@ -924,13 +922,11 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         primary: ExecutionResultStore,
         legacy: ExecutionResultStore,
         legacy_write_enabled: bool,
-        cutover_id: int,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._primary = primary
         self._legacy = legacy
         self._legacy_write_enabled = legacy_write_enabled
-        self._cutover_id = cutover_id
         self._clock = clock
 
     @classmethod
@@ -944,7 +940,6 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
             primary,
             legacy,
             legacy_write_enabled=config.get_bool('OSPREY_EXECUTION_RESULT_LEGACY_WRITE_ENABLED', True),
-            cutover_id=config.get_int('OSPREY_EXECUTION_RESULT_GCS_CUTOVER_ID', 0),
         )
 
     def insert(
@@ -990,33 +985,28 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
 
     def select_many(self, action_ids: List[int]) -> List[Dict[str, Any]]:
         action_ids = list(dict.fromkeys(action_ids))
-        # The primary holds nothing written before the cutover, so skip it for older ids. Ids are never
-        # negative, so a cutover of 0 makes every id eligible.
-        eligible = [i for i in action_ids if i >= self._cutover_id]
-        ineligible = [i for i in action_ids if i < self._cutover_id]
-
         found: Dict[int, Dict[str, Any]] = {}
         primary_failed = False
-        if eligible:
+        if action_ids:
             try:
                 with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:gcs']):
-                    found = {record['id']: record for record in self._primary.select_many(eligible)}
+                    found = {record['id']: record for record in self._primary.select_many(action_ids)}
             except ExecutionResultReadError as e:
                 # Keep what the primary read; the ids it could not read go to legacy below. The store
                 # already logged each failure with its traceback.
                 logger.warning(
-                    f'Read {len(e.partial_results)} of {len(eligible)} execution results from GCS; '
+                    f'Read {len(e.partial_results)} of {len(action_ids)} execution results from GCS; '
                     f'{e.failed_prefixes} list or download calls failed'
                 )
                 metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_error')
                 found = {record['id']: record for record in e.partial_results}
                 primary_failed = True
             except Exception:
-                logger.exception(f'Failed to read {len(eligible)} execution results from GCS')
+                logger.exception(f'Failed to read {len(action_ids)} execution results from GCS')
                 metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_error')
                 primary_failed = True
 
-        misses = [i for i in eligible if i not in found]
+        misses = [i for i in action_ids if i not in found]
         # A failed read says nothing about what GCS holds, so it does not count toward either miss rate.
         if not primary_failed:
             now = self._clock()
@@ -1027,9 +1017,9 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
                 metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_expected_miss', len(misses) - unexpected)
 
         fallback: Dict[int, Dict[str, Any]] = {}
-        if misses or ineligible:
+        if misses:
             with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:legacy']):
-                fallback = {record['id']: record for record in self._legacy.select_many(misses + ineligible)}
+                fallback = {record['id']: record for record in self._legacy.select_many(misses)}
 
         results: List[Dict[str, Any]] = []
         sources = {'gcs': 0, 'legacy': 0, 'miss': 0}

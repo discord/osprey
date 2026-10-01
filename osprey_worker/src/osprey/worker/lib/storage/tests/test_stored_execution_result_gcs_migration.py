@@ -136,13 +136,11 @@ def _gcs_migration_store(
     primary: _FakeStore,
     legacy: _FakeStore,
     legacy_write_enabled: bool = True,
-    cutover_id: int = 0,
 ) -> StoredExecutionResultGCSMigration:
     return StoredExecutionResultGCSMigration(
         primary,
         legacy,
         legacy_write_enabled=legacy_write_enabled,
-        cutover_id=cutover_id,
         clock=_NOW.timestamp,
     )
 
@@ -212,28 +210,9 @@ def test_select_one_prefers_primary(primary: _FakeStore, legacy: _FakeStore, fak
     assert legacy.selected == []
 
 
-def test_cutover_skips_primary_for_older_ids(
-    primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics
-) -> None:
-    before = _action_id(_NOW - timedelta(hours=2))
-    after = _action_id(_NOW - timedelta(minutes=10))
-    for action_id in (before, after):
-        primary.put(action_id, 'gcs')
-        legacy.put(action_id, 'legacy')
-
-    results = _gcs_migration_store(primary, legacy, cutover_id=_action_id(_NOW - timedelta(hours=1))).select_many(
-        [before, after]
-    )
-
-    assert {r['id']: r['action_data'] for r in results} == {before: 'legacy', after: 'gcs'}
-    assert primary.selected_ids() == [after]
-    assert legacy.selected_ids() == [before]
-    assert fake_metrics.total('.read.gcs_expected_miss') + fake_metrics.total('.read.gcs_unexpected_miss') == 0
-
-
 def test_expected_and_unexpected_misses(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
     young = _action_id(_NOW - timedelta(minutes=2))
-    store = _gcs_migration_store(primary, legacy, cutover_id=_action_id(_NOW - timedelta(hours=1)))
+    store = _gcs_migration_store(primary, legacy)
 
     store.select_many([_OLD])
     assert fake_metrics.total('.read.gcs_unexpected_miss') == 1
@@ -265,21 +244,19 @@ def test_partial_primary_read_keeps_its_results_and_falls_back_for_the_rest(
 ) -> None:
     primary.partial_select = True
     in_gcs, unread = (_action_id(_NOW - timedelta(minutes=10), s) for s in range(2))
-    before = _action_id(_NOW - timedelta(hours=2))
     primary.put(in_gcs, 'gcs')
-    for action_id in (in_gcs, unread, before):
+    for action_id in (in_gcs, unread):
         legacy.put(action_id, 'legacy')
-    store = _gcs_migration_store(primary, legacy, cutover_id=_action_id(_NOW - timedelta(hours=1)))
 
-    results = store.select_many([in_gcs, unread, before])
+    results = _gcs_migration_store(primary, legacy).select_many([in_gcs, unread])
 
-    assert [(r['id'], r['action_data']) for r in results] == [(in_gcs, 'gcs'), (unread, 'legacy'), (before, 'legacy')]
-    assert legacy.selected == [[unread, before]]
+    assert [(r['id'], r['action_data']) for r in results] == [(in_gcs, 'gcs'), (unread, 'legacy')]
+    assert legacy.selected == [[unread]]
     assert fake_metrics.total('.read.gcs_error') == 1
     assert fake_metrics.total('.read.gcs_unexpected_miss') == 0
     assert fake_metrics.total('.read.gcs_expected_miss') == 0
     assert fake_metrics.total('.read.source', 'source:gcs') == 1
-    assert fake_metrics.total('.read.source', 'source:legacy') == 2
+    assert fake_metrics.total('.read.source', 'source:legacy') == 1
 
 
 def test_flush_reaches_both_stores(primary: _FakeStore, legacy: _FakeStore) -> None:

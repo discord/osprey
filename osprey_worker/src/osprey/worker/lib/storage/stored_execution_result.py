@@ -625,6 +625,9 @@ class StoredExecutionResultGCS(ExecutionResultStore):
         metrics.histogram(f'{_GCS_METRIC}.flush.records', batch.records, tags=tags)
         metrics.histogram(f'{_GCS_METRIC}.flush.raw_bytes', batch.raw_bytes, tags=tags)
         metrics.histogram(f'{_GCS_METRIC}.flush.compressed_bytes', len(body), tags=tags)
+        # A counter, unlike the histograms, sums across processes: insert - dropped_records - uploaded_records
+        # is what is still buffered, or was lost without being counted (a crash or SIGKILL).
+        metrics.increment(f'{_GCS_METRIC}.uploaded_records', batch.records)
 
     @staticmethod
     def _drop_failed_upload(batch: _Batch, object_name: str) -> None:

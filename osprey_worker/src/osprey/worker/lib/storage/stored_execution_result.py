@@ -904,13 +904,13 @@ _GCS_MISS_AGE_SECONDS = 300
 
 
 class StoredExecutionResultGCSMigration(ExecutionResultStore):
-    """Moves execution results from a legacy store (BigTable) to a primary store (GCS).
+    """Moves execution results from BigTable to GCS.
 
-    Every write goes to the primary, and to the legacy store while `bigtable_write_enabled` is on. Reads try
-    the primary and fall back to the legacy store. Primary failures never propagate; legacy failures do,
-    so the sink keeps its retry semantics.
+    Every write goes to GCS, and to BigTable while `bigtable_write_enabled` is on. Reads try GCS and fall
+    back to BigTable. GCS failures never propagate; BigTable failures do, so the sink keeps its retry
+    semantics.
 
-    Rollout: turn on dual write. Once reads are stable, turn BigTable writes off. After the legacy store's
+    Rollout: turn on dual write. Once reads are stable, turn BigTable writes off. After BigTable's
     90-day retention, switch the backend to `gcs`.
 
     `write target:gcs outcome:error` cannot fire for the GCS store, because its `insert` never raises.
@@ -919,26 +919,26 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
 
     def __init__(
         self,
-        primary: ExecutionResultStore,
-        legacy: ExecutionResultStore,
+        gcs: ExecutionResultStore,
+        bigtable: ExecutionResultStore,
         bigtable_write_enabled: bool,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        self._primary = primary
-        self._legacy = legacy
+        self._gcs = gcs
+        self._bigtable = bigtable
         self._bigtable_write_enabled = bigtable_write_enabled
         self._clock = clock
 
     @classmethod
     def from_config(
-        cls, primary: ExecutionResultStore, legacy: ExecutionResultStore
+        cls, gcs: ExecutionResultStore, bigtable: ExecutionResultStore
     ) -> StoredExecutionResultGCSMigration:
         from osprey.worker.lib.singletons import CONFIG
 
         config = CONFIG.instance()
         return cls(
-            primary,
-            legacy,
+            gcs,
+            bigtable,
             bigtable_write_enabled=config.get_bool('OSPREY_EXECUTION_RESULT_BIGTABLE_WRITE_ENABLED', True),
         )
 
@@ -951,7 +951,7 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         action_data_json: str,
     ) -> None:
         try:
-            self._primary.insert(
+            self._gcs.insert(
                 action_id=action_id,
                 extracted_features_json=extracted_features_json,
                 error_traces_json=error_traces_json,
@@ -967,7 +967,7 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         if not self._bigtable_write_enabled:
             return
         try:
-            self._legacy.insert(
+            self._bigtable.insert(
                 action_id=action_id,
                 extracted_features_json=extracted_features_json,
                 error_traces_json=error_traces_json,
@@ -986,13 +986,13 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
     def select_many(self, action_ids: List[int]) -> List[Dict[str, Any]]:
         action_ids = list(dict.fromkeys(action_ids))
         found: Dict[int, Dict[str, Any]] = {}
-        primary_failed = False
+        gcs_failed = False
         if action_ids:
             try:
                 with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:gcs']):
-                    found = {record['id']: record for record in self._primary.select_many(action_ids)}
+                    found = {record['id']: record for record in self._gcs.select_many(action_ids)}
             except ExecutionResultReadError as e:
-                # Keep what the primary read; the ids it could not read go to legacy below. The store
+                # Keep what GCS returned; the ids it could not read go to BigTable below. The store
                 # already logged each failure with its traceback.
                 logger.warning(
                     f'Read {len(e.partial_results)} of {len(action_ids)} execution results from GCS; '
@@ -1000,15 +1000,15 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
                 )
                 metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_error')
                 found = {record['id']: record for record in e.partial_results}
-                primary_failed = True
+                gcs_failed = True
             except Exception:
                 logger.exception(f'Failed to read {len(action_ids)} execution results from GCS')
                 metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_error')
-                primary_failed = True
+                gcs_failed = True
 
         misses = [i for i in action_ids if i not in found]
         # A failed read says nothing about what GCS holds, so it does not count toward either miss rate.
-        if not primary_failed:
+        if not gcs_failed:
             now = self._clock()
             old = sum(1 for i in misses if now - Snowflake(i).to_timestamp() > _GCS_MISS_AGE_SECONDS)
             if old:
@@ -1019,12 +1019,12 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         fallback: Dict[int, Dict[str, Any]] = {}
         if misses:
             with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:bigtable']):
-                fallback = {record['id']: record for record in self._legacy.select_many(misses)}
+                fallback = {record['id']: record for record in self._bigtable.select_many(misses)}
 
         results: List[Dict[str, Any]] = []
         sources = {'gcs': 0, 'bigtable': 0, 'not_found': 0}
         for action_id in action_ids:
-            # During dual write both stores can hold an id; the primary's record wins.
+            # During dual write both stores can hold an id; the GCS record wins.
             if action_id in found:
                 results.append(found[action_id])
                 sources['gcs'] += 1
@@ -1040,10 +1040,10 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
 
     def flush(self) -> None:
         try:
-            self._primary.flush()
+            self._gcs.flush()
         except Exception:
             logger.exception('Failed to flush buffered execution results to GCS')
-        self._legacy.flush()
+        self._bigtable.flush()
 
 
 class ExecutionResultStorageService:

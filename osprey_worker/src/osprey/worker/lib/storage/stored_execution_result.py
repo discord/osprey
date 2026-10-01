@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import base64
 import gzip
+import itertools
 import json
+import os
+import re
+import socket
+import threading
+import time
+import zlib
 from abc import ABC, abstractmethod
-from datetime import datetime
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
+from uuid import uuid4
 
 import gevent
 import google.cloud.storage as storage
 import pytz
 from google.api_core import retry
+from google.api_core.exceptions import PreconditionFailed
 from google.cloud.bigtable import row_filters, row_set
 from google.cloud.bigtable.row import Row
 from minio import Minio
@@ -21,6 +33,7 @@ from osprey.worker.lib.osprey_shared.logging import get_logger
 from osprey.worker.lib.snowflake import Snowflake
 from osprey.worker.lib.storage import ExecutionResultStorageBackendType, postgres
 from osprey.worker.lib.storage.bigtable import osprey_bigtable
+from osprey.worker.lib.storage.bloom_filter import BloomFilter
 from osprey.worker.lib.storage.pg_stored_execution import PgStoredExecutionResult
 from pydantic.main import BaseModel
 
@@ -31,8 +44,19 @@ if TYPE_CHECKING:
     from osprey.worker.ui_api.osprey.lib.abilities import DataCensorAbility
 
 BIGTABLE_CONCURRENCY_LIMIT = 100
-GCS_CONCURRENCY_LIMIT = 100
 MINIO_CONCURRENCY_LIMIT = 100
+
+
+class ExecutionResultReadError(Exception):
+    """A read found what it could, but some objects or prefixes could not be read.
+
+    `partial_results` holds the records that were read. A missing id may still exist in the store.
+    """
+
+    def __init__(self, partial_results: List[Dict[str, Any]], failed_prefixes: int) -> None:
+        super().__init__(f'{failed_prefixes} list or download calls failed')
+        self.partial_results = partial_results
+        self.failed_prefixes = failed_prefixes
 
 
 class ExecutionResultStore(ABC):
@@ -59,6 +83,10 @@ class ExecutionResultStore(ABC):
     ) -> None:
         """Insert an execution result."""
         pass
+
+    def flush(self) -> None:
+        """Upload or persist buffered writes. Default: nothing buffered."""
+        return None
 
 
 class ErrorTrace(BaseModel):
@@ -268,57 +296,127 @@ class StoredExecutionResultBigTable(ExecutionResultStore):
         return execution_result_dict
 
 
+# Caps closed batches waiting on the uploader so a GCS outage cannot grow memory without bound; past it,
+# new closes are dropped. The hard bound is MAX_PENDING_BATCHES x MAX_COMPRESSED_BYTES (512 MiB at the
+# defaults) plus the open batches. Typical use is far lower, because most batches close by time or count.
+MAX_PENDING_BATCHES = 32
+# An on-time batch lives at least this long. Records that lag past their slot's close re-open it, and
+# without this floor that batch would close, and upload a tiny object, on every tick.
+REOPEN_MIN_AGE_SECONDS = 60
+
+_GCS_METRIC = 'gcs_stored_execution_result'
+_LATE_SLOT = 'late'
+_WRITER_ID_INVALID_CHARS = re.compile(r'[^A-Za-z0-9._-]')
+# One counter per process, shared by every store instance, so no two uploads from this process pick
+# the same object name. `next()` on `itertools.count` is atomic under the GIL.
+_OBJECT_SEQ = itertools.count()
+
+
+def _writer_id(token: str) -> str:
+    # A restarted container keeps its hostname and often its pid, and seq restarts at 0; the token keeps
+    # its names distinct. Read the pid on every call so a store built before a fork differs per child.
+    host = os.environ.get('HOSTNAME') or socket.gethostname()
+    return _WRITER_ID_INVALID_CHARS.sub('_', f'{host}-{os.getpid()}-{token}')
+
+
+def _object_prefix(day: str, slot: str) -> str:
+    return f'v1/{day}/{slot}/'
+
+
+def _late_slot(hhmm: str) -> str:
+    # Split a day's late objects by snowflake hour, so a read lists one hour rather than the whole day.
+    return f'{_LATE_SLOT}/{hhmm[:2]}'
+
+
+@dataclass
+class _Batch:
+    key: Tuple[str, str]
+    created_at: float
+    # None for late batches: they close by age, not by bucket end.
+    bucket_end: Optional[float]
+    compressor: Any = field(default_factory=lambda: zlib.compressobj(6, zlib.DEFLATED, 31))
+    compressed: bytearray = field(default_factory=bytearray)
+    bloom: BloomFilter = field(default_factory=BloomFilter)
+    records: int = 0
+    raw_bytes: int = 0
+
+
 class StoredExecutionResultGCS(ExecutionResultStore):
-    def __init__(self):
-        self._gcs_client: storage.Client | None = None
-        self._bucket_name: str | None = None
+    """Buffers execution results in-process and writes them to GCS as gzip JSON-lines bundles.
 
-    def _get_gcs_client(self) -> storage.Client:
-        if self._gcs_client is None:
-            from osprey.worker.lib.singletons import CONFIG
+    Objects live under `v1/{YYYYMMDD}/{HHMM}/` (the action id's snowflake time, floored to the bucket
+    width) or under `v1/{YYYYMMDD}/late/{HH}/` (the snowflake hour) when the action is older than the late
+    threshold. Each object carries a Bloom filter of its ids in custom metadata, so a reader finds a
+    record from the id alone: list two prefixes, download only the objects whose filter matches.
 
-            config = CONFIG.instance()
-            project_id = config.get_str('OSPREY_GCP_PROJECT_ID', 'osprey-dev')
-            self._gcs_client = storage.Client(project=project_id)
-        return self._gcs_client
+    A write is not durable or readable until its batch uploads. A crash loses the open batches.
 
-    def _get_bucket_name(self) -> str:
-        if self._bucket_name is None:
-            from osprey.worker.lib.singletons import CONFIG
+    Uses `threading`, not `gevent`. The async worker calls every store method through
+    `asyncio.to_thread`, so inserts arrive on real OS threads and nothing there drives a gevent hub.
+    """
 
-            config = CONFIG.instance()
-            self._bucket_name = config.get_str('OSPREY_GCS_EXECUTION_RESULTS_BUCKET', 'osprey-execution-results-stg')
-        return self._bucket_name
+    # Sleeps between upload attempts; one more attempt than entries.
+    _UPLOAD_RETRY_DELAYS_SECONDS: Tuple[float, ...] = (0.5, 1.0)
 
-    def select_one(self, action_id: int) -> Optional[Dict[str, Any]]:
-        try:
-            with metrics.timed('gcs_stored_execution_result.get_one'):
-                object_name = StoredExecutionResultGCS._encode_action_id(action_id)
-                bucket = self._get_gcs_client().bucket(self._get_bucket_name())
-                blob = bucket.get_blob(object_name)
-                if not blob:
-                    metrics.increment(
-                        'gcs_stored_execution_result.select_one.not_found', tags=[f'action_id:{action_id}']
-                    )
-                    return None
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.time,
+        client_factory: Optional[Callable[[], storage.Client]] = None,
+    ) -> None:
+        from osprey.worker.lib.singletons import CONFIG
 
-                raw_data = blob.download_as_bytes()
-                data = json.loads(raw_data.decode('utf-8'))
+        config = CONFIG.instance()
+        # Object names come from the snowflake timestamp, so a zero epoch files every record under 1970.
+        if config.get_int('SNOWFLAKE_EPOCH', 0) == 0:
+            raise ValueError('SNOWFLAKE_EPOCH must be set and non-zero to use StoredExecutionResultGCS')
+        self._bucket_name = config.expect_str('OSPREY_GCS_EXECUTION_RESULTS_BUCKET')
+        # Writer and reader must use the same width; changing it orphans existing objects for reads.
+        self._bucket_width_minutes = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_BUCKET_WIDTH_MINUTES', 1)
+        if self._bucket_width_minutes <= 0 or 60 % self._bucket_width_minutes != 0:
+            raise ValueError('OSPREY_GCS_EXECUTION_RESULTS_BUCKET_WIDTH_MINUTES must divide 60')
+        self._max_records = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS', 1000)
+        # BloomFilter() keeps false positives under 1e-5 only up to 1000 keys; each false positive costs a reader
+        # a full object download.
+        if not 1 <= self._max_records <= 1000:
+            raise ValueError('OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS must be between 1 and 1000')
+        self._max_compressed_bytes = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_MAX_COMPRESSED_BYTES', 16777216)
+        self._close_grace_seconds = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_CLOSE_GRACE_SECONDS', 15)
+        # Every read of an hour lists its late prefix, so keep it for replays: a backlog shorter than this still
+        # lands in per-minute prefixes instead of piling into one late/{HH} prefix.
+        self._late_threshold_seconds = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_LATE_THRESHOLD_SECONDS', 3600)
+        self._flush_tick_seconds = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_FLUSH_TICK_SECONDS', 300)
+        upload_threads = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_UPLOAD_THREADS', 2)
+        self._read_threads = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_READ_THREADS', 16)
+        project_id = config.get_str('OSPREY_GCP_PROJECT_ID', 'osprey-dev')
 
-                result = StoredExecutionResultGCS._execution_result_dict_from_gcs_data(data)
-                return result
-        except Exception as e:
-            logger.error(f'Failed to retrieve execution result from GCS for action_id {action_id}: {e}')
-            return None
+        self._clock = clock
+        self._client_factory = client_factory or (lambda: storage.Client(project=project_id))
+        self._client: Optional[storage.Client] = None
+        self._client_lock = threading.Lock()
+        self._writer_token = uuid4().hex[:8]
 
-    def select_many(self, action_ids: List[int]) -> List[Dict[str, Any]]:
-        results = [
-            result
-            for result in gevent.pool.Pool(GCS_CONCURRENCY_LIMIT).imap(self.select_one, action_ids)
-            if result is not None
-        ]
+        self._lock = threading.Lock()
+        self._batches: Dict[Tuple[str, str], _Batch] = {}
+        self._uploader = ThreadPoolExecutor(max_workers=upload_threads, thread_name_prefix='gcs-batched-upload')
+        # Queued and running uploads, mapped to their record counts.
+        self._in_flight: Dict[Future[None], int] = {}
+        self._in_flight_lock = threading.Lock()
+        self._timer_thread: Optional[threading.Thread] = None
+        self._stop_timer = threading.Event()
 
-        return results
+    def _get_client(self) -> storage.Client:
+        with self._client_lock:
+            if self._client is None:
+                self._client = self._client_factory()
+            return self._client
+
+    def _on_time_slot(self, snowflake_seconds: float) -> Tuple[str, str, float]:
+        """Returns (YYYYMMDD, HHMM, bucket end) for a snowflake time, floored to the bucket width."""
+        moment = datetime.fromtimestamp(snowflake_seconds, tz=timezone.utc)
+        start = moment.replace(
+            minute=moment.minute - moment.minute % self._bucket_width_minutes, second=0, microsecond=0
+        )
+        return start.strftime('%Y%m%d'), start.strftime('%H%M'), start.timestamp() + self._bucket_width_minutes * 60
 
     def insert(
         self,
@@ -329,50 +427,316 @@ class StoredExecutionResultGCS(ExecutionResultStore):
         action_data_json: str,
     ) -> None:
         try:
-            with metrics.timed('gcs_stored_execution_result.insert'):
-                object_name = StoredExecutionResultGCS._encode_action_id(action_id)
-                data = {
-                    'id': action_id,
-                    'extracted_features': extracted_features_json,
-                    'error_traces': error_traces_json,
-                    'timestamp': timestamp.isoformat(),
-                    'action_data': action_data_json,
-                }
+            for cell, value in (
+                ('extracted_features', extracted_features_json),
+                ('error_traces', error_traces_json),
+                ('action_data', action_data_json),
+            ):
+                metrics.histogram(f'{_GCS_METRIC}.value_bytes', len(value.encode('utf-8')), tags=[f'cell:{cell}'])
 
-                json_data = json.dumps(data)
-                compressed_data = gzip.compress(json_data.encode('utf-8'))
+            snowflake_seconds = Snowflake(action_id).to_timestamp()
+            now = self._clock()
+            day, hhmm, bucket_end = self._on_time_slot(snowflake_seconds)
+            late = now - snowflake_seconds > self._late_threshold_seconds
+            key = (day, _late_slot(hhmm) if late else hhmm)
+            line = (
+                json.dumps(
+                    {
+                        'id': action_id,
+                        'ts': timestamp.isoformat(),
+                        'extracted_features': extracted_features_json,
+                        'error_traces': error_traces_json,
+                        'action_data': action_data_json,
+                    }
+                )
+                + '\n'
+            ).encode('utf-8')
 
-                bucket = self._get_gcs_client().bucket(self._get_bucket_name())
-                blob = bucket.blob(object_name)
+            closed: Optional[Tuple[_Batch, str]] = None
+            with self._lock:
+                # Start the timer on first use, so building a store (ui-api, chooser probes) starts no thread.
+                if self._timer_thread is None:
+                    self._start_timer_locked()
+                batch = self._batches.get(key)
+                if batch is None:
+                    batch = _Batch(key=key, created_at=now, bucket_end=None if late else bucket_end)
+                    self._batches[key] = batch
+                batch.compressed += batch.compressor.compress(line)
+                batch.bloom.add(action_id)
+                batch.records += 1
+                batch.raw_bytes += len(line)
+                if batch.records >= self._max_records:
+                    closed = (self._batches.pop(key), 'max_records')
+                elif len(batch.compressed) >= self._max_compressed_bytes:
+                    closed = (self._batches.pop(key), 'max_bytes')
 
-                blob.content_encoding = 'gzip'
+            metrics.increment(f'{_GCS_METRIC}.insert', tags=[f'slot:{"late" if late else "on_time"}'])
+            if closed is not None:
+                self._submit(*closed)
+        except Exception:
+            logger.exception(f'Failed to buffer execution result {action_id} for GCS')
+            metrics.increment(f'{_GCS_METRIC}.dropped_records')
 
-                blob.upload_from_string(compressed_data, content_type='application/json')
+    def start(self) -> None:
+        """Starts the daemon thread that closes due batches. Idempotent; the first insert also calls it."""
+        with self._lock:
+            self._start_timer_locked()
 
-        except Exception as e:
-            logger.error(f'Failed to insert execution result into GCS for action_id {action_id}: {e}')
+    def _start_timer_locked(self) -> None:
+        if self._timer_thread is not None:
+            return
+        self._stop_timer.clear()
+        self._timer_thread = threading.Thread(target=self._run_timer, name='gcs-batched-timer', daemon=True)
+        self._timer_thread.start()
 
-    @staticmethod
-    def _encode_action_id(action_id_snowflake: int) -> str:
-        """Constructs a GCS object key for a given snowflake using the same distribution logic as BigTable."""
-        key_prefix = Snowflake(action_id_snowflake).to_key_prefix()
-        return f'{key_prefix}:{action_id_snowflake}.json'
+    def close(self) -> None:
+        """Stops the timer, uploads every open batch, and shuts the uploader down."""
+        with self._lock:
+            timer_thread, self._timer_thread = self._timer_thread, None
+        if timer_thread is not None:
+            # Join outside the lock: a running tick takes it.
+            self._stop_timer.set()
+            timer_thread.join()
+        self.flush()
+        # flush() already bounded the wait. Cancel the uploads still queued so interpreter exit does not
+        # block on them, and count their records as dropped.
+        with self._in_flight_lock:
+            in_flight = list(self._in_flight.items())
+        cancelled_records = sum(records for future, records in in_flight if future.cancel())
+        self._uploader.shutdown(wait=False, cancel_futures=True)
+        if cancelled_records:
+            logger.error(f'Dropped {cancelled_records} execution results: their uploads were still queued at close')
+            metrics.increment(f'{_GCS_METRIC}.dropped_records', cancelled_records)
 
-    @staticmethod
-    def _execution_result_dict_from_gcs_data(data: Dict[str, Any]) -> Dict[str, Any]:
-        execution_result_dict = {
-            'id': data['id'],
-            'extracted_features': data['extracted_features'],
-            'error_traces': data['error_traces'],
-            'timestamp': datetime.fromisoformat(data['timestamp']),
-            'action_data': None,
+    def flush(self, timeout: float = 25.0) -> None:
+        """Uploads every open batch and waits up to `timeout` for all in-flight uploads."""
+        with self._lock:
+            batches = list(self._batches.values())
+            self._batches = {}
+        for batch in batches:
+            self._submit(batch, 'shutdown')
+        with self._in_flight_lock:
+            pending = list(self._in_flight)
+        _, not_done = wait(pending, timeout=timeout)
+        if not_done:
+            logger.error(f'{len(not_done)} execution result uploads to GCS did not finish within {timeout}s')
+
+    def _run_timer(self) -> None:
+        # Event.wait doubles as the sleep and the stop signal, so close() does not wait a full tick.
+        while not self._stop_timer.wait(1.0):
+            try:
+                self._tick()
+            except Exception:
+                logger.exception('Failed to close due execution result batches')
+
+    def _tick(self) -> None:
+        now = self._clock()
+        due: List[Tuple[_Batch, str]] = []
+        with self._lock:
+            for key, batch in list(self._batches.items()):
+                if batch.bucket_end is None:
+                    if now - batch.created_at >= self._flush_tick_seconds:
+                        due.append((self._batches.pop(key), 'tick'))
+                elif now >= max(
+                    batch.bucket_end + self._close_grace_seconds, batch.created_at + REOPEN_MIN_AGE_SECONDS
+                ):
+                    due.append((self._batches.pop(key), 'bucket_closed'))
+            buffered_records = sum(batch.records for batch in self._batches.values())
+            open_batches = len(self._batches)
+        with self._in_flight_lock:
+            pending_batches = len(self._in_flight)
+        metrics.gauge(f'{_GCS_METRIC}.buffered_records', buffered_records)
+        metrics.gauge(f'{_GCS_METRIC}.open_batches', open_batches)
+        metrics.gauge(f'{_GCS_METRIC}.pending_batches', pending_batches)
+        for batch, reason in due:
+            self._submit(batch, reason)
+
+    def _submit(self, batch: _Batch, reason: str) -> None:
+        # Never call this while holding self._lock: the future can finish before we return.
+        with self._in_flight_lock:
+            if len(self._in_flight) >= MAX_PENDING_BATCHES:
+                logger.error(f'Dropped {batch.records} execution results: {MAX_PENDING_BATCHES} batches await upload')
+                metrics.increment(f'{_GCS_METRIC}.flush_error', batch.records)
+                metrics.increment(f'{_GCS_METRIC}.dropped_records', batch.records)
+                return
+            try:
+                future = self._uploader.submit(self._upload, batch, reason)
+            except RuntimeError:
+                # The uploader refuses work after close().
+                logger.error(f'Dropped {batch.records} execution results: the GCS uploader is shut down')
+                metrics.increment(f'{_GCS_METRIC}.dropped_records', batch.records)
+                return
+            self._in_flight[future] = batch.records
+        # Outside the lock: if the future is already done, the callback runs here and takes the lock.
+        future.add_done_callback(self._forget_upload)
+
+    def _forget_upload(self, future: Future[None]) -> None:
+        with self._in_flight_lock:
+            self._in_flight.pop(future, None)
+
+    def _upload(self, batch: _Batch, reason: str) -> None:
+        # Nobody reads the future's result, so an escaped exception would lose the batch silently.
+        try:
+            self._upload_batch(batch, reason)
+        except Exception:
+            logger.exception(f'Dropped {batch.records} execution results: unexpected error while uploading')
+            metrics.increment(f'{_GCS_METRIC}.dropped_records', batch.records)
+
+    def _upload_batch(self, batch: _Batch, reason: str) -> None:
+        started = time.monotonic()
+        batch.compressed += batch.compressor.flush()
+        day, slot = batch.key
+        object_name = f'{_object_prefix(day, slot)}{_writer_id(self._writer_token)}-{next(_OBJECT_SEQ):08d}.jsonl.gz'
+        metadata = {
+            'schema': '1',
+            'n': str(batch.records),
+            'bloom': base64.b64encode(batch.bloom.to_bytes()).decode('ascii'),
+            'bloom_k': '7',
         }
+        body = bytes(batch.compressed)
+        for attempt in range(len(self._UPLOAD_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                blob = self._get_client().bucket(self._bucket_name).blob(object_name)
+                blob.metadata = metadata
+                # retry=None keeps this loop the only retry, so one attempt is one request and a 412 on
+                # the first attempt really is a collision.
+                blob.upload_from_string(
+                    body, content_type='application/gzip', if_generation_match=0, retry=None, timeout=30
+                )
+                break
+            except PreconditionFailed:
+                if attempt > 0:
+                    # Names are unique, so a 412 on a retry means an earlier attempt stored the object
+                    # and only its response was lost.
+                    logger.info(f'GCS object {object_name} already exists on retry; an earlier attempt stored it')
+                    break
+                # A 412 on the first attempt is a real name collision; retrying would hit it again.
+                self._drop_failed_upload(batch, object_name)
+                return
+            except Exception:
+                if attempt == len(self._UPLOAD_RETRY_DELAYS_SECONDS):
+                    self._drop_failed_upload(batch, object_name)
+                    return
+                metrics.increment(f'{_GCS_METRIC}.upload_retry')
+                time.sleep(self._UPLOAD_RETRY_DELAYS_SECONDS[attempt])
 
-        action_data = data.get('action_data')
-        if action_data:
-            execution_result_dict['action_data'] = action_data
+        tags = [f'reason:{reason}']
+        metrics.timing(f'{_GCS_METRIC}.flush.duration', time.monotonic() - started, tags=tags)
+        metrics.histogram(f'{_GCS_METRIC}.flush.records', batch.records, tags=tags)
+        metrics.histogram(f'{_GCS_METRIC}.flush.raw_bytes', batch.raw_bytes, tags=tags)
+        metrics.histogram(f'{_GCS_METRIC}.flush.compressed_bytes', len(body), tags=tags)
 
-        return execution_result_dict
+    @staticmethod
+    def _drop_failed_upload(batch: _Batch, object_name: str) -> None:
+        logger.exception(f'Failed to upload {batch.records} execution results to GCS object {object_name}')
+        metrics.increment(f'{_GCS_METRIC}.flush_error', batch.records)
+        metrics.increment(f'{_GCS_METRIC}.dropped_records', batch.records)
+
+    def select_one(self, action_id: int) -> Optional[Dict[str, Any]]:
+        results = self.select_many([action_id])
+        return results[0] if results else None
+
+    def select_many(self, action_ids: List[int]) -> List[Dict[str, Any]]:
+        if not action_ids:
+            return []
+
+        with metrics.timed(f'{_GCS_METRIC}.select.duration'):
+            # The writer's clock decides on-time vs late, so the reader checks both. The late prefix
+            # covers the id's snowflake hour and collects every wanted id from that hour.
+            wanted_by_prefix: Dict[str, Set[int]] = {}
+            for action_id in action_ids:
+                day, hhmm, _ = self._on_time_slot(Snowflake(action_id).to_timestamp())
+                for slot in (hhmm, _late_slot(hhmm)):
+                    wanted_by_prefix.setdefault(_object_prefix(day, slot), set()).add(action_id)
+
+            found: Dict[int, Dict[str, Any]] = {}
+            failures = 0
+            pool = ThreadPoolExecutor(max_workers=self._read_threads)
+            try:
+                candidates: List[Tuple[Any, Set[int]]] = []
+                for listed in pool.map(self._list_candidates, wanted_by_prefix.items()):
+                    if listed is None:
+                        failures += 1
+                    else:
+                        candidates.extend(listed)
+                metrics.increment(f'{_GCS_METRIC}.select.candidates', len(candidates))
+                for records in pool.map(self._read_candidate, candidates):
+                    if records is None:
+                        failures += 1
+                        continue
+                    for record in records:
+                        current = found.get(record['id'])
+                        # A record can land twice (a retried upload or a replay). `ts` is the action
+                        # timestamp, so equal `ts` keeps the first copy seen and a later `ts` wins.
+                        if current is None or record['timestamp'] > current['timestamp']:
+                            found[record['id']] = record
+            finally:
+                # Do not join list or download calls still running, so a caller's deadline (a gevent.Timeout
+                # in smite-ui-api) surfaces now instead of after every GCS request returns.
+                pool.shutdown(wait=False, cancel_futures=True)
+
+            metrics.increment(f'{_GCS_METRIC}.select.found', len(found))
+            metrics.increment(f'{_GCS_METRIC}.select.missing', len(set(action_ids)) - len(found))
+        results = list(found.values())
+        if failures:
+            raise ExecutionResultReadError(partial_results=results, failed_prefixes=failures)
+        return results
+
+    def _list_candidates(self, prefix_and_wanted: Tuple[str, Set[int]]) -> Optional[List[Tuple[Any, Set[int]]]]:
+        prefix, wanted = prefix_and_wanted
+        candidates: List[Tuple[Any, Set[int]]] = []
+        try:
+            iterator = self._get_client().list_blobs(
+                self._bucket_name, prefix=prefix, fields='items(name,metadata),nextPageToken'
+            )
+            for page in iterator.pages:
+                listed = 0
+                for blob in page:
+                    listed += 1
+                    if self._may_contain(blob.metadata, wanted):
+                        candidates.append((blob, wanted))
+                metrics.increment(f'{_GCS_METRIC}.select.list_pages')
+                metrics.increment(f'{_GCS_METRIC}.select.objects_listed', listed)
+        except Exception:
+            logger.exception(f'Failed to list batched execution results under GCS prefix {prefix}')
+            return None
+        return candidates
+
+    @staticmethod
+    def _may_contain(metadata: Optional[Dict[str, str]], wanted: Set[int]) -> bool:
+        # An object without a usable filter could hold anything, so it stays a candidate.
+        if not metadata or 'bloom' not in metadata:
+            return True
+        try:
+            bloom = BloomFilter.from_bytes(base64.b64decode(metadata['bloom']), int(metadata['bloom_k']))
+        except (KeyError, TypeError, ValueError):
+            return True
+        return any(action_id in bloom for action_id in wanted)
+
+    def _read_candidate(self, candidate: Tuple[Any, Set[int]]) -> Optional[List[Dict[str, Any]]]:
+        blob, wanted = candidate
+        records: List[Dict[str, Any]] = []
+        try:
+            data = blob.download_as_bytes()
+            metrics.increment(f'{_GCS_METRIC}.select.bytes_downloaded', len(data))
+            for line in gzip.decompress(data).splitlines():
+                record = json.loads(line)
+                if record['id'] in wanted:
+                    records.append(
+                        {
+                            'id': record['id'],
+                            'extracted_features': record['extracted_features'],
+                            'error_traces': record['error_traces'],
+                            'timestamp': datetime.fromisoformat(record['ts']),
+                            'action_data': record.get('action_data') or None,
+                        }
+                    )
+        except Exception:
+            logger.exception(f'Failed to read batched execution results from GCS object {blob.name}')
+            return None
+        if not records:
+            metrics.increment(f'{_GCS_METRIC}.select.bloom_false_positives')
+        return records
 
 
 class StoredExecutionResultMinIO(ExecutionResultStore):
@@ -544,6 +908,156 @@ class StoredExecutionResultPostgres(ExecutionResultStore):
         return execution_result_dict
 
 
+_GCS_MIGRATION_METRIC = 'execution_result_gcs_migration'
+# The GCS writer closes a slot about 15 s after it ends, then uploads. `gcs_miss age:under_5m` is likely
+# a write still in the buffer. `age:over_5m` means the id predates dual write, GCS lost it, or a worker
+# processed it more than ~4 min late and its batch has not uploaded yet (up to 60 s more, 300 s if late).
+_GCS_MISS_AGE_SECONDS = 300
+
+
+class StoredExecutionResultGCSMigration(ExecutionResultStore):
+    """Moves execution results from BigTable to GCS.
+
+    Every write goes to GCS, and to BigTable while `bigtable_write_enabled` is on. Reads try GCS and fall
+    back to BigTable. GCS failures never propagate; BigTable failures do, so the sink keeps its retry
+    semantics.
+
+    Rollout: turn on dual write. Once reads are stable, turn BigTable writes off. After BigTable's
+    90-day retention, switch the backend to `gcs`.
+
+    `write target:gcs outcome:error` cannot fire for the GCS store, because its `insert` never raises.
+    `gcs_stored_execution_result.dropped_records` is the write-failure signal.
+    """
+
+    def __init__(
+        self,
+        gcs: ExecutionResultStore,
+        bigtable: ExecutionResultStore,
+        bigtable_write_enabled: bool,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._gcs = gcs
+        self._bigtable = bigtable
+        self._bigtable_write_enabled = bigtable_write_enabled
+        self._clock = clock
+
+    @classmethod
+    def from_config(
+        cls, gcs: ExecutionResultStore, bigtable: ExecutionResultStore
+    ) -> StoredExecutionResultGCSMigration:
+        from osprey.worker.lib.singletons import CONFIG
+
+        config = CONFIG.instance()
+        return cls(
+            gcs,
+            bigtable,
+            bigtable_write_enabled=config.get_bool('OSPREY_EXECUTION_RESULT_BIGTABLE_WRITE_ENABLED', True),
+        )
+
+    def insert(
+        self,
+        action_id: int,
+        extracted_features_json: str,
+        error_traces_json: str,
+        timestamp: datetime,
+        action_data_json: str,
+    ) -> None:
+        try:
+            self._gcs.insert(
+                action_id=action_id,
+                extracted_features_json=extracted_features_json,
+                error_traces_json=error_traces_json,
+                timestamp=timestamp,
+                action_data_json=action_data_json,
+            )
+            outcome = 'ok'
+        except Exception:
+            logger.exception(f'Failed to write execution result {action_id} to GCS')
+            outcome = 'error'
+        metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:gcs', f'outcome:{outcome}'])
+
+        if not self._bigtable_write_enabled:
+            return
+        try:
+            self._bigtable.insert(
+                action_id=action_id,
+                extracted_features_json=extracted_features_json,
+                error_traces_json=error_traces_json,
+                timestamp=timestamp,
+                action_data_json=action_data_json,
+            )
+        except Exception:
+            metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:bigtable', 'outcome:error'])
+            raise
+        metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:bigtable', 'outcome:ok'])
+
+    def select_one(self, action_id: int) -> Optional[Dict[str, Any]]:
+        results = self.select_many([action_id])
+        return results[0] if results else None
+
+    def select_many(self, action_ids: List[int]) -> List[Dict[str, Any]]:
+        action_ids = list(dict.fromkeys(action_ids))
+        found: Dict[int, Dict[str, Any]] = {}
+        gcs_failed = False
+        if action_ids:
+            try:
+                with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:gcs']):
+                    found = {record['id']: record for record in self._gcs.select_many(action_ids)}
+            except ExecutionResultReadError as e:
+                # Keep what GCS returned; the ids it could not read go to BigTable below. The store
+                # already logged each failure with its traceback.
+                logger.warning(
+                    f'Read {len(e.partial_results)} of {len(action_ids)} execution results from GCS; '
+                    f'{e.failed_prefixes} list or download calls failed'
+                )
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_error')
+                found = {record['id']: record for record in e.partial_results}
+                gcs_failed = True
+            except Exception:
+                logger.exception(f'Failed to read {len(action_ids)} execution results from GCS')
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_error')
+                gcs_failed = True
+
+        misses = [i for i in action_ids if i not in found]
+        # A failed read says nothing about what GCS holds, so it does not count toward either miss rate.
+        if not gcs_failed:
+            now = self._clock()
+            old = sum(1 for i in misses if now - Snowflake(i).to_timestamp() > _GCS_MISS_AGE_SECONDS)
+            if old:
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_miss', old, tags=['age:over_5m'])
+            if len(misses) > old:
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_miss', len(misses) - old, tags=['age:under_5m'])
+
+        fallback: Dict[int, Dict[str, Any]] = {}
+        if misses:
+            with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:bigtable']):
+                fallback = {record['id']: record for record in self._bigtable.select_many(misses)}
+
+        results: List[Dict[str, Any]] = []
+        sources = {'gcs': 0, 'bigtable': 0, 'not_found': 0}
+        for action_id in action_ids:
+            # During dual write both stores can hold an id; the GCS record wins.
+            if action_id in found:
+                results.append(found[action_id])
+                sources['gcs'] += 1
+            elif action_id in fallback:
+                results.append(fallback[action_id])
+                sources['bigtable'] += 1
+            else:
+                sources['not_found'] += 1
+        for source, count in sources.items():
+            if count:
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.source', count, tags=[f'source:{source}'])
+        return results
+
+    def flush(self) -> None:
+        try:
+            self._gcs.flush()
+        except Exception:
+            logger.exception('Failed to flush buffered execution results to GCS')
+        self._bigtable.flush()
+
+
 class ExecutionResultStorageService:
     """Service class that provides execution result operations with a configured backend."""
 
@@ -567,6 +1081,10 @@ class ExecutionResultStorageService:
     ) -> List[StoredExecutionResult]:
         """Get execution results from the configured storage backend."""
         return StoredExecutionResult.get_many(action_ids, self._storage_backend, data_censor_abilities)
+
+    def flush(self) -> None:
+        """Upload or persist the backend's buffered writes."""
+        self._storage_backend.flush()
 
 
 def bootstrap_execution_result_storage_service() -> ExecutionResultStorageService:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import gzip
-import hashlib
 import itertools
 import json
 import os
@@ -899,59 +898,38 @@ class StoredExecutionResultPostgres(ExecutionResultStore):
 
 
 _GCS_MIGRATION_METRIC = 'execution_result_gcs_migration'
-# The batched writer closes a slot about 15 s after it ends, then uploads. A sampled id older than this
-# should be readable, so a miss means lost or unreadable data rather than a write still in the buffer.
+# The GCS writer closes a slot about 15 s after it ends, then uploads. An id at or past the cutover and
+# older than this should be readable, so a miss means lost or unreadable data rather than a buffered write.
 _UNEXPECTED_MISS_AGE_SECONDS = 300
 
 
-def in_gcs_write_sample(action_id: int, percent: float) -> bool:
-    """Returns whether `action_id` falls in the GCS write sample.
-
-    Hashes the id, so writers and readers agree without shared state, and a reader can tell an expected
-    GCS miss from an unexpected one.
-    """
-    if percent <= 0:
-        return False
-    if percent >= 100:
-        return True
-    digest = hashlib.blake2b(action_id.to_bytes(8, 'big'), digest_size=4).digest()
-    return int.from_bytes(digest, 'big') % 10000 < int(percent * 100)
-
-
 class StoredExecutionResultGCSMigration(ExecutionResultStore):
-    """Moves execution results from a legacy store (BigTable) to a primary store (batched GCS) in steps.
+    """Moves execution results from a legacy store (BigTable) to a primary store (GCS).
 
-    Writes go to the primary for a percent of action ids and to the legacy store while it stays the
-    system of record. Reads try the primary for ids at or above `cutover_id` and fall back to the legacy
-    store. Primary failures never propagate; legacy failures do, so the sink keeps its retry semantics.
+    Every write goes to the primary, and to the legacy store while `legacy_write_enabled` is on. Reads try
+    the primary for ids at or past `cutover_id` and fall back to the legacy store. Primary failures never
+    propagate; legacy failures do, so the sink keeps its retry semantics.
 
-    `write target:gcs outcome:error` cannot fire for the batched store, because its `insert` never
-    raises. `gcs_stored_execution_result.dropped_records` is the write-failure signal.
+    Rollout: turn on dual write, then set `OSPREY_EXECUTION_RESULT_GCS_CUTOVER_ID` once, to a snowflake
+    minted after dual write is live on every worker. Ids before it skip GCS, so `gcs_unexpected_miss`
+    counts only data GCS should hold. Once that metric is stable, turn legacy write off. After the
+    legacy store's 90-day retention, switch the backend to `gcs`.
 
-    The miss metrics use the reader's current percent, so operate a ramp this way. At every increase of
-    `OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT`, set `OSPREY_EXECUTION_RESULT_GCS_CUTOVER_ID` to a
-    snowflake minted after the new percent is live on every worker. This is safe while legacy write and
-    legacy read fallback stay on. Once legacy read fallback is off, ids below the cutover are unreadable
-    even if GCS holds them. Change the percent on the worker and the ui-api together. Otherwise
-    `gcs_unexpected_miss` over-counts (percent raised without a new cutover) or under-counts (ui-api
-    percent lags the worker).
+    `write target:gcs outcome:error` cannot fire for the GCS store, because its `insert` never raises.
+    `gcs_stored_execution_result.dropped_records` is the write-failure signal.
     """
 
     def __init__(
         self,
         primary: ExecutionResultStore,
         legacy: ExecutionResultStore,
-        gcs_write_percent: float,
         legacy_write_enabled: bool,
-        legacy_read_fallback: bool,
         cutover_id: int,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._primary = primary
         self._legacy = legacy
-        self._gcs_write_percent = gcs_write_percent
         self._legacy_write_enabled = legacy_write_enabled
-        self._legacy_read_fallback = legacy_read_fallback
         self._cutover_id = cutover_id
         self._clock = clock
 
@@ -962,19 +940,10 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         from osprey.worker.lib.singletons import CONFIG
 
         config = CONFIG.instance()
-        gcs_write_percent = config.get_float('OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT', 0.0)
-        legacy_write_enabled = config.get_bool('OSPREY_EXECUTION_RESULT_LEGACY_WRITE_ENABLED', True)
-        if not legacy_write_enabled and gcs_write_percent < 100:
-            logger.warning(
-                f'Legacy execution result writes are off and the GCS write percent is {gcs_write_percent}: '
-                'unsampled action ids are written nowhere'
-            )
         return cls(
             primary,
             legacy,
-            gcs_write_percent=gcs_write_percent,
-            legacy_write_enabled=legacy_write_enabled,
-            legacy_read_fallback=config.get_bool('OSPREY_EXECUTION_RESULT_LEGACY_READ_FALLBACK', True),
+            legacy_write_enabled=config.get_bool('OSPREY_EXECUTION_RESULT_LEGACY_WRITE_ENABLED', True),
             cutover_id=config.get_int('OSPREY_EXECUTION_RESULT_GCS_CUTOVER_ID', 0),
         )
 
@@ -986,20 +955,18 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         timestamp: datetime,
         action_data_json: str,
     ) -> None:
-        outcome = 'skipped'
-        if in_gcs_write_sample(action_id, self._gcs_write_percent):
-            try:
-                self._primary.insert(
-                    action_id=action_id,
-                    extracted_features_json=extracted_features_json,
-                    error_traces_json=error_traces_json,
-                    timestamp=timestamp,
-                    action_data_json=action_data_json,
-                )
-                outcome = 'ok'
-            except Exception:
-                logger.exception(f'Failed to write execution result {action_id} to GCS')
-                outcome = 'error'
+        try:
+            self._primary.insert(
+                action_id=action_id,
+                extracted_features_json=extracted_features_json,
+                error_traces_json=error_traces_json,
+                timestamp=timestamp,
+                action_data_json=action_data_json,
+            )
+            outcome = 'ok'
+        except Exception:
+            logger.exception(f'Failed to write execution result {action_id} to GCS')
+            outcome = 'error'
         metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:gcs', f'outcome:{outcome}'])
 
         if not self._legacy_write_enabled:
@@ -1053,19 +1020,14 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         # A failed read says nothing about what GCS holds, so it does not count toward either miss rate.
         if not primary_failed:
             now = self._clock()
-            unexpected = sum(
-                1
-                for i in misses
-                if in_gcs_write_sample(i, self._gcs_write_percent)
-                and now - Snowflake(i).to_timestamp() > _UNEXPECTED_MISS_AGE_SECONDS
-            )
+            unexpected = sum(1 for i in misses if now - Snowflake(i).to_timestamp() > _UNEXPECTED_MISS_AGE_SECONDS)
             if unexpected:
                 metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_unexpected_miss', unexpected)
             if len(misses) > unexpected:
                 metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_expected_miss', len(misses) - unexpected)
 
         fallback: Dict[int, Dict[str, Any]] = {}
-        if self._legacy_read_fallback and (misses or ineligible):
+        if misses or ineligible:
             with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:legacy']):
                 fallback = {record['id']: record for record in self._legacy.select_many(misses + ineligible)}
 

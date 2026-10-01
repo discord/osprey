@@ -1,5 +1,4 @@
 import contextlib
-import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -13,7 +12,6 @@ from osprey.worker.lib.storage.stored_execution_result import (
     StoredExecutionResultGCS,
     StoredExecutionResultGCSMigration,
     bootstrap_execution_result_storage_service,
-    in_gcs_write_sample,
 )
 from osprey.worker.lib.storage.tests.test_stored_execution_result_gcs import _FakeClient, _FakeGCS
 
@@ -27,16 +25,8 @@ def _action_id(moment: datetime, sequence: int = 0) -> int:
     return ((unix_ms - _EPOCH_MS) << 22) | sequence
 
 
-# Ten minutes old: past the 300 s threshold, so a sampled miss is unexpected.
+# Ten minutes old: past the 300 s threshold, so a miss is unexpected.
 _OLD = _action_id(_NOW - timedelta(minutes=10))
-
-
-def _find_id(moment: datetime, sampled: bool, percent: float = 50.0) -> int:
-    return next(
-        action_id
-        for action_id in (_action_id(moment, sequence) for sequence in range(1000))
-        if in_gcs_write_sample(action_id, percent) == sampled
-    )
 
 
 class _FakeStore(ExecutionResultStore):
@@ -145,17 +135,13 @@ def legacy() -> _FakeStore:
 def _gcs_migration_store(
     primary: _FakeStore,
     legacy: _FakeStore,
-    gcs_write_percent: float = 100.0,
     legacy_write_enabled: bool = True,
-    legacy_read_fallback: bool = True,
     cutover_id: int = 0,
 ) -> StoredExecutionResultGCSMigration:
     return StoredExecutionResultGCSMigration(
         primary,
         legacy,
-        gcs_write_percent=gcs_write_percent,
         legacy_write_enabled=legacy_write_enabled,
-        legacy_read_fallback=legacy_read_fallback,
         cutover_id=cutover_id,
         clock=_NOW.timestamp,
     )
@@ -165,37 +151,7 @@ def _insert(store: ExecutionResultStore, action_id: int) -> None:
     store.insert(action_id, '{"ActionName": "test"}', '[]', _NOW, '{}')
 
 
-def test_sample_bounds_rate_and_determinism() -> None:
-    ids = [_action_id(_NOW + timedelta(milliseconds=i // 4), i % 4) for i in range(20000)]
-    assert not any(in_gcs_write_sample(i, 0) for i in ids)
-    assert all(in_gcs_write_sample(i, 100) for i in ids)
-    sampled = [i for i in ids if in_gcs_write_sample(i, 10)]
-    assert 0.08 * len(ids) < len(sampled) < 0.12 * len(ids)
-    assert sampled == [i for i in ids if in_gcs_write_sample(i, 10)]
-
-
-def test_sample_golden_vectors() -> None:
-    # Buckets, blake2b(id.to_bytes(8, 'big'), digest_size=4) as a big-endian int % 10000:
-    # 1234567890123456789 -> 4329, 987654321098765432 -> 8266. A change here splits worker and ui-api.
-    assert in_gcs_write_sample(1234567890123456789, 43.3)
-    assert not in_gcs_write_sample(1234567890123456789, 43.29)
-    assert in_gcs_write_sample(987654321098765432, 82.67)
-    assert not in_gcs_write_sample(987654321098765432, 82.66)
-
-
-def test_insert_at_zero_percent_writes_legacy_only(
-    primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics
-) -> None:
-    _insert(_gcs_migration_store(primary, legacy, gcs_write_percent=0), _OLD)
-    assert primary.records == {}
-    assert list(legacy.records) == [_OLD]
-    assert fake_metrics.total('.write', 'target:gcs', 'outcome:skipped') == 1
-    assert fake_metrics.total('.write', 'target:legacy', 'outcome:ok') == 1
-
-
-def test_insert_at_full_percent_writes_both(
-    primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics
-) -> None:
+def test_insert_writes_both(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
     _insert(_gcs_migration_store(primary, legacy), _OLD)
     assert list(primary.records) == [_OLD]
     assert list(legacy.records) == [_OLD]
@@ -276,29 +232,16 @@ def test_cutover_skips_primary_for_older_ids(
 
 
 def test_expected_and_unexpected_misses(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
-    old_sampled = _find_id(_NOW - timedelta(minutes=10), sampled=True)
-    old_unsampled = _find_id(_NOW - timedelta(minutes=10), sampled=False)
-    young_sampled = _find_id(_NOW - timedelta(minutes=2), sampled=True)
-    store = _gcs_migration_store(primary, legacy, gcs_write_percent=50)
+    young = _action_id(_NOW - timedelta(minutes=2))
+    store = _gcs_migration_store(primary, legacy, cutover_id=_action_id(_NOW - timedelta(hours=1)))
 
-    store.select_many([old_sampled])
+    store.select_many([_OLD])
     assert fake_metrics.total('.read.gcs_unexpected_miss') == 1
     assert fake_metrics.total('.read.gcs_expected_miss') == 0
 
-    store.select_many([old_unsampled, young_sampled])
+    store.select_many([young])
     assert fake_metrics.total('.read.gcs_unexpected_miss') == 1
-    assert fake_metrics.total('.read.gcs_expected_miss') == 2
-
-
-def test_legacy_read_fallback_disabled(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
-    legacy.put(_OLD, 'legacy')
-    before = _action_id(_NOW - timedelta(hours=2))
-    store = _gcs_migration_store(
-        primary, legacy, legacy_read_fallback=False, cutover_id=_action_id(_NOW - timedelta(hours=1))
-    )
-    assert store.select_many([_OLD, before]) == []
-    assert legacy.selected == []
-    assert fake_metrics.total('.read.source', 'source:miss') == 2
+    assert fake_metrics.total('.read.gcs_expected_miss') == 1
 
 
 def test_primary_select_failure_falls_back(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
@@ -373,7 +316,6 @@ def test_chooser_builds_gcs_migration_store(monkeypatch: pytest.MonkeyPatch, fak
     CONFIG.instance().configure(
         {
             'SNOWFLAKE_EPOCH': _EPOCH_MS,
-            'OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT': '100',
             'OSPREY_EXECUTION_RESULT_LEGACY_WRITE_ENABLED': 'false',
         }
     )
@@ -417,7 +359,6 @@ def test_service_reads_the_real_batched_store_through_gcs_migration(
             'SNOWFLAKE_EPOCH': _EPOCH_MS,
             'OSPREY_EXECUTION_RESULT_STORAGE_BACKEND': 'gcs_migration',
             'OSPREY_GCS_EXECUTION_RESULTS_BUCKET': 'test-bucket',
-            'OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT': '100',
         }
     )
 
@@ -453,32 +394,6 @@ def test_service_reads_the_real_batched_store_through_gcs_migration(
         assert bigtable.selected == [ids]
     finally:
         batched.close()
-
-
-@pytest.mark.parametrize(
-    'percent, legacy_write, warns',
-    [('50', 'false', True), ('100', 'false', False), ('50', 'true', False)],
-)
-def test_from_config_warns_when_unsampled_ids_are_written_nowhere(
-    primary: _FakeStore,
-    legacy: _FakeStore,
-    caplog: pytest.LogCaptureFixture,
-    percent: str,
-    legacy_write: str,
-    warns: bool,
-) -> None:
-    CONFIG.instance().unconfigure_for_tests()
-    CONFIG.instance().configure(
-        {
-            'SNOWFLAKE_EPOCH': _EPOCH_MS,
-            'OSPREY_EXECUTION_RESULT_GCS_WRITE_PERCENT': percent,
-            'OSPREY_EXECUTION_RESULT_LEGACY_WRITE_ENABLED': legacy_write,
-        }
-    )
-    with caplog.at_level(logging.WARNING):
-        StoredExecutionResultGCSMigration.from_config(primary, legacy)
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and 'written nowhere' in r.getMessage()]
-    assert len(warnings) == (1 if warns else 0)
 
 
 def test_chooser_returns_plugin_store(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -432,6 +432,7 @@ def test_every_inserted_record_round_trips_after_flush(
     results = {result['id']: result for result in store.select_many(ids)}
 
     assert set(results) == set(ids)
+    assert fake_metrics.total('.insert') == fake_metrics.total('.uploaded_records') == len(ids)
     for action_id in ids:
         assert results[action_id] == {
             'id': action_id,
@@ -615,6 +616,7 @@ def test_upload_failure_drops_the_batch_and_counts_it(
     assert fake_metrics.total('.dropped_records') == 3
     assert fake_metrics.total('.flush_error') == 3
     assert fake_metrics.values('histogram', '.flush.records') == []
+    assert fake_metrics.total('.uploaded_records') == 0
 
 
 def test_precondition_failed_on_retry_counts_as_stored(
@@ -631,6 +633,7 @@ def test_precondition_failed_on_retry_counts_as_stored(
     assert fake_metrics.total('.dropped_records') == 0
     assert fake_metrics.total('.flush_error') == 0
     assert fake_metrics.values('histogram', '.flush.records', 'reason:shutdown') == [1]
+    assert fake_metrics.total('.uploaded_records') == 1
     assert store.select_one(action_id) is not None
 
 

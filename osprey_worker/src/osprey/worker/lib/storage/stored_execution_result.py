@@ -375,9 +375,15 @@ class StoredExecutionResultGCS(ExecutionResultStore):
         if self._bucket_width_minutes <= 0 or 60 % self._bucket_width_minutes != 0:
             raise ValueError('OSPREY_GCS_EXECUTION_RESULTS_BUCKET_WIDTH_MINUTES must divide 60')
         self._max_records = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS', 1000)
+        # BloomFilter() keeps false positives under 1e-5 only up to 1000 keys; each false positive costs a reader
+        # a full object download.
+        if not 1 <= self._max_records <= 1000:
+            raise ValueError('OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS must be between 1 and 1000')
         self._max_compressed_bytes = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_MAX_COMPRESSED_BYTES', 16777216)
         self._close_grace_seconds = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_CLOSE_GRACE_SECONDS', 15)
-        self._late_threshold_seconds = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_LATE_THRESHOLD_SECONDS', 600)
+        # Every read of an hour lists its late prefix, so keep it for replays: a backlog shorter than this still
+        # lands in per-minute prefixes instead of piling into one late/{HH} prefix.
+        self._late_threshold_seconds = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_LATE_THRESHOLD_SECONDS', 3600)
         self._flush_tick_seconds = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_FLUSH_TICK_SECONDS', 300)
         upload_threads = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_UPLOAD_THREADS', 2)
         self._read_threads = config.get_int('OSPREY_GCS_EXECUTION_RESULTS_READ_THREADS', 16)
@@ -645,7 +651,8 @@ class StoredExecutionResultGCS(ExecutionResultStore):
 
             found: Dict[int, Dict[str, Any]] = {}
             failures = 0
-            with ThreadPoolExecutor(max_workers=self._read_threads) as pool:
+            pool = ThreadPoolExecutor(max_workers=self._read_threads)
+            try:
                 candidates: List[Tuple[Any, Set[int]]] = []
                 for listed in pool.map(self._list_candidates, wanted_by_prefix.items()):
                     if listed is None:
@@ -663,6 +670,10 @@ class StoredExecutionResultGCS(ExecutionResultStore):
                         # timestamp, so equal `ts` keeps the first copy seen and a later `ts` wins.
                         if current is None or record['timestamp'] > current['timestamp']:
                             found[record['id']] = record
+            finally:
+                # Do not join list or download calls still running, so a caller's deadline (a gevent.Timeout
+                # in smite-ui-api) surfaces now instead of after every GCS request returns.
+                pool.shutdown(wait=False, cancel_futures=True)
 
             metrics.increment(f'{_GCS_METRIC}.select.found', len(found))
             metrics.increment(f'{_GCS_METRIC}.select.missing', len(set(action_ids)) - len(found))
@@ -899,7 +910,8 @@ class StoredExecutionResultPostgres(ExecutionResultStore):
 
 _GCS_MIGRATION_METRIC = 'execution_result_gcs_migration'
 # The GCS writer closes a slot about 15 s after it ends, then uploads. `gcs_miss age:under_5m` is likely
-# a write still in the buffer; `age:over_5m` means the id predates dual write, or GCS lost it.
+# a write still in the buffer. `age:over_5m` means the id predates dual write, GCS lost it, or a worker
+# processed it more than ~4 min late and its batch has not uploaded yet (up to 60 s more, 300 s if late).
 _GCS_MISS_AGE_SECONDS = 300
 
 

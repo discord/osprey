@@ -4,6 +4,7 @@ import json
 import random
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
@@ -251,6 +252,13 @@ def test_constructor_requires_snowflake_epoch(make_store: Callable[..., StoredEx
         make_store(SNOWFLAKE_EPOCH=0)
 
 
+def test_constructor_rejects_more_records_than_the_bloom_filter_holds(
+    make_store: Callable[..., StoredExecutionResultGCS],
+) -> None:
+    with pytest.raises(ValueError, match='MAX_RECORDS'):
+        make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=1001)
+
+
 @pytest.mark.parametrize('width, expected_prefix', [(1, 'v1/20260924/1234/'), (5, 'v1/20260924/1230/')])
 def test_on_time_record_lands_under_its_floored_minute(
     make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, width: int, expected_prefix: str
@@ -270,7 +278,7 @@ def test_record_older_than_late_threshold_lands_under_late(
     clock: _FakeClock,
 ) -> None:
     store = make_store()
-    clock.set(_BASE + timedelta(seconds=601))
+    clock.set(_BASE + timedelta(seconds=3601))
     _insert(store, _action_id(_BASE))
     store.flush()
 
@@ -393,7 +401,7 @@ def test_late_batch_closes_after_default_flush_tick(
     clock: _FakeClock,
 ) -> None:
     store = make_store()
-    created = _BASE + timedelta(seconds=700)
+    created = _BASE + timedelta(seconds=3700)
     clock.set(created)
     _insert(store, _action_id(_BASE))
 
@@ -561,13 +569,12 @@ def test_download_failure_raises_with_results_from_the_other_objects(
 def test_duplicate_id_returns_the_latest_timestamp(make_store: Callable[..., StoredExecutionResultGCS]) -> None:
     store = make_store()
     action_id = _action_id(_BASE)
-    # A replay re-publishes the action stamped with a later publish time. Write it first so write order
-    # cannot decide the winner.
+    # A replay re-publishes the action stamped with a later publish time. Write it between two older
+    # copies so neither the first nor the last copy read can win by position.
     replayed_at = _BASE + timedelta(minutes=5)
-    _insert(store, action_id, timestamp=replayed_at, features='{"ActionName": "replay"}')
-    store.flush()
-    _insert(store, action_id, timestamp=_BASE)
-    store.flush()
+    for timestamp, name in ((_BASE, 'old'), (replayed_at, 'replay'), (_BASE, 'old')):
+        _insert(store, action_id, timestamp=timestamp, features=f'{{"ActionName": "{name}"}}')
+        store.flush()
 
     results = store.select_many([action_id])
 
@@ -705,9 +712,11 @@ def test_object_metadata_stays_under_gcs_limit(
 
 
 def test_concurrent_inserts_do_not_lose_writes(
-    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The async worker calls insert() through asyncio.to_thread, so inserts race on real OS threads."""
+    # This test checks locking, not the backlog cap: inserts can outrun the 2 uploaders (always under gevent).
+    monkeypatch.setattr(stored_execution_result, 'MAX_PENDING_BATCHES', 1000)
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=7)
     thread_count = 16
     inserts_per_thread = 25
@@ -748,7 +757,7 @@ def test_start_is_idempotent_and_close_uploads_open_batches(
 
 
 def test_constructing_a_store_starts_no_thread_and_the_first_insert_starts_the_timer(
-    make_store: Callable[..., StoredExecutionResultGCS],
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, clock: _FakeClock
 ) -> None:
     before = set(threading.enumerate())
     store = make_store()
@@ -760,6 +769,13 @@ def test_constructing_a_store_starts_no_thread_and_the_first_insert_starts_the_t
     timer = store._timer_thread
     assert timer is not None and timer.is_alive()
     assert timer in set(threading.enumerate()) - before
+
+    # With no flush() call, only the timer thread can close the slot once it ends.
+    clock.set(_BASE + timedelta(minutes=5))
+    deadline = time.monotonic() + 5
+    while not gcs.objects and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(gcs.objects) == 1
 
 
 def test_close_cancels_queued_uploads_and_counts_them_as_dropped(

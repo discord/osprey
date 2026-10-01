@@ -898,19 +898,19 @@ class StoredExecutionResultPostgres(ExecutionResultStore):
 
 
 _GCS_MIGRATION_METRIC = 'execution_result_gcs_migration'
-# The GCS writer closes a slot about 15 s after it ends, then uploads. A miss on an id older than this is
-# not a buffered write: the id predates dual write, or GCS lost it.
-_UNEXPECTED_MISS_AGE_SECONDS = 300
+# The GCS writer closes a slot about 15 s after it ends, then uploads. `gcs_miss age:under_5m` is likely
+# a write still in the buffer; `age:over_5m` means the id predates dual write, or GCS lost it.
+_GCS_MISS_AGE_SECONDS = 300
 
 
 class StoredExecutionResultGCSMigration(ExecutionResultStore):
     """Moves execution results from a legacy store (BigTable) to a primary store (GCS).
 
-    Every write goes to the primary, and to the legacy store while `legacy_write_enabled` is on. Reads try
+    Every write goes to the primary, and to the legacy store while `bigtable_write_enabled` is on. Reads try
     the primary and fall back to the legacy store. Primary failures never propagate; legacy failures do,
     so the sink keeps its retry semantics.
 
-    Rollout: turn on dual write. Once reads are stable, turn legacy write off. After the legacy store's
+    Rollout: turn on dual write. Once reads are stable, turn BigTable writes off. After the legacy store's
     90-day retention, switch the backend to `gcs`.
 
     `write target:gcs outcome:error` cannot fire for the GCS store, because its `insert` never raises.
@@ -921,12 +921,12 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         self,
         primary: ExecutionResultStore,
         legacy: ExecutionResultStore,
-        legacy_write_enabled: bool,
+        bigtable_write_enabled: bool,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._primary = primary
         self._legacy = legacy
-        self._legacy_write_enabled = legacy_write_enabled
+        self._bigtable_write_enabled = bigtable_write_enabled
         self._clock = clock
 
     @classmethod
@@ -939,7 +939,7 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         return cls(
             primary,
             legacy,
-            legacy_write_enabled=config.get_bool('OSPREY_EXECUTION_RESULT_LEGACY_WRITE_ENABLED', True),
+            bigtable_write_enabled=config.get_bool('OSPREY_EXECUTION_RESULT_BIGTABLE_WRITE_ENABLED', True),
         )
 
     def insert(
@@ -964,7 +964,7 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
             outcome = 'error'
         metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:gcs', f'outcome:{outcome}'])
 
-        if not self._legacy_write_enabled:
+        if not self._bigtable_write_enabled:
             return
         try:
             self._legacy.insert(
@@ -975,9 +975,9 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
                 action_data_json=action_data_json,
             )
         except Exception:
-            metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:legacy', 'outcome:error'])
+            metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:bigtable', 'outcome:error'])
             raise
-        metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:legacy', 'outcome:ok'])
+        metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:bigtable', 'outcome:ok'])
 
     def select_one(self, action_id: int) -> Optional[Dict[str, Any]]:
         results = self.select_many([action_id])
@@ -1010,19 +1010,19 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         # A failed read says nothing about what GCS holds, so it does not count toward either miss rate.
         if not primary_failed:
             now = self._clock()
-            unexpected = sum(1 for i in misses if now - Snowflake(i).to_timestamp() > _UNEXPECTED_MISS_AGE_SECONDS)
-            if unexpected:
-                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_unexpected_miss', unexpected)
-            if len(misses) > unexpected:
-                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_expected_miss', len(misses) - unexpected)
+            old = sum(1 for i in misses if now - Snowflake(i).to_timestamp() > _GCS_MISS_AGE_SECONDS)
+            if old:
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_miss', old, tags=['age:over_5m'])
+            if len(misses) > old:
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_miss', len(misses) - old, tags=['age:under_5m'])
 
         fallback: Dict[int, Dict[str, Any]] = {}
         if misses:
-            with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:legacy']):
+            with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:bigtable']):
                 fallback = {record['id']: record for record in self._legacy.select_many(misses)}
 
         results: List[Dict[str, Any]] = []
-        sources = {'gcs': 0, 'legacy': 0, 'miss': 0}
+        sources = {'gcs': 0, 'bigtable': 0, 'not_found': 0}
         for action_id in action_ids:
             # During dual write both stores can hold an id; the primary's record wins.
             if action_id in found:
@@ -1030,9 +1030,9 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
                 sources['gcs'] += 1
             elif action_id in fallback:
                 results.append(fallback[action_id])
-                sources['legacy'] += 1
+                sources['bigtable'] += 1
             else:
-                sources['miss'] += 1
+                sources['not_found'] += 1
         for source, count in sources.items():
             if count:
                 metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.source', count, tags=[f'source:{source}'])

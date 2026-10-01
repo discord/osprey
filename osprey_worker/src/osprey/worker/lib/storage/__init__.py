@@ -24,7 +24,7 @@ class ExecutionResultStorageBackendType(StrEnum):
 
     GCS_MIGRATION = auto()
     """
-    Writes go to GCS and, while legacy write is on, to BigTable. Reads
+    Writes go to GCS and, while BigTable writes are on, to BigTable. Reads
     try GCS, then fall back to BigTable. See StoredExecutionResultGCSMigration.
     """
 

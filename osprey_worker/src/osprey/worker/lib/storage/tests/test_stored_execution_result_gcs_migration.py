@@ -25,7 +25,7 @@ def _action_id(moment: datetime, sequence: int = 0) -> int:
     return ((unix_ms - _EPOCH_MS) << 22) | sequence
 
 
-# Ten minutes old: past the 300 s threshold, so a miss is unexpected.
+# Ten minutes old: past the 300 s threshold, so a miss counts as age:over_5m.
 _OLD = _action_id(_NOW - timedelta(minutes=10))
 
 
@@ -135,12 +135,12 @@ def legacy() -> _FakeStore:
 def _gcs_migration_store(
     primary: _FakeStore,
     legacy: _FakeStore,
-    legacy_write_enabled: bool = True,
+    bigtable_write_enabled: bool = True,
 ) -> StoredExecutionResultGCSMigration:
     return StoredExecutionResultGCSMigration(
         primary,
         legacy,
-        legacy_write_enabled=legacy_write_enabled,
+        bigtable_write_enabled=bigtable_write_enabled,
         clock=_NOW.timestamp,
     )
 
@@ -163,7 +163,7 @@ def test_primary_insert_failure_is_swallowed(
     _insert(_gcs_migration_store(primary, legacy), _OLD)
     assert list(legacy.records) == [_OLD]
     assert fake_metrics.total('.write', 'target:gcs', 'outcome:error') == 1
-    assert fake_metrics.total('.write', 'target:legacy', 'outcome:ok') == 1
+    assert fake_metrics.total('.write', 'target:bigtable', 'outcome:ok') == 1
 
 
 def test_legacy_insert_failure_propagates(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
@@ -171,18 +171,18 @@ def test_legacy_insert_failure_propagates(primary: _FakeStore, legacy: _FakeStor
     with pytest.raises(RuntimeError, match='simulated insert failure'):
         _insert(_gcs_migration_store(primary, legacy), _OLD)
     assert list(primary.records) == [_OLD]
-    assert fake_metrics.total('.write', 'target:legacy', 'outcome:error') == 1
-    assert fake_metrics.total('.write', 'target:legacy', 'outcome:ok') == 0
+    assert fake_metrics.total('.write', 'target:bigtable', 'outcome:error') == 1
+    assert fake_metrics.total('.write', 'target:bigtable', 'outcome:ok') == 0
 
 
-def test_legacy_write_disabled_skips_legacy(
+def test_bigtable_write_disabled_skips_bigtable(
     primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics
 ) -> None:
     legacy.fail_insert = True
-    _insert(_gcs_migration_store(primary, legacy, legacy_write_enabled=False), _OLD)
+    _insert(_gcs_migration_store(primary, legacy, bigtable_write_enabled=False), _OLD)
     assert list(primary.records) == [_OLD]
     assert legacy.records == {}
-    assert fake_metrics.total('.write', 'target:legacy') == 0
+    assert fake_metrics.total('.write', 'target:bigtable') == 0
 
 
 def test_read_sources(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
@@ -197,9 +197,9 @@ def test_read_sources(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _Fa
     assert primary.selected == [[in_gcs, in_legacy, nowhere]]
     assert legacy.selected == [[in_legacy, nowhere]]
     assert fake_metrics.total('.read.source', 'source:gcs') == 1
-    assert fake_metrics.total('.read.source', 'source:legacy') == 1
-    assert fake_metrics.total('.read.source', 'source:miss') == 1
-    assert fake_metrics.timed_backends() == ['backend:gcs', 'backend:legacy']
+    assert fake_metrics.total('.read.source', 'source:bigtable') == 1
+    assert fake_metrics.total('.read.source', 'source:not_found') == 1
+    assert fake_metrics.timed_backends() == ['backend:gcs', 'backend:bigtable']
 
 
 def test_select_one_prefers_primary(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
@@ -210,17 +210,17 @@ def test_select_one_prefers_primary(primary: _FakeStore, legacy: _FakeStore, fak
     assert legacy.selected == []
 
 
-def test_expected_and_unexpected_misses(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
+def test_gcs_misses_by_age(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
     young = _action_id(_NOW - timedelta(minutes=2))
     store = _gcs_migration_store(primary, legacy)
 
     store.select_many([_OLD])
-    assert fake_metrics.total('.read.gcs_unexpected_miss') == 1
-    assert fake_metrics.total('.read.gcs_expected_miss') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 1
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 0
 
     store.select_many([young])
-    assert fake_metrics.total('.read.gcs_unexpected_miss') == 1
-    assert fake_metrics.total('.read.gcs_expected_miss') == 1
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 1
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 1
 
 
 def test_primary_select_failure_falls_back(primary: _FakeStore, legacy: _FakeStore, fake_metrics: _FakeMetrics) -> None:
@@ -233,10 +233,10 @@ def test_primary_select_failure_falls_back(primary: _FakeStore, legacy: _FakeSto
 
     assert [r['id'] for r in results] == ids
     assert legacy.selected == [ids]
-    assert fake_metrics.total('.read.source', 'source:legacy') == 3
+    assert fake_metrics.total('.read.source', 'source:bigtable') == 3
     assert fake_metrics.total('.read.gcs_error') == 1
-    assert fake_metrics.total('.read.gcs_unexpected_miss') == 0
-    assert fake_metrics.total('.read.gcs_expected_miss') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 0
 
 
 def test_partial_primary_read_keeps_its_results_and_falls_back_for_the_rest(
@@ -253,10 +253,10 @@ def test_partial_primary_read_keeps_its_results_and_falls_back_for_the_rest(
     assert [(r['id'], r['action_data']) for r in results] == [(in_gcs, 'gcs'), (unread, 'legacy')]
     assert legacy.selected == [[unread]]
     assert fake_metrics.total('.read.gcs_error') == 1
-    assert fake_metrics.total('.read.gcs_unexpected_miss') == 0
-    assert fake_metrics.total('.read.gcs_expected_miss') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 0
     assert fake_metrics.total('.read.source', 'source:gcs') == 1
-    assert fake_metrics.total('.read.source', 'source:legacy') == 1
+    assert fake_metrics.total('.read.source', 'source:bigtable') == 1
 
 
 def test_flush_reaches_both_stores(primary: _FakeStore, legacy: _FakeStore) -> None:
@@ -293,7 +293,7 @@ def test_chooser_builds_gcs_migration_store(monkeypatch: pytest.MonkeyPatch, fak
     CONFIG.instance().configure(
         {
             'SNOWFLAKE_EPOCH': _EPOCH_MS,
-            'OSPREY_EXECUTION_RESULT_LEGACY_WRITE_ENABLED': 'false',
+            'OSPREY_EXECUTION_RESULT_BIGTABLE_WRITE_ENABLED': 'false',
         }
     )
 
@@ -346,8 +346,8 @@ def test_service_reads_the_real_batched_store_through_gcs_migration(
     assert isinstance(batched, StoredExecutionResultGCS)
     assert batched._timer_thread is None
     try:
-        # Past the unexpected-miss age but not late, so the records land on time and a GCS miss would
-        # count as unexpected.
+        # Past the 5-minute miss age but not late, so the records land on time and a GCS miss would
+        # count as age:over_5m.
         moment = datetime.now(timezone.utc) - timedelta(seconds=400)
         ids = [_action_id(moment, sequence) for sequence in range(2)]
         for action_id in ids:
@@ -365,8 +365,8 @@ def test_service_reads_the_real_batched_store_through_gcs_migration(
 
         assert sorted(result.id for result in service.get_many(ids)) == sorted(ids)
         assert fake_metrics.total('.read.gcs_error') == 1
-        assert fake_metrics.total('.read.gcs_unexpected_miss') == 0
-        assert fake_metrics.total('.read.source', 'source:legacy') == 2
+        assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 0
+        assert fake_metrics.total('.read.source', 'source:bigtable') == 2
         [bigtable] = _FakeBigTable.instances
         assert bigtable.selected == [ids]
     finally:

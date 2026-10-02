@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # Keep a flush under the 10MB server limit on one publish request.
 _MAX_BATCH_BYTES = 9_000_000
 
-# Give up on the shutdown backlog after this long, so a Pub/Sub outage cannot
-# hold a terminating pod open indefinitely.
+# Stop starting shutdown flushes after this long, so a Pub/Sub outage cannot hold a
+# terminating pod open indefinitely. A flush already in flight still runs to _PUBLISH_TIMEOUT.
 _DRAIN_DEADLINE_SECONDS = 30.0
 
 _TRANSIENT_PUBLISH_ERRORS = (
@@ -157,9 +157,8 @@ class AsyncPubSubPublisher:
     async def _drain(self) -> None:
         """Publish what is still queued once the flush loop has stopped.
 
-        Deadline-bounded rather than driven by a queue-size snapshot, because
-        `_flush_batch` requeues transient failures and those have to be
-        re-attempted rather than abandoned.
+        Loops on the queue, not a size snapshot, because `_flush_batch` requeues transient failures.
+        The deadline gates starting a flush; an in-flight publish is not interrupted.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _DRAIN_DEADLINE_SECONDS
@@ -218,20 +217,11 @@ class AsyncPubSubPublisher:
             logger.exception('Failed to publish %d messages', len(batch))
             return []
 
-        # IDs come back in request order, so a short response means the tail
-        # was never accepted and has to go back on the queue.
-        published = len(response.message_ids)
-        if published:
-            metrics.increment('async_pubsub_publisher.publish.success', value=published, tags=self._metric_tags)
-        if published == len(batch):
-            return []
+        # Publish is atomic: a successful response acknowledges every message in the request.
         metrics.increment(
-            'async_pubsub_publisher.publish.failure',
-            value=len(batch) - published,
-            tags=self._metric_tags + ['error:PartialPublish'],
+            'async_pubsub_publisher.publish.success', value=len(response.message_ids), tags=self._metric_tags
         )
-        logger.warning('Pub/Sub accepted %d of %d messages; requeuing the rest', published, len(batch))
-        return batch[published:]
+        return []
 
     def publish(self, data: BaseModel) -> None:
         """Queue a Pydantic model for async batched publishing."""

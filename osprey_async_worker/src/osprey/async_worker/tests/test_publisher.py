@@ -201,20 +201,6 @@ def test_take_batch_never_crosses_the_request_byte_limit(mock_metrics):
     assert publisher._queue.qsize() == 1
 
 
-@patch('osprey.async_worker.lib.publisher.metrics')
-def test_partial_publish_requeues_the_unacknowledged_tail(mock_metrics):
-    publisher = _make_publisher()
-    publisher._client.publish.return_value = _response(2)
-
-    assert publisher._sync_flush([b'one', b'two', b'three']) == [b'three']
-
-    mock_metrics.increment.assert_any_call(
-        'async_pubsub_publisher.publish.failure',
-        value=1,
-        tags=publisher._metric_tags + ['error:PartialPublish'],
-    )
-
-
 def test_transient_set_matches_the_library_default_publish_retry_set():
     assert _is_transient_publish_error(Cancelled('cancelled'))
     assert _is_transient_publish_error(Unknown('unknown'))

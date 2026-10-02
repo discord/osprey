@@ -189,6 +189,19 @@ def test_take_batch_stops_at_the_request_byte_limit(mock_metrics):
 
 
 @patch('osprey.async_worker.lib.publisher.metrics')
+def test_take_batch_never_crosses_the_request_byte_limit(mock_metrics):
+    """The limit is checked before a message is added, not after."""
+    publisher = _make_publisher()
+    for _ in range(2):
+        publisher._queue.put_nowait(b'x' * (_MAX_BATCH_BYTES * 2 // 3))
+
+    batch = publisher._take_batch(publisher._queue.get_nowait())
+
+    assert len(batch) == 1
+    assert publisher._queue.qsize() == 1
+
+
+@patch('osprey.async_worker.lib.publisher.metrics')
 def test_partial_publish_requeues_the_unacknowledged_tail(mock_metrics):
     publisher = _make_publisher()
     publisher._client.publish.return_value = _response(2)

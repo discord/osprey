@@ -138,10 +138,16 @@ class AsyncPubSubPublisher:
         """Drain up to max_messages, from an already-dequeued first message."""
         batch = [first]
         size = len(first)
-        while len(batch) < self._max_messages and size < _MAX_BATCH_BYTES:
+        while len(batch) < self._max_messages:
             try:
                 data = self._queue.get_nowait()
             except asyncio.QueueEmpty:
+                break
+            if size + len(data) > _MAX_BATCH_BYTES:
+                # Checked before appending: a batch that crosses the limit fails the
+                # whole request as InvalidArgument, which is not retried. The message
+                # goes back on the queue and leads a later batch (order is not a contract).
+                self._queue.put_nowait(data)
                 break
             batch.append(data)
             size += len(data)

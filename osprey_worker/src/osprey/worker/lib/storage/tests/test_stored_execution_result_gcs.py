@@ -319,8 +319,8 @@ def test_max_records_closes_the_batch_off_the_caller_thread(
 
     ((_, metadata),) = gcs.objects.values()
     assert metadata['n'] == '3'
-    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:max_records') == [3]
-    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:shutdown') == []
+    assert fake_metrics.values('histogram', '.upload.records', 'reason:max_records') == [3]
+    assert fake_metrics.values('histogram', '.upload.records', 'reason:shutdown') == []
     assert all(name.startswith('gcs-batched-upload') for name in gcs.upload_threads)
 
 
@@ -336,7 +336,7 @@ def test_max_compressed_bytes_closes_the_batch(
     store.flush()
 
     assert [metadata['n'] for _, metadata in gcs.objects.values()] == ['1', '1']
-    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:max_bytes') == [1, 1]
+    assert fake_metrics.values('histogram', '.upload.records', 'reason:max_bytes') == [1, 1]
 
 
 def test_on_time_batch_closes_only_after_bucket_end_plus_grace(
@@ -363,7 +363,7 @@ def test_on_time_batch_closes_only_after_bucket_end_plus_grace(
     store.flush()
 
     assert len(gcs.objects) == 1
-    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:minute_ended') == [1]
+    assert fake_metrics.values('histogram', '.upload.records', 'reason:bucket_closed') == [1]
 
 
 def test_reopened_slot_waits_for_the_minimum_age_before_closing(
@@ -391,7 +391,7 @@ def test_reopened_slot_waits_for_the_minimum_age_before_closing(
 
     (name,) = _object_names(gcs)
     assert name.startswith('v1/20260924/1234/')
-    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:minute_ended') == [1]
+    assert fake_metrics.values('histogram', '.upload.records', 'reason:bucket_closed') == [1]
 
 
 def test_late_batch_closes_after_default_flush_tick(
@@ -416,7 +416,7 @@ def test_late_batch_closes_after_default_flush_tick(
 
     (name,) = _object_names(gcs)
     assert name.startswith('v1/20260924/late/12/')
-    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:late_timer') == [1]
+    assert fake_metrics.values('histogram', '.upload.records', 'reason:tick') == [1]
 
 
 def test_every_inserted_record_round_trips_after_flush(
@@ -637,7 +637,7 @@ def test_precondition_failed_on_retry_counts_as_stored(
     assert fake_metrics.total('.upload.retries') == 1
     assert fake_metrics.total('.write.dropped_records') == 0
     assert fake_metrics.total('.write.dropped_records', 'cause:upload_failed') == 0
-    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:shutdown') == [1]
+    assert fake_metrics.values('histogram', '.upload.records', 'reason:shutdown') == [1]
     assert fake_metrics.total('.write.uploaded_records') == 1
     assert store.select_one(action_id) is not None
 

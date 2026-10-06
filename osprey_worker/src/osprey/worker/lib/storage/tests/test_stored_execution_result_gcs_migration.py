@@ -25,7 +25,7 @@ def _action_id(moment: datetime, sequence: int = 0) -> int:
     return ((unix_ms - _EPOCH_MS) << 22) | sequence
 
 
-# Ten minutes old: past the 300 s threshold, so a miss counts as age:over_5m.
+# Ten minutes old: past the 300 s threshold, so a miss counts as age:over_3m.
 _OLD = _action_id(_NOW - timedelta(minutes=10))
 
 
@@ -217,12 +217,12 @@ def test_gcs_misses_by_age(gcs_store: _FakeStore, bigtable_store: _FakeStore, fa
     store = _gcs_migration_store(gcs_store, bigtable_store)
 
     store.select_many([_OLD])
-    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 1
-    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_3m') == 1
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_3m') == 0
 
     store.select_many([young])
-    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 1
-    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 1
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_3m') == 1
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_3m') == 1
 
 
 def test_gcs_select_failure_falls_back(
@@ -239,8 +239,8 @@ def test_gcs_select_failure_falls_back(
     assert bigtable_store.selected == [ids]
     assert fake_metrics.total('.read.source', 'source:bigtable') == 3
     assert fake_metrics.total('.read.gcs_error') == 1
-    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 0
-    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_3m') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_3m') == 0
 
 
 def test_partial_gcs_read_keeps_its_results_and_falls_back_for_the_rest(
@@ -257,8 +257,8 @@ def test_partial_gcs_read_keeps_its_results_and_falls_back_for_the_rest(
     assert [(r['id'], r['action_data']) for r in results] == [(in_gcs, 'gcs'), (unread, 'bigtable')]
     assert bigtable_store.selected == [[unread]]
     assert fake_metrics.total('.read.gcs_error') == 1
-    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 0
-    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_3m') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_3m') == 0
     assert fake_metrics.total('.read.source', 'source:gcs') == 1
     assert fake_metrics.total('.read.source', 'source:bigtable') == 1
 
@@ -351,7 +351,7 @@ def test_service_reads_the_real_batched_store_through_gcs_migration(
     assert batched._timer_thread is None
     try:
         # Past the 5-minute miss age but not late, so the records land on time and a GCS miss would
-        # count as age:over_5m.
+        # count as age:over_3m.
         moment = datetime.now(timezone.utc) - timedelta(seconds=400)
         ids = [_action_id(moment, sequence) for sequence in range(2)]
         for action_id in ids:
@@ -369,7 +369,7 @@ def test_service_reads_the_real_batched_store_through_gcs_migration(
 
         assert sorted(result.id for result in service.get_many(ids)) == sorted(ids)
         assert fake_metrics.total('.read.gcs_error') == 1
-        assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 0
+        assert fake_metrics.total('.read.gcs_miss', 'age:over_3m') == 0
         assert fake_metrics.total('.read.source', 'source:bigtable') == 2
         [bigtable] = _FakeBigTable.instances
         assert bigtable.selected == [ids]

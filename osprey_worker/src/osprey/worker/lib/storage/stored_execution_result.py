@@ -435,14 +435,12 @@ class StoredExecutionResultGCS(ExecutionResultStore):
         action_data_json: str,
     ) -> None:
         try:
-            for field, value in (
+            for cell, value in (
                 ('extracted_features', extracted_features_json),
                 ('error_traces', error_traces_json),
                 ('action_data', action_data_json),
             ):
-                metrics.histogram(
-                    f'{_GCS_METRIC}.write.value_bytes', len(value.encode('utf-8')), tags=[f'field:{field}']
-                )
+                metrics.histogram(f'{_GCS_METRIC}.write.value_bytes', len(value.encode('utf-8')), tags=[f'cell:{cell}'])
 
             snowflake_seconds = Snowflake(action_id).to_timestamp()
             now = self._clock()
@@ -546,11 +544,11 @@ class StoredExecutionResultGCS(ExecutionResultStore):
             for key, batch in list(self._batches.items()):
                 if batch.bucket_end is None:
                     if now - batch.created_at >= self._flush_tick_seconds:
-                        due.append((self._batches.pop(key), 'late_timer'))
+                        due.append((self._batches.pop(key), 'tick'))
                 elif now >= max(
                     batch.bucket_end + self._close_grace_seconds, batch.created_at + REOPEN_MIN_AGE_SECONDS
                 ):
-                    due.append((self._batches.pop(key), 'minute_ended'))
+                    due.append((self._batches.pop(key), 'bucket_closed'))
             buffered_records = sum(batch.records for batch in self._batches.values())
             open_batches = len(self._batches)
         with self._in_flight_lock:
@@ -629,7 +627,7 @@ class StoredExecutionResultGCS(ExecutionResultStore):
                 metrics.increment(f'{_GCS_METRIC}.upload.retries')
                 time.sleep(self._UPLOAD_RETRY_DELAYS_SECONDS[attempt])
 
-        tags = [f'closed_by:{reason}']
+        tags = [f'reason:{reason}']
         metrics.timing(f'{_GCS_METRIC}.upload.duration', time.monotonic() - started, tags=tags)
         metrics.histogram(f'{_GCS_METRIC}.upload.records', batch.records, tags=tags)
         metrics.histogram(f'{_GCS_METRIC}.upload.raw_bytes', batch.raw_bytes, tags=tags)
@@ -922,10 +920,10 @@ class StoredExecutionResultPostgres(ExecutionResultStore):
 
 
 _GCS_MIGRATION_METRIC = 'execution_result_gcs_migration'
-# The GCS writer closes a slot about 15 s after it ends, then uploads. `gcs_miss age:under_5m` is likely
-# a write still in the buffer. `age:over_5m` means the id predates dual write, GCS lost it, or a worker
-# processed it more than ~4 min late and its batch has not uploaded yet (up to 60 s more, 300 s if late).
-_GCS_MISS_AGE_SECONDS = 300
+# The GCS writer closes a slot about 15 s after it ends, then uploads. `gcs_miss age:under_3m` is likely
+# a write still in the buffer. `age:over_3m` means the id predates dual write, GCS lost it, or a worker
+# processed it late and its batch has not uploaded yet. 3 minutes matches smite-ui-api's pending window.
+_GCS_MISS_AGE_SECONDS = 180
 
 
 class StoredExecutionResultGCSMigration(ExecutionResultStore):
@@ -1037,9 +1035,9 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
             now = self._clock()
             old = sum(1 for i in misses if now - Snowflake(i).to_timestamp() > _GCS_MISS_AGE_SECONDS)
             if old:
-                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_miss', old, tags=['age:over_5m'])
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_miss', old, tags=['age:over_3m'])
             if len(misses) > old:
-                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_miss', len(misses) - old, tags=['age:under_5m'])
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_miss', len(misses) - old, tags=['age:under_3m'])
 
         fallback: Dict[int, Dict[str, Any]] = {}
         if misses:

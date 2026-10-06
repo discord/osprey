@@ -3,14 +3,14 @@ revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '4' and platform_machine == 'x86_64'",
-    "python_full_version >= '3.14' and python_full_version < '4' and platform_machine == 'x86_64'",
-    "python_full_version == '3.13.*' and platform_machine == 'x86_64'",
-    "python_full_version == '3.12.*' and platform_machine == 'x86_64'",
-    "python_full_version < '3.12' and platform_machine == 'x86_64'",
     "python_full_version >= '4' and platform_machine != 'x86_64'",
+    "python_full_version >= '3.14' and python_full_version < '4' and platform_machine == 'x86_64'",
     "python_full_version >= '3.14' and python_full_version < '4' and platform_machine != 'x86_64'",
+    "python_full_version == '3.13.*' and platform_machine == 'x86_64'",
     "python_full_version == '3.13.*' and platform_machine != 'x86_64'",
+    "python_full_version == '3.12.*' and platform_machine == 'x86_64'",
     "python_full_version == '3.12.*' and platform_machine != 'x86_64'",
+    "python_full_version < '3.12' and platform_machine == 'x86_64'",
     "python_full_version < '3.12' and platform_machine != 'x86_64'",
 ]
 
@@ -1117,7 +1117,7 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'x86_64'",
 ]
 dependencies = [
-    { name = "six", marker = "platform_machine == 'x86_64'" },
+    { name = "six" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a3/1c/c42834d4fee45c5cf2d9546e97e879a1cbcdecfd16eb1a12144dcb91edae/grpcio-1.49.1.tar.gz", hash = "sha256:d4725fc9ec8e8822906ae26bb26f5546891aa7fbc3443de970cc556d43a5c99f", size = 22059239, upload-time = "2022-09-22T03:02:44.376Z" }
 wheels = [
@@ -1191,9 +1191,9 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'x86_64'",
 ]
 dependencies = [
-    { name = "googleapis-common-protos", marker = "platform_machine == 'x86_64'" },
-    { name = "grpcio", version = "1.49.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64'" },
-    { name = "protobuf", marker = "platform_machine == 'x86_64'" },
+    { name = "googleapis-common-protos" },
+    { name = "grpcio", version = "1.49.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/19/99/7cd6af0c6da3084fa39818af3e3de1f4ca21127004e87f39a2affe290521/grpcio-status-1.49.1.tar.gz", hash = "sha256:658f48dc146ee0c7b6eebd302d74e0d45c00727c20035ff51d68750dbaccf5d9", size = 13505, upload-time = "2022-09-22T03:02:56.074Z" }
 wheels = [
@@ -1212,9 +1212,9 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine != 'x86_64'",
 ]
 dependencies = [
-    { name = "googleapis-common-protos", marker = "platform_machine != 'x86_64'" },
-    { name = "grpcio", version = "1.53.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64'" },
-    { name = "protobuf", marker = "platform_machine != 'x86_64'" },
+    { name = "googleapis-common-protos" },
+    { name = "grpcio", version = "1.53.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/45/6c/ed089e2b0d9215a1405de8790b2d6593780690d2732e0c208da27dfd86c4/grpcio-status-1.53.2.tar.gz", hash = "sha256:9a0823b99218424f012f59f6e9d17e8f569a67f0ca47cbca27dbf3bdf72c2248", size = 13505, upload-time = "2023-08-02T16:55:34.192Z" }
 wheels = [
@@ -1233,9 +1233,9 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'x86_64'",
 ]
 dependencies = [
-    { name = "grpcio", version = "1.49.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64'" },
-    { name = "protobuf", marker = "platform_machine == 'x86_64'" },
-    { name = "setuptools", marker = "platform_machine == 'x86_64'" },
+    { name = "grpcio", version = "1.49.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf" },
+    { name = "setuptools" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6c/e4/3416d25aebc4477141a491fae2c9494c5e0437a706c59103a936aac7d072/grpcio-tools-1.49.1.tar.gz", hash = "sha256:84cc64e5b46bad43d5d7bd2fd772b656eba0366961187a847e908e2cb735db91", size = 2252679, upload-time = "2022-09-22T03:03:00.279Z" }
 wheels = [
@@ -1257,9 +1257,9 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine != 'x86_64'",
 ]
 dependencies = [
-    { name = "grpcio", version = "1.53.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64'" },
-    { name = "protobuf", marker = "platform_machine != 'x86_64'" },
-    { name = "setuptools", marker = "platform_machine != 'x86_64'" },
+    { name = "grpcio", version = "1.53.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf" },
+    { name = "setuptools" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/80/4a/d176f59e4b080f8bcd1242ca9bfa9d1a77a9ef1620725eef846f112b8a99/grpcio-tools-1.53.2.tar.gz", hash = "sha256:1b10f95d1f4af2b9d63c9beccf386b3a5e1a92f14b3f64a9a8385b6ba091e0dc", size = 2257313, upload-time = "2023-08-02T16:55:36.975Z" }
 wheels = [
@@ -3202,11 +3202,11 @@ wheels = [
 
 [[package]]
 name = "urllib3"
-version = "2.7.0"
+version = "2.8.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909b5e40b1b90a496d987258916dbbf88e842c729f510e/urllib3-2.8.0.tar.gz", hash = "sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63", size = 458972, upload-time = "2026-09-15T19:29:36.253Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
+    { url = "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3", size = 135717, upload-time = "2026-09-15T19:29:34.577Z" },
 ]
 
 [[package]]

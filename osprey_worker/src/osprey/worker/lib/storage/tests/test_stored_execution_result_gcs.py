@@ -14,13 +14,13 @@ from google.api_core.exceptions import PreconditionFailed, ServiceUnavailable
 from osprey.worker.lib.singletons import CONFIG
 from osprey.worker.lib.storage import stored_execution_result
 from osprey.worker.lib.storage.stored_execution_result import (
-    MAX_PENDING_BATCHES,
+    MAX_QUEUED_UPLOADS,
     ExecutionResultReadError,
     StoredExecutionResultGCS,
 )
 
 _EPOCH_MS = 1420070400000
-_METRIC = 'gcs_stored_execution_result'
+_METRIC = 'execution_result.gcs'
 # 2026-09-24 12:34:20 UTC: mid-minute, so small offsets stay in the 12:34 slot.
 _BASE = datetime(2026, 9, 24, 12, 34, 20, tzinfo=timezone.utc)
 _BASE_CONFIG: Dict[str, Any] = {
@@ -284,8 +284,8 @@ def test_record_older_than_late_threshold_lands_under_late(
 
     (name,) = _object_names(gcs)
     assert name.startswith('v1/20260924/late/12/')
-    assert fake_metrics.total('.insert', 'slot:late') == 1
-    assert fake_metrics.total('.insert', 'slot:on_time') == 0
+    assert fake_metrics.total('.write.records', 'slot:late') == 1
+    assert fake_metrics.total('.write.records', 'slot:on_time') == 0
 
 
 def test_object_names_are_sanitized_and_seq_increments_without_overwrite(
@@ -319,8 +319,8 @@ def test_max_records_closes_the_batch_off_the_caller_thread(
 
     ((_, metadata),) = gcs.objects.values()
     assert metadata['n'] == '3'
-    assert fake_metrics.values('histogram', '.flush.records', 'reason:max_records') == [3]
-    assert fake_metrics.values('histogram', '.flush.records', 'reason:shutdown') == []
+    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:max_records') == [3]
+    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:shutdown') == []
     assert all(name.startswith('gcs-batched-upload') for name in gcs.upload_threads)
 
 
@@ -336,7 +336,7 @@ def test_max_compressed_bytes_closes_the_batch(
     store.flush()
 
     assert [metadata['n'] for _, metadata in gcs.objects.values()] == ['1', '1']
-    assert fake_metrics.values('histogram', '.flush.records', 'reason:max_bytes') == [1, 1]
+    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:max_bytes') == [1, 1]
 
 
 def test_on_time_batch_closes_only_after_bucket_end_plus_grace(
@@ -354,16 +354,16 @@ def test_on_time_batch_closes_only_after_bucket_end_plus_grace(
 
     clock.set(bucket_end + timedelta(seconds=14.9))
     store._tick()
-    assert fake_metrics.last_gauge('.open_batches') == 1
-    assert fake_metrics.last_gauge('.buffered_records') == 1
+    assert fake_metrics.last_gauge('.buffer.open_batches') == 1
+    assert fake_metrics.last_gauge('.buffer.records') == 1
 
     clock.set(bucket_end + timedelta(seconds=15))
     store._tick()
-    assert fake_metrics.last_gauge('.open_batches') == 0
+    assert fake_metrics.last_gauge('.buffer.open_batches') == 0
     store.flush()
 
     assert len(gcs.objects) == 1
-    assert fake_metrics.values('histogram', '.flush.records', 'reason:bucket_closed') == [1]
+    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:minute_ended') == [1]
 
 
 def test_reopened_slot_waits_for_the_minimum_age_before_closing(
@@ -379,19 +379,19 @@ def test_reopened_slot_waits_for_the_minimum_age_before_closing(
     _insert(store, _action_id(_BASE))
 
     store._tick()
-    assert fake_metrics.last_gauge('.open_batches') == 1
+    assert fake_metrics.last_gauge('.buffer.open_batches') == 1
     clock.set(created + timedelta(seconds=59.9))
     store._tick()
-    assert fake_metrics.last_gauge('.open_batches') == 1
+    assert fake_metrics.last_gauge('.buffer.open_batches') == 1
 
     clock.set(created + timedelta(seconds=60))
     store._tick()
-    assert fake_metrics.last_gauge('.open_batches') == 0
+    assert fake_metrics.last_gauge('.buffer.open_batches') == 0
     store.flush()
 
     (name,) = _object_names(gcs)
     assert name.startswith('v1/20260924/1234/')
-    assert fake_metrics.values('histogram', '.flush.records', 'reason:bucket_closed') == [1]
+    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:minute_ended') == [1]
 
 
 def test_late_batch_closes_after_default_flush_tick(
@@ -407,16 +407,16 @@ def test_late_batch_closes_after_default_flush_tick(
 
     clock.set(created + timedelta(seconds=299.9))
     store._tick()
-    assert fake_metrics.last_gauge('.open_batches') == 1
+    assert fake_metrics.last_gauge('.buffer.open_batches') == 1
 
     clock.set(created + timedelta(seconds=300))
     store._tick()
-    assert fake_metrics.last_gauge('.open_batches') == 0
+    assert fake_metrics.last_gauge('.buffer.open_batches') == 0
     store.flush()
 
     (name,) = _object_names(gcs)
     assert name.startswith('v1/20260924/late/12/')
-    assert fake_metrics.values('histogram', '.flush.records', 'reason:tick') == [1]
+    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:late_timer') == [1]
 
 
 def test_every_inserted_record_round_trips_after_flush(
@@ -432,7 +432,7 @@ def test_every_inserted_record_round_trips_after_flush(
     results = {result['id']: result for result in store.select_many(ids)}
 
     assert set(results) == set(ids)
-    assert fake_metrics.total('.insert') == fake_metrics.total('.uploaded_records') == len(ids)
+    assert fake_metrics.total('.write.records') == fake_metrics.total('.write.uploaded_records') == len(ids)
     for action_id in ids:
         assert results[action_id] == {
             'id': action_id,
@@ -442,8 +442,8 @@ def test_every_inserted_record_round_trips_after_flush(
             'action_data': f'{{"action_id": {action_id}}}',
         }
         assert isinstance(results[action_id]['timestamp'], datetime)
-    assert fake_metrics.total('.select.found') == len(ids)
-    assert fake_metrics.total('.select.missing') == 0
+    assert fake_metrics.total('.read.ids', 'result:in_gcs') == len(ids)
+    assert fake_metrics.total('.read.ids', 'result:not_in_gcs') == 0
 
 
 def test_missing_id_returns_none(
@@ -455,7 +455,7 @@ def test_missing_id_returns_none(
 
     assert store.select_many([]) == []
     assert store.select_one(_action_id(_BASE, sequence=999)) is None
-    assert fake_metrics.total('.select.missing') == 1
+    assert fake_metrics.total('.read.ids', 'result:not_in_gcs') == 1
 
 
 def test_reader_lists_minute_and_late_hour_prefixes_and_finds_late_records(
@@ -494,10 +494,10 @@ def test_bloom_prefilter_downloads_only_candidate_objects(
     (downloaded,) = gcs.downloads
     assert downloaded.startswith('v1/20260924/1234/')
     # Three objects in the 12:34 slot at page size 2; the late prefix is empty.
-    assert fake_metrics.total('.select.objects_listed') == 3
-    assert fake_metrics.total('.select.list_pages') == 2
-    assert fake_metrics.total('.select.candidates') == 1
-    assert fake_metrics.total('.select.bloom_false_positives') == 0
+    assert fake_metrics.total('.read.objects_listed') == 3
+    assert fake_metrics.total('.read.list_pages') == 2
+    assert fake_metrics.total('.read.objects_downloaded') == 1
+    assert fake_metrics.total('.read.bloom_false_positives') == 0
 
 
 def test_unparseable_bloom_metadata_makes_only_that_blob_a_candidate(
@@ -538,8 +538,8 @@ def test_list_failure_raises_with_results_from_the_other_prefixes(
 
     assert [result['id'] for result in raised.value.partial_results] == [good_id]
     assert raised.value.failed_prefixes == 1
-    assert fake_metrics.total('.select.found') == 1
-    assert fake_metrics.total('.select.missing') == 1
+    assert fake_metrics.total('.read.ids', 'result:in_gcs') == 1
+    assert fake_metrics.total('.read.ids', 'result:not_in_gcs') == 1
 
 
 def test_download_failure_raises_with_results_from_the_other_objects(
@@ -612,11 +612,11 @@ def test_upload_failure_drops_the_batch_and_counts_it(
 
     assert gcs.objects == {}
     assert len(gcs.upload_threads) == 3
-    assert fake_metrics.total('.upload_retry') == 2
-    assert fake_metrics.total('.dropped_records') == 3
-    assert fake_metrics.total('.flush_error') == 3
-    assert fake_metrics.values('histogram', '.flush.records') == []
-    assert fake_metrics.total('.uploaded_records') == 0
+    assert fake_metrics.total('.upload.retries') == 2
+    assert fake_metrics.total('.write.dropped_records') == 3
+    assert fake_metrics.total('.write.dropped_records', 'cause:upload_failed') == 3
+    assert fake_metrics.values('histogram', '.upload.records') == []
+    assert fake_metrics.total('.write.uploaded_records') == 0
 
 
 def test_precondition_failed_on_retry_counts_as_stored(
@@ -629,11 +629,11 @@ def test_precondition_failed_on_retry_counts_as_stored(
     store.flush()
 
     assert len(gcs.upload_threads) == 2
-    assert fake_metrics.total('.upload_retry') == 1
-    assert fake_metrics.total('.dropped_records') == 0
-    assert fake_metrics.total('.flush_error') == 0
-    assert fake_metrics.values('histogram', '.flush.records', 'reason:shutdown') == [1]
-    assert fake_metrics.total('.uploaded_records') == 1
+    assert fake_metrics.total('.upload.retries') == 1
+    assert fake_metrics.total('.write.dropped_records') == 0
+    assert fake_metrics.total('.write.dropped_records', 'cause:upload_failed') == 0
+    assert fake_metrics.values('histogram', '.upload.records', 'closed_by:shutdown') == [1]
+    assert fake_metrics.total('.write.uploaded_records') == 1
     assert store.select_one(action_id) is not None
 
 
@@ -653,30 +653,30 @@ def test_precondition_failed_on_first_attempt_drops_without_retry(
     store.flush()
 
     assert len(gcs.upload_threads) == 1
-    assert fake_metrics.total('.upload_retry') == 0
-    assert fake_metrics.total('.dropped_records') == 1
-    assert fake_metrics.values('histogram', '.flush.records') == []
+    assert fake_metrics.total('.upload.retries') == 0
+    assert fake_metrics.total('.write.dropped_records') == 1
+    assert fake_metrics.values('histogram', '.upload.records') == []
 
 
-def test_backlog_past_max_pending_batches_is_dropped(
+def test_backlog_past_max_queued_uploads_is_dropped(
     make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, fake_metrics: _FakeMetrics
 ) -> None:
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=1, OSPREY_GCS_EXECUTION_RESULTS_UPLOAD_THREADS=1)
     gcs.upload_gate.clear()
-    # Each insert closes a one-record batch; the first MAX_PENDING_BATCHES fill the backlog.
-    for sequence in range(MAX_PENDING_BATCHES + 1):
+    # Each insert closes a one-record batch; the first MAX_QUEUED_UPLOADS fill the backlog.
+    for sequence in range(MAX_QUEUED_UPLOADS + 1):
         _insert(store, _action_id(_BASE, sequence))
     store._tick()
 
-    assert fake_metrics.last_gauge('.pending_batches') == MAX_PENDING_BATCHES
-    assert fake_metrics.total('.dropped_records') == 1
-    assert fake_metrics.total('.flush_error') == 1
+    assert fake_metrics.last_gauge('.buffer.queued_uploads') == MAX_QUEUED_UPLOADS
+    assert fake_metrics.total('.write.dropped_records') == 1
+    assert fake_metrics.total('.write.dropped_records', 'cause:queue_full') == 1
 
     gcs.upload_gate.set()
     store.flush()
 
-    assert len(gcs.objects) == MAX_PENDING_BATCHES
-    assert fake_metrics.total('.dropped_records') == 1
+    assert len(gcs.objects) == MAX_QUEUED_UPLOADS
+    assert fake_metrics.total('.write.dropped_records') == 1
 
 
 def test_unexpected_upload_error_is_counted_as_dropped(
@@ -695,7 +695,7 @@ def test_unexpected_upload_error_is_counted_as_dropped(
     store.flush()
 
     assert gcs.objects == {}
-    assert fake_metrics.total('.dropped_records') == 2
+    assert fake_metrics.total('.write.dropped_records') == 2
 
 
 def test_object_metadata_stays_under_gcs_limit(
@@ -719,7 +719,7 @@ def test_concurrent_inserts_do_not_lose_writes(
 ) -> None:
     """The async worker calls insert() through asyncio.to_thread, so inserts race on real OS threads."""
     # This test checks locking, not the backlog cap: inserts can outrun the 2 uploaders (always under gevent).
-    monkeypatch.setattr(stored_execution_result, 'MAX_PENDING_BATCHES', 1000)
+    monkeypatch.setattr(stored_execution_result, 'MAX_QUEUED_UPLOADS', 1000)
     store = make_store(OSPREY_GCS_EXECUTION_RESULTS_MAX_RECORDS=7)
     thread_count = 16
     inserts_per_thread = 25
@@ -797,7 +797,7 @@ def test_close_cancels_queued_uploads_and_counts_them_as_dropped(
 
     store.close()
 
-    assert fake_metrics.total('.dropped_records') == 2
+    assert fake_metrics.total('.write.dropped_records') == 2
     assert [upload.cancelled() for upload in uploads] == [False, True, True]
     assert store._in_flight.keys() == {uploads[0]}
     gcs.upload_gate.set()

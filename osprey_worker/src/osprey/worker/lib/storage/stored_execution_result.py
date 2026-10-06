@@ -435,12 +435,14 @@ class StoredExecutionResultGCS(ExecutionResultStore):
         action_data_json: str,
     ) -> None:
         try:
-            for cell, value in (
+            for field, value in (
                 ('extracted_features', extracted_features_json),
                 ('error_traces', error_traces_json),
                 ('action_data', action_data_json),
             ):
-                metrics.histogram(f'{_GCS_METRIC}.write.value_bytes', len(value.encode('utf-8')), tags=[f'cell:{cell}'])
+                metrics.histogram(
+                    f'{_GCS_METRIC}.write.value_bytes', len(value.encode('utf-8')), tags=[f'field:{field}']
+                )
 
             snowflake_seconds = Snowflake(action_id).to_timestamp()
             now = self._clock()
@@ -544,7 +546,7 @@ class StoredExecutionResultGCS(ExecutionResultStore):
             for key, batch in list(self._batches.items()):
                 if batch.bucket_end is None:
                     if now - batch.created_at >= self._flush_tick_seconds:
-                        due.append((self._batches.pop(key), 'tick'))
+                        due.append((self._batches.pop(key), 'late_batch_age'))
                 elif now >= max(
                     batch.bucket_end + self._close_grace_seconds, batch.created_at + REOPEN_MIN_AGE_SECONDS
                 ):

@@ -416,7 +416,7 @@ def test_late_batch_closes_after_default_flush_tick(
 
     (name,) = _object_names(gcs)
     assert name.startswith('v1/20260924/late/12/')
-    assert fake_metrics.values('histogram', '.upload.records', 'reason:tick') == [1]
+    assert fake_metrics.values('histogram', '.upload.records', 'reason:late_batch_age') == [1]
 
 
 def test_every_inserted_record_round_trips_after_flush(

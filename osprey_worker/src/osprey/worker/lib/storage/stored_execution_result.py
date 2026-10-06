@@ -690,6 +690,8 @@ class StoredExecutionResultGCS(ExecutionResultStore):
             metrics.increment(f'{_GCS_METRIC}.read.ids', len(set(action_ids)) - len(found), tags=['result:not_in_gcs'])
         results = list(found.values())
         if failures:
+            # One per read with any failed list or download call; the error carries the count of calls.
+            metrics.increment(f'{_GCS_METRIC}.read.errors')
             raise ExecutionResultReadError(partial_results=results, failed_prefixes=failures)
         return results
 
@@ -919,7 +921,11 @@ class StoredExecutionResultPostgres(ExecutionResultStore):
         return execution_result_dict
 
 
-_GCS_MIGRATION_METRIC = 'execution_result.migration'
+_GCS_MIGRATION_METRIC = 'execution_result_gcs_migration'
+# The GCS writer closes a slot about 15 s after it ends, then uploads. `gcs_miss age:under_5m` is likely
+# a write still in the buffer. `age:over_5m` means the id predates dual write, GCS lost it, or a worker
+# processed it more than ~4 min late and its batch has not uploaded yet (up to 60 s more, 300 s if late).
+_GCS_MISS_AGE_SECONDS = 300
 
 
 class StoredExecutionResultGCSMigration(ExecutionResultStore):
@@ -932,9 +938,8 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
     Rollout: turn on dual write. Once reads are stable, turn BigTable writes off. After BigTable's
     90-day retention, switch the backend to `gcs`.
 
-    `write store:gcs outcome:error` cannot fire for the GCS store, because its `insert` never raises.
-    `execution_result.gcs.write.dropped_records` is the write-failure signal. Reads count only results returned,
-    by store; the caller knows whether an id with no result is still being saved or is really missing.
+    `write target:gcs outcome:error` cannot fire for the GCS store, because its `insert` never raises.
+    `execution_result.gcs.write.dropped_records` is the write-failure signal.
     """
 
     def __init__(
@@ -942,10 +947,12 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         gcs: ExecutionResultStore,
         bigtable: ExecutionResultStore,
         bigtable_write_enabled: bool,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._gcs = gcs
         self._bigtable = bigtable
         self._bigtable_write_enabled = bigtable_write_enabled
+        self._clock = clock
 
     @classmethod
     def from_config(
@@ -980,7 +987,7 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
         except Exception:
             logger.exception(f'Failed to write execution result {action_id} to GCS')
             outcome = 'error'
-        metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['store:gcs', f'outcome:{outcome}'])
+        metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:gcs', f'outcome:{outcome}'])
 
         if not self._bigtable_write_enabled:
             return
@@ -993,9 +1000,9 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
                 action_data_json=action_data_json,
             )
         except Exception:
-            metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['store:bigtable', 'outcome:error'])
+            metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:bigtable', 'outcome:error'])
             raise
-        metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['store:bigtable', 'outcome:ok'])
+        metrics.increment(f'{_GCS_MIGRATION_METRIC}.write', tags=['target:bigtable', 'outcome:ok'])
 
     def select_one(self, action_id: int) -> Optional[Dict[str, Any]]:
         results = self.select_many([action_id])
@@ -1004,9 +1011,10 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
     def select_many(self, action_ids: List[int]) -> List[Dict[str, Any]]:
         action_ids = list(dict.fromkeys(action_ids))
         found: Dict[int, Dict[str, Any]] = {}
+        gcs_failed = False
         if action_ids:
             try:
-                with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['store:gcs']):
+                with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:gcs']):
                     found = {record['id']: record for record in self._gcs.select_many(action_ids)}
             except ExecutionResultReadError as e:
                 # Keep what GCS returned; the ids it could not read go to BigTable below. The store
@@ -1015,32 +1023,44 @@ class StoredExecutionResultGCSMigration(ExecutionResultStore):
                     f'Read {len(e.partial_results)} of {len(action_ids)} execution results from GCS; '
                     f'{e.failed_prefixes} list or download calls failed'
                 )
-                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_errors')
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_error')
                 found = {record['id']: record for record in e.partial_results}
+                gcs_failed = True
             except Exception:
                 logger.exception(f'Failed to read {len(action_ids)} execution results from GCS')
-                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_errors')
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_error')
+                gcs_failed = True
 
         misses = [i for i in action_ids if i not in found]
+        # A failed read says nothing about what GCS holds, so it does not count toward either miss rate.
+        if not gcs_failed:
+            now = self._clock()
+            old = sum(1 for i in misses if now - Snowflake(i).to_timestamp() > _GCS_MISS_AGE_SECONDS)
+            if old:
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_miss', old, tags=['age:over_5m'])
+            if len(misses) > old:
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.gcs_miss', len(misses) - old, tags=['age:under_5m'])
 
         fallback: Dict[int, Dict[str, Any]] = {}
         if misses:
-            with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['store:bigtable']):
+            with metrics.timed(f'{_GCS_MIGRATION_METRIC}.read.duration', tags=['backend:bigtable']):
                 fallback = {record['id']: record for record in self._bigtable.select_many(misses)}
 
         results: List[Dict[str, Any]] = []
-        served = {'gcs': 0, 'bigtable': 0}
+        sources = {'gcs': 0, 'bigtable': 0, 'not_found': 0}
         for action_id in action_ids:
             # During dual write both stores can hold an id; the GCS record wins.
             if action_id in found:
                 results.append(found[action_id])
-                served['gcs'] += 1
+                sources['gcs'] += 1
             elif action_id in fallback:
                 results.append(fallback[action_id])
-                served['bigtable'] += 1
-        for store, count in served.items():
+                sources['bigtable'] += 1
+            else:
+                sources['not_found'] += 1
+        for source, count in sources.items():
             if count:
-                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.results', count, tags=[f'store:{store}'])
+                metrics.increment(f'{_GCS_MIGRATION_METRIC}.read.source', count, tags=[f'source:{source}'])
         return results
 
     def flush(self) -> None:

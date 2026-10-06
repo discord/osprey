@@ -16,7 +16,7 @@ from osprey.worker.lib.storage.stored_execution_result import (
 from osprey.worker.lib.storage.tests.test_stored_execution_result_gcs import _FakeClient, _FakeGCS
 
 _EPOCH_MS = 1420070400000
-_METRIC = 'execution_result.migration'
+_METRIC = 'execution_result_gcs_migration'
 _NOW = datetime(2026, 9, 24, 12, 34, 20, tzinfo=timezone.utc)
 
 
@@ -102,7 +102,7 @@ class _FakeMetrics:
             if metric == f'{_METRIC}{suffix}' and all(tag in event_tags for tag in tags)
         )
 
-    def timed_stores(self) -> List[str]:
+    def timed_backends(self) -> List[str]:
         return [tags[0] for metric, _, tags in self.events if metric == f'{_METRIC}.read.duration']
 
 
@@ -141,6 +141,7 @@ def _gcs_migration_store(
         gcs_store,
         bigtable_store,
         bigtable_write_enabled=bigtable_write_enabled,
+        clock=_NOW.timestamp,
     )
 
 
@@ -152,7 +153,7 @@ def test_insert_writes_both(gcs_store: _FakeStore, bigtable_store: _FakeStore, f
     _insert(_gcs_migration_store(gcs_store, bigtable_store), _OLD)
     assert list(gcs_store.records) == [_OLD]
     assert list(bigtable_store.records) == [_OLD]
-    assert fake_metrics.total('.write', 'store:gcs', 'outcome:ok') == 1
+    assert fake_metrics.total('.write', 'target:gcs', 'outcome:ok') == 1
 
 
 def test_gcs_insert_failure_is_swallowed(
@@ -161,8 +162,8 @@ def test_gcs_insert_failure_is_swallowed(
     gcs_store.fail_insert = True
     _insert(_gcs_migration_store(gcs_store, bigtable_store), _OLD)
     assert list(bigtable_store.records) == [_OLD]
-    assert fake_metrics.total('.write', 'store:gcs', 'outcome:error') == 1
-    assert fake_metrics.total('.write', 'store:bigtable', 'outcome:ok') == 1
+    assert fake_metrics.total('.write', 'target:gcs', 'outcome:error') == 1
+    assert fake_metrics.total('.write', 'target:bigtable', 'outcome:ok') == 1
 
 
 def test_bigtable_insert_failure_propagates(
@@ -172,8 +173,8 @@ def test_bigtable_insert_failure_propagates(
     with pytest.raises(RuntimeError, match='simulated insert failure'):
         _insert(_gcs_migration_store(gcs_store, bigtable_store), _OLD)
     assert list(gcs_store.records) == [_OLD]
-    assert fake_metrics.total('.write', 'store:bigtable', 'outcome:error') == 1
-    assert fake_metrics.total('.write', 'store:bigtable', 'outcome:ok') == 0
+    assert fake_metrics.total('.write', 'target:bigtable', 'outcome:error') == 1
+    assert fake_metrics.total('.write', 'target:bigtable', 'outcome:ok') == 0
 
 
 def test_bigtable_write_disabled_skips_bigtable(
@@ -183,10 +184,10 @@ def test_bigtable_write_disabled_skips_bigtable(
     _insert(_gcs_migration_store(gcs_store, bigtable_store, bigtable_write_enabled=False), _OLD)
     assert list(gcs_store.records) == [_OLD]
     assert bigtable_store.records == {}
-    assert fake_metrics.total('.write', 'store:bigtable') == 0
+    assert fake_metrics.total('.write', 'target:bigtable') == 0
 
 
-def test_read_results_by_store(gcs_store: _FakeStore, bigtable_store: _FakeStore, fake_metrics: _FakeMetrics) -> None:
+def test_read_sources(gcs_store: _FakeStore, bigtable_store: _FakeStore, fake_metrics: _FakeMetrics) -> None:
     in_gcs, in_bigtable, nowhere = (_action_id(_NOW - timedelta(minutes=10), s) for s in range(3))
     gcs_store.put(in_gcs, 'gcs')
     bigtable_store.put(in_gcs, 'bigtable')
@@ -197,11 +198,10 @@ def test_read_results_by_store(gcs_store: _FakeStore, bigtable_store: _FakeStore
     assert [(r['id'], r['action_data']) for r in results] == [(in_gcs, 'gcs'), (in_bigtable, 'bigtable')]
     assert gcs_store.selected == [[in_gcs, in_bigtable, nowhere]]
     assert bigtable_store.selected == [[in_bigtable, nowhere]]
-    assert fake_metrics.total('.read.results', 'store:gcs') == 1
-    assert fake_metrics.total('.read.results', 'store:bigtable') == 1
-    # An id with no result is counted by the caller, which knows whether it is still being saved.
-    assert fake_metrics.total('.read.results') == 2
-    assert fake_metrics.timed_stores() == ['store:gcs', 'store:bigtable']
+    assert fake_metrics.total('.read.source', 'source:gcs') == 1
+    assert fake_metrics.total('.read.source', 'source:bigtable') == 1
+    assert fake_metrics.total('.read.source', 'source:not_found') == 1
+    assert fake_metrics.timed_backends() == ['backend:gcs', 'backend:bigtable']
 
 
 def test_select_one_prefers_gcs(gcs_store: _FakeStore, bigtable_store: _FakeStore, fake_metrics: _FakeMetrics) -> None:
@@ -210,6 +210,19 @@ def test_select_one_prefers_gcs(gcs_store: _FakeStore, bigtable_store: _FakeStor
     record = _gcs_migration_store(gcs_store, bigtable_store).select_one(_OLD)
     assert record is not None and record['action_data'] == 'gcs'
     assert bigtable_store.selected == []
+
+
+def test_gcs_misses_by_age(gcs_store: _FakeStore, bigtable_store: _FakeStore, fake_metrics: _FakeMetrics) -> None:
+    young = _action_id(_NOW - timedelta(minutes=2))
+    store = _gcs_migration_store(gcs_store, bigtable_store)
+
+    store.select_many([_OLD])
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 1
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 0
+
+    store.select_many([young])
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 1
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 1
 
 
 def test_gcs_select_failure_falls_back(
@@ -224,8 +237,10 @@ def test_gcs_select_failure_falls_back(
 
     assert [r['id'] for r in results] == ids
     assert bigtable_store.selected == [ids]
-    assert fake_metrics.total('.read.results', 'store:bigtable') == 3
-    assert fake_metrics.total('.read.gcs_errors') == 1
+    assert fake_metrics.total('.read.source', 'source:bigtable') == 3
+    assert fake_metrics.total('.read.gcs_error') == 1
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 0
 
 
 def test_partial_gcs_read_keeps_its_results_and_falls_back_for_the_rest(
@@ -241,9 +256,11 @@ def test_partial_gcs_read_keeps_its_results_and_falls_back_for_the_rest(
 
     assert [(r['id'], r['action_data']) for r in results] == [(in_gcs, 'gcs'), (unread, 'bigtable')]
     assert bigtable_store.selected == [[unread]]
-    assert fake_metrics.total('.read.gcs_errors') == 1
-    assert fake_metrics.total('.read.results', 'store:gcs') == 1
-    assert fake_metrics.total('.read.results', 'store:bigtable') == 1
+    assert fake_metrics.total('.read.gcs_error') == 1
+    assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 0
+    assert fake_metrics.total('.read.gcs_miss', 'age:under_5m') == 0
+    assert fake_metrics.total('.read.source', 'source:gcs') == 1
+    assert fake_metrics.total('.read.source', 'source:bigtable') == 1
 
 
 def test_flush_reaches_both_stores(gcs_store: _FakeStore, bigtable_store: _FakeStore) -> None:
@@ -343,7 +360,7 @@ def test_service_reads_the_real_batched_store_through_gcs_migration(
         assert len(gcs.objects) == 1
 
         assert sorted(result.id for result in service.get_many(ids)) == sorted(ids)
-        assert fake_metrics.total('.read.results', 'store:gcs') == 2
+        assert fake_metrics.total('.read.source', 'source:gcs') == 2
 
         def _fail_list(*_args: Any, **_kwargs: Any) -> None:
             raise RuntimeError('simulated GCS list outage')
@@ -351,8 +368,9 @@ def test_service_reads_the_real_batched_store_through_gcs_migration(
         monkeypatch.setattr(_FakeClient, 'list_blobs', _fail_list)
 
         assert sorted(result.id for result in service.get_many(ids)) == sorted(ids)
-        assert fake_metrics.total('.read.gcs_errors') == 1
-        assert fake_metrics.total('.read.results', 'store:bigtable') == 2
+        assert fake_metrics.total('.read.gcs_error') == 1
+        assert fake_metrics.total('.read.gcs_miss', 'age:over_5m') == 0
+        assert fake_metrics.total('.read.source', 'source:bigtable') == 2
         [bigtable] = _FakeBigTable.instances
         assert bigtable.selected == [ids]
     finally:

@@ -540,10 +540,14 @@ def test_list_failure_raises_with_results_from_the_other_prefixes(
     assert raised.value.failed_prefixes == 1
     assert fake_metrics.total('.read.ids', 'result:in_gcs') == 1
     assert fake_metrics.total('.read.ids', 'result:not_in_gcs') == 1
+    assert fake_metrics.total('.read.errors') == 1
 
 
 def test_download_failure_raises_with_results_from_the_other_objects(
-    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, monkeypatch: pytest.MonkeyPatch
+    make_store: Callable[..., StoredExecutionResultGCS],
+    gcs: _FakeGCS,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_metrics: _FakeMetrics,
 ) -> None:
     store = make_store()
     good_id = _action_id(_BASE)
@@ -565,6 +569,7 @@ def test_download_failure_raises_with_results_from_the_other_objects(
 
     assert [result['id'] for result in raised.value.partial_results] == [good_id]
     assert raised.value.failed_prefixes == 1
+    assert fake_metrics.total('.read.errors') == 1
 
 
 def test_duplicate_id_returns_the_latest_timestamp(make_store: Callable[..., StoredExecutionResultGCS]) -> None:

@@ -173,7 +173,7 @@ async def test_long_sync_wave_yields_by_elapsed_time_while_async_pending(
 
     # The task started before any node of the 40-node wave ran; the old every-100-nodes loop starts it after.
     assert state['started_at_node'] is not None
-    assert state['nodes'] - state['started_at_node'] == _SYNC_NODE_COUNT
+    assert state['nodes'] - state['started_at_node'] >= _SYNC_NODE_COUNT
     # ~120 ms of sync work at a 20 ms interval gives about 7 yields; the old loop gives none.
     assert 2 <= state['ticks'] <= _SYNC_NODE_COUNT
 

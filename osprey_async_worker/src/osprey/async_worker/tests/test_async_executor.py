@@ -172,7 +172,9 @@ async def test_long_sync_wave_yields_by_elapsed_time_while_async_pending(
     finally:
         ticker_task.cancel()
 
-    assert state['started_at_node'] is not None and state['started_at_node'] <= 2
+    # The task must be running before most of the 40-node wave has executed.
+    assert state['started_at_node'] is not None
+    assert state['started_at_node'] <= state['nodes'] - _SYNC_NODE_COUNT + 2
     # ~120 ms of sync work at a 20 ms interval: one yield at the first node plus roughly six more.
     assert 4 <= state['ticks'] <= 14
 

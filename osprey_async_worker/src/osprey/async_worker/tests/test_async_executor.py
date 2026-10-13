@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from textwrap import dedent
-from typing import ClassVar, Iterator, Sequence
+from typing import Callable, ClassVar, Iterator, Sequence
 
 import pytest
 from osprey.async_worker import executor as async_executor
@@ -118,10 +118,11 @@ class CountingBatchableUdf(AsyncBatchableUDFBase[CountingBatchableArguments, str
 
 
 class StartedAsyncUdf(AsyncUDFBase[GatedArguments, str]):
-    started: ClassVar[bool] = False
+    on_start: ClassVar[Callable[[], None] | None] = None
 
     async def async_execute(self, execution_context: ExecutionContext, arguments: GatedArguments) -> str:
-        type(self).started = True
+        if type(self).on_start:
+            type(self).on_start()
         return arguments.value
 
 
@@ -133,13 +134,10 @@ _SYNC_NODES_SOURCE = '\n'.join(f'S{i} = StringLength(s="x{i}")' for i in range(_
 @pytest.fixture()
 def slow_sync_wave(monkeypatch: pytest.MonkeyPatch):
     """Makes each sync node busy-wait and counts event loop turns taken during the wave."""
-    StartedAsyncUdf.started = False
     original = async_executor._execute_sync
     state = {'ticks': 0, 'started_at_node': None, 'nodes': 0}
 
     def slow_execute_sync(*args, **kwargs):
-        if state['started_at_node'] is None and StartedAsyncUdf.started:
-            state['started_at_node'] = state['nodes']
         state['nodes'] += 1
         end = time.monotonic() + _SYNC_NODE_SECONDS
         while time.monotonic() < end:
@@ -152,6 +150,7 @@ def slow_sync_wave(monkeypatch: pytest.MonkeyPatch):
             await asyncio.sleep(0)
 
     monkeypatch.setattr(async_executor, '_execute_sync', slow_execute_sync)
+    monkeypatch.setattr(StartedAsyncUdf, 'on_start', lambda: state.__setitem__('started_at_node', state['nodes']))
     return state, ticker
 
 
@@ -172,11 +171,11 @@ async def test_long_sync_wave_yields_by_elapsed_time_while_async_pending(
     finally:
         ticker_task.cancel()
 
-    # The task must be running before most of the 40-node wave has executed.
+    # The task started before any node of the 40-node wave ran; the old every-100-nodes loop starts it after.
     assert state['started_at_node'] is not None
-    assert state['started_at_node'] <= state['nodes'] - _SYNC_NODE_COUNT + 2
-    # ~120 ms of sync work at a 20 ms interval: one yield at the first node plus roughly six more.
-    assert 4 <= state['ticks'] <= 14
+    assert state['nodes'] - state['started_at_node'] == _SYNC_NODE_COUNT
+    # ~120 ms of sync work at a 20 ms interval gives about 7 yields; the old loop gives none.
+    assert 2 <= state['ticks'] <= _SYNC_NODE_COUNT
 
 
 @pytest.mark.asyncio

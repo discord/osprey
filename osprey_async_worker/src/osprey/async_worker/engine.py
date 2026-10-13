@@ -8,6 +8,7 @@ Provides async execute() that calls the async executor directly.
 import asyncio
 import gc
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import time
@@ -65,6 +66,16 @@ _DEFAULT_MAX_ASYNC_PER_EXECUTION = 12
 _DEFAULT_YIELD_INTERVAL_MS = DEFAULT_YIELD_INTERVAL_S * 1000
 
 
+def _read_yield_interval_s() -> float:
+    interval_ms = CONFIG.instance().get_float('OSPREY_ASYNC_YIELD_INTERVAL_MS', _DEFAULT_YIELD_INTERVAL_MS)
+    if not math.isfinite(interval_ms) or interval_ms <= 0:
+        log.warning(
+            'Ignoring invalid OSPREY_ASYNC_YIELD_INTERVAL_MS=%r; using %s ms', interval_ms, _DEFAULT_YIELD_INTERVAL_MS
+        )
+        return DEFAULT_YIELD_INTERVAL_S
+    return interval_ms / 1000
+
+
 class FeatureLocation(TypedDict):
     """Where a stored-name identifier is declared in the rule sources.
 
@@ -105,6 +116,7 @@ class AsyncOspreyEngine:
         self._sources_provider = sources_provider
         self._udf_registry = udf_registry
         self._should_yield_during_compilation = should_yield_during_compilation
+        self._yield_interval_s = _read_yield_interval_s()
         config_registry = get_config_registry()
         self._validator_registry = ValidatorRegistry.instance_with_additional_validators(
             config_registry.get_validator()
@@ -462,9 +474,6 @@ class AsyncOspreyEngine:
                 max_concurrent = CONFIG.instance().get_int(
                     'OSPREY_MAX_ASYNC_PER_EXECUTION', _DEFAULT_MAX_ASYNC_PER_EXECUTION
                 )
-            yield_interval_s = (
-                CONFIG.instance().get_float('OSPREY_ASYNC_YIELD_INTERVAL_MS', _DEFAULT_YIELD_INTERVAL_MS) / 1000
-            )
             action_name = action.action_name
 
             async def _run(graph: ExecutionGraph) -> ExecutionResult:
@@ -475,7 +484,7 @@ class AsyncOspreyEngine:
                     max_concurrent=max_concurrent,
                     sample_rate=sample_rate,
                     parent_tracer_span=parent_tracer_span,
-                    yield_interval_s=yield_interval_s,
+                    yield_interval_s=self._yield_interval_s,
                 )
 
             serve_graph, shadow_spec = resolve_dispatch(

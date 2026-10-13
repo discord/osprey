@@ -9,6 +9,7 @@ from textwrap import dedent
 from typing import Dict, Optional, Union
 
 import pytest
+from osprey.async_worker.executor import DEFAULT_YIELD_INTERVAL_S
 from osprey.async_worker.executor import execute as async_execute
 from osprey.engine.ast.sources import SOURCE_ENTRY_POINT_PATH, Sources
 from osprey.engine.ast_validator import validate_sources
@@ -68,6 +69,7 @@ def async_execute_with_result(stdlib_udf_registry: UDFRegistry):
         udf_registry: Optional[UDFRegistry] = None,
         max_concurrent: int = 12,
         action_time: Optional[datetime] = None,
+        yield_interval_s: float = DEFAULT_YIELD_INTERVAL_S,
     ) -> ExecutionResult:
         registry = udf_registry or stdlib_udf_registry
         sources = _into_sources(sources_dict)
@@ -88,7 +90,13 @@ def async_execute_with_result(stdlib_udf_registry: UDFRegistry):
             action_name=action_name,
             timestamp=action_time or datetime.utcnow(),
         )
-        return await async_execute(execution_graph, udf_helpers or UDFHelpers(), action, max_concurrent=max_concurrent)
+        return await async_execute(
+            execution_graph,
+            udf_helpers or UDFHelpers(),
+            action,
+            max_concurrent=max_concurrent,
+            yield_interval_s=yield_interval_s,
+        )
 
     return _execute
 

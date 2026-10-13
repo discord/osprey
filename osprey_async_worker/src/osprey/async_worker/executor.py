@@ -10,6 +10,7 @@ primitives will NOT work here — they must be ported to AsyncUDFBase.
 
 import asyncio
 import os
+import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Any, AsyncContextManager, AsyncIterator, Dict, List, Optional, Sequence, Set, Tuple
@@ -51,6 +52,8 @@ logger = get_logger(__name__)
 _UNSET_RESULT: NodeResult = Err(None)
 
 _DEFAULT_MAX_ASYNC_PER_EXECUTION = 12
+# Max sync evaluation time between event-loop yields while async work is pending.
+DEFAULT_YIELD_INTERVAL_S = 0.010
 _OBSERVABILITY_SAMPLE_RATE = 0.01
 _CARDINALITY_SUPPRESSION_TAGS = (
     'host:none',
@@ -443,6 +446,7 @@ async def execute(
     max_concurrent: int = _DEFAULT_MAX_ASYNC_PER_EXECUTION,
     sample_rate: int = 100,
     parent_tracer_span: Optional[TracerSpan] = None,
+    yield_interval_s: float = DEFAULT_YIELD_INTERVAL_S,
 ) -> ExecutionResult:
     """Async executor for the osprey rules engine.
 
@@ -530,14 +534,16 @@ async def execute(
                 max_in_flight = in_flight
 
         # Execute sync chains inline (pure computation, fast, no I/O).
-        # Only yield deep into a long sync round when async tasks are in flight.
-        # Each sleep(0) triggers a full event loop cycle including gRPC C-core polling,
-        # so unnecessary yields cause significant context-switch overhead.
-        # Short rounds (<100 chains) skip yielding entirely — the asyncio.wait() at the
-        # top of the loop provides natural yield points between rounds.
+        # While async tasks are in flight, yield at the first node and whenever yield_interval_s of sync
+        # work has elapsed, so task startup and I/O callbacks are not delayed until the wave ends.
+        # Each sleep(0) is a full event loop cycle, so skip it when nothing is pending.
+        last_yield = time.monotonic()
         for i, sync_chain in enumerate(ready_sync):
-            if (in_progress_singlets or in_progress_batches) and i > 0 and i % 100 == 0:
-                await asyncio.sleep(0)
+            if in_progress_singlets or in_progress_batches:
+                now = time.monotonic()
+                if i == 0 or now - last_yield >= yield_interval_s:
+                    await asyncio.sleep(0)
+                    last_yield = time.monotonic()
             result = _execute_sync(sync_chain, context, error_infos)
             context.set_resolved_value(sync_chain, result)
 

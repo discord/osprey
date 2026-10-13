@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from osprey.worker.lib.data_exporters.validation_result_exporter import BaseValidationResultExporter
 
 from ddtrace.span import Span as TracerSpan
+from osprey.async_worker.executor import DEFAULT_YIELD_INTERVAL_S
 from osprey.async_worker.executor import execute as async_execute
 from osprey.async_worker.typed_contract_warmer import TypedContractWarmer
 from osprey.engine.ast.ast_utils import iter_nodes
@@ -61,6 +62,7 @@ from osprey.worker.lib.sources_provider_base import BaseSourcesProvider
 log = logging.getLogger(__name__)
 
 _DEFAULT_MAX_ASYNC_PER_EXECUTION = 12
+_DEFAULT_YIELD_INTERVAL_MS = DEFAULT_YIELD_INTERVAL_S * 1000
 
 
 class FeatureLocation(TypedDict):
@@ -460,6 +462,9 @@ class AsyncOspreyEngine:
                 max_concurrent = CONFIG.instance().get_int(
                     'OSPREY_MAX_ASYNC_PER_EXECUTION', _DEFAULT_MAX_ASYNC_PER_EXECUTION
                 )
+            yield_interval_s = (
+                CONFIG.instance().get_float('OSPREY_ASYNC_YIELD_INTERVAL_MS', _DEFAULT_YIELD_INTERVAL_MS) / 1000
+            )
             action_name = action.action_name
 
             async def _run(graph: ExecutionGraph) -> ExecutionResult:
@@ -470,6 +475,7 @@ class AsyncOspreyEngine:
                     max_concurrent=max_concurrent,
                     sample_rate=sample_rate,
                     parent_tracer_span=parent_tracer_span,
+                    yield_interval_s=yield_interval_s,
                 )
 
             serve_graph, shadow_spec = resolve_dispatch(

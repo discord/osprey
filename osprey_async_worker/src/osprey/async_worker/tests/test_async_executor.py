@@ -5,6 +5,7 @@ executor for stdlib UDFs (pure computation, no I/O).
 """
 
 import asyncio
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -114,6 +115,78 @@ class CountingBatchableUdf(AsyncBatchableUDFBase[CountingBatchableArguments, str
 
     async def async_execute_batch(self, execution_context, udfs, arguments: Sequence[CountingBatchableArgs]):
         return [Ok(a.value) for a in arguments]
+
+
+class StartedAsyncUdf(AsyncUDFBase[GatedArguments, str]):
+    started: ClassVar[bool] = False
+
+    async def async_execute(self, execution_context: ExecutionContext, arguments: GatedArguments) -> str:
+        type(self).started = True
+        return arguments.value
+
+
+_SYNC_NODE_COUNT = 40
+_SYNC_NODE_SECONDS = 0.003
+_SYNC_NODES_SOURCE = '\n'.join(f'S{i} = StringLength(s="x{i}")' for i in range(_SYNC_NODE_COUNT))
+
+
+@pytest.fixture()
+def slow_sync_wave(monkeypatch: pytest.MonkeyPatch):
+    """Makes each sync node busy-wait and counts event loop turns taken during the wave."""
+    StartedAsyncUdf.started = False
+    original = async_executor._execute_sync
+    state = {'ticks': 0, 'started_at_node': None, 'nodes': 0}
+
+    def slow_execute_sync(*args, **kwargs):
+        if state['started_at_node'] is None and StartedAsyncUdf.started:
+            state['started_at_node'] = state['nodes']
+        state['nodes'] += 1
+        end = time.monotonic() + _SYNC_NODE_SECONDS
+        while time.monotonic() < end:
+            pass
+        return original(*args, **kwargs)
+
+    async def ticker():
+        while True:
+            state['ticks'] += 1
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(async_executor, '_execute_sync', slow_execute_sync)
+    return state, ticker
+
+
+@pytest.mark.asyncio
+async def test_long_sync_wave_yields_by_elapsed_time_while_async_pending(
+    async_execute_with_result, stdlib_udf_registry: UDFRegistry, slow_sync_wave
+) -> None:
+    """A pending async task must start early in a long sync wave, not after 100 nodes."""
+    state, ticker = slow_sync_wave
+    stdlib_udf_registry.register(StartedAsyncUdf)
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        await async_execute_with_result(
+            f'A = StartedAsyncUdf(value="a")\n{_SYNC_NODES_SOURCE}',
+            udf_registry=stdlib_udf_registry,
+            yield_interval_s=0.02,
+        )
+    finally:
+        ticker_task.cancel()
+
+    assert state['started_at_node'] is not None and state['started_at_node'] <= 2
+    # ~120 ms of sync work at a 20 ms interval: one yield at the first node plus roughly six more.
+    assert 4 <= state['ticks'] <= 14
+
+
+@pytest.mark.asyncio
+async def test_sync_only_wave_does_not_yield(async_execute_with_result, slow_sync_wave) -> None:
+    state, ticker = slow_sync_wave
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        await async_execute_with_result(_SYNC_NODES_SOURCE, yield_interval_s=0.0)
+    finally:
+        ticker_task.cancel()
+
+    assert state['ticks'] == 0
 
 
 @pytest.mark.asyncio

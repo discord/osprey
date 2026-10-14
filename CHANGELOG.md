@@ -24,4 +24,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 🐛 Bug fixes
 - Default to selecting all for event stream ([#194](https://github.com/roostorg/osprey/pull/194) by [@chimosky](https://github.com/chimosky))
+- Async executor yields to the event loop by elapsed time (default 10 ms, `OSPREY_ASYNC_YIELD_INTERVAL_MS`) instead of every 100 sync nodes while async work is pending, so async reads are no longer delayed behind long sync waves ([#77](https://github.com/discord/osprey/pull/77) by [@cmttt](https://github.com/cmttt))
 - Fix failed UDF query ([#233](https://github.com/roostorg/osprey/pull/233) by [@chimosky](https://github.com/chimosky))

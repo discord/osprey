@@ -52,10 +52,6 @@ services:
         condition: service_healthy
       bigtable-initializer:
         condition: service_completed_successfully
-      minio:
-        condition: service_healthy
-      minio-bucket-init:
-        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       snowflake-id-worker:

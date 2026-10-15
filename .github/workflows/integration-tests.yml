@@ -28,7 +28,7 @@ jobs:
 
       - name: Pull and build Docker images
         run: |
-          docker compose -f docker-compose.yaml -f docker-compose.test.yaml --profile test pull
+          docker compose -f docker-compose.yaml -f docker-compose.test.yaml --profile test pull --include-deps test_runner
           docker compose -f docker-compose.yaml -f docker-compose.test.yaml --profile test build
 
       - name: Run integration tests

@@ -187,3 +187,27 @@ async def test_exhausted_watch_stream_reopens_watcher_and_redelivers():
     provider._watcher_task = asyncio.create_task(provider._watch_loop())
     await asyncio.wait_for(handled.wait(), timeout=5)
     await provider.stop()
+
+
+@pytest.mark.asyncio
+async def test_unapplied_sources_are_retried_by_rereading_etcd():
+    """Opt-in retry: the watcher mux drops an unchanged re-delivery, so the provider re-reads etcd itself."""
+    event = _make_full_sync_event({'main.sml': '# flaky'})
+    client = MagicMock()
+    client.get_watcher.return_value.begin_watching.return_value = event
+    provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=client, unapplied_retry_seconds=0.01)
+    applied = asyncio.Event()
+    calls = []
+
+    def callback() -> None:
+        calls.append(1)
+        if len(calls) == 2:
+            provider.mark_sources_applied(provider.get_current_sources().hash())
+            applied.set()
+
+    provider.set_sources_watcher(callback)
+    await provider._handle_event_safely(event)
+    provider._schedule_unapplied_retry()
+    await asyncio.wait_for(applied.wait(), timeout=5)
+    assert len(calls) == 2
+    await provider.stop()

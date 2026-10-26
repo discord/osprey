@@ -25,6 +25,7 @@ from osprey.worker.lib.sources_provider_base import BaseSourcesProvider
 SourcesWatcherCallback = Callable[[], Union[None, Awaitable[None]]]
 
 _WATCH_EXHAUSTED = object()
+_MAX_RETRY_SECONDS = 300.0
 
 
 class AsyncEtcdSourcesProvider(BaseSourcesProvider):
@@ -40,6 +41,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         etcd_key: str,
         etcd_client: Optional[EtcdClient] = None,
         reload_jitter_seconds: float = 0,
+        unapplied_retry_seconds: float = 0,
     ):
         self._etcd_key = etcd_key
         self._client = etcd_client or EtcdClient()
@@ -57,6 +59,13 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         # to match how ReadOnlyEtcdDict drives the gevent watcher.
         self._watcher_iter: Optional[Iterator[Any]] = None
         self._watcher_task: Optional[asyncio.Task[None]] = None
+        # The watcher's mux drops an unchanged value re-delivered on the same stream, so a failed
+        # compile is only retried on a watcher reset. When > 0 (off by default), re-read etcd and
+        # retry after this many seconds, doubling up to _MAX_RETRY_SECONDS while sources stay unapplied.
+        self._unapplied_retry_seconds = unapplied_retry_seconds
+        self._retry_delay = unapplied_retry_seconds
+        self._retry_task: Optional[asyncio.Task[None]] = None
+        self._handle_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Initialize sources from etcd and start watching for changes."""
@@ -111,7 +120,6 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
                     # next() with a default: asyncio cannot raise StopIteration into a future, so
                     # a bare next() on an exhausted generator hangs this task forever.
                     event = await loop.run_in_executor(None, next, watcher_iter, _WATCH_EXHAUSTED)
-                    backoff = 1.0  # Reset on success
                 except Exception:
                     logging.exception('Error in etcd watcher loop, retrying in %.1fs', backoff)
                     self._watcher = None
@@ -123,24 +131,59 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
                 if event is _WATCH_EXHAUSTED:
                     # Generator exhausted (e.g. transient etcd error inside
                     # continue_watching). Reopen the watcher fresh.
-                    logging.warning('etcd watcher stream ended, reopening')
+                    logging.warning('etcd watcher stream ended, reopening in %.1fs', backoff)
                     self._watcher = None
                     self._watcher_iter = None
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
                     continue
 
+                backoff = 1.0  # Reset on a delivered event
+
                 if event is not None:
-                    # A raise here would end this task and silently stop all future rule updates.
-                    try:
-                        await self._handle_event(event)
-                    except Exception:
-                        logging.exception('Error handling etcd sources event; watcher stays alive')
-                        metrics.increment('osprey.sources_provider.handler_error')
-                        sentry_sdk.capture_exception()
+                    await self._handle_event_safely(event)
+                    self._schedule_unapplied_retry()
         except asyncio.CancelledError:
             return
         finally:
             self._watcher = None
             self._watcher_iter = None
+
+    async def _handle_event_safely(self, event) -> None:
+        # A raise here would end the caller's task and silently stop all future rule updates.
+        try:
+            async with self._handle_lock:
+                await self._handle_event(event)
+        except Exception:
+            logging.exception('Error handling etcd sources event; watcher stays alive')
+            metrics.increment('osprey.sources_provider.handler_error')
+            sentry_sdk.capture_exception()
+
+    def _fetch_current_event(self):
+        return self._client.get_watcher(self._etcd_key, recursive=False).begin_watching()
+
+    def _schedule_unapplied_retry(self) -> None:
+        if self._unapplied_retry_seconds <= 0 or (self._retry_task is not None and not self._retry_task.done()):
+            return
+        if self._current_sources is None or self._current_sources.hash() == self._applied_sources_hash:
+            self._retry_delay = self._unapplied_retry_seconds
+            return
+        self._retry_task = asyncio.create_task(self._retry_unapplied())
+
+    async def _retry_unapplied(self) -> None:
+        delay = self._retry_delay
+        self._retry_delay = min(delay * 2, _MAX_RETRY_SECONDS)
+        await asyncio.sleep(delay)
+        try:
+            event = await asyncio.get_running_loop().run_in_executor(None, self._fetch_current_event)
+        except Exception:
+            logging.exception('Error re-reading etcd sources for retry')
+            metrics.increment('osprey.sources_provider.handler_error')
+            sentry_sdk.capture_exception()
+        else:
+            await self._handle_event_safely(event)
+        self._retry_task = None
+        self._schedule_unapplied_retry()
 
     async def _handle_event(self, event) -> None:
         """Handle an etcd event by updating sources and notifying watchers."""
@@ -195,3 +238,6 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
             except asyncio.CancelledError:
                 pass
             self._watcher_task = None
+        if self._retry_task is not None:
+            self._retry_task.cancel()
+            self._retry_task = None

@@ -152,6 +152,8 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
                     backoff = 1.0
 
                 if event is not None:
+                    # The event was read before the lock, so a retry may apply a newer value first and
+                    # this one lands after it. The stream then delivers the newer value too, so it converges.
                     await self._handle_event_safely(event)
                     self._schedule_unapplied_retry()
         except asyncio.CancelledError:
@@ -235,7 +237,11 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         new_hash = new_sources.hash()
         if self._applied_sources_hash is not None and new_hash == self._applied_sources_hash:
             # Desired sources are the applied ones again (e.g. a rollback after a failed compile).
+            # Forget the failed hash's attempts so pushing it again later gets a fresh budget.
             self._current_sources = new_sources
+            self._tracked_hash = None
+            self._attempts = 0
+            self._retry_delay = self._unapplied_retry_seconds
             return
 
         if new_hash != self._tracked_hash:
@@ -243,7 +249,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
             self._attempts = 0
             self._retry_delay = self._unapplied_retry_seconds
         if self._attempts >= self._max_attempts_per_hash:
-            logging.error('Giving up on unapplied sources=%s after %d attempts', new_hash, self._attempts)
+            logging.error('Giving up on sources=%s after %d failed attempts to apply', new_hash, self._attempts)
             metrics.increment('osprey.sources_provider.retry_exhausted')
             return
         if self._attempts > 0:
@@ -264,6 +270,8 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
                     await result
             except Exception:
                 # The engine may have swapped graphs before raising, so what is applied is unknown.
+                # Cost: if only the engine's post-swap tail failed, the live hash is recompiled on each
+                # retry, at most max_attempts_per_hash times, and then logged as given up on.
                 self._applied_sources_hash = None
                 raise
 

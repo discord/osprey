@@ -204,23 +204,30 @@ def test_name_must_be_unique_across_corpus(run_validation: RunValidationFunction
 
 
 @pytest.mark.parametrize(
-    'then',
+    'then, hint',
     [
-        "[DeclareVerdict(verdict='v')]",
-        '[L]',
+        ("[DeclareVerdict(verdict='v')]", 'has no `entity` argument'),
+        ('[L]', 'not through a variable'),
+        ('L', 'not through a variable'),
+        ('Effects', 'not through a variable'),
     ],
 )
-def test_rollout_rejects_then_without_direct_entity_call(run_validation: RunValidationFunction, then: str) -> None:
+def test_rollout_rejects_then_without_direct_entity_call(
+    run_validation: RunValidationFunction, then: str, hint: str
+) -> None:
     with pytest.raises(ValidationFailed) as e:
         run_validation(
             f"""
             R = Rule(when_all=[True], description='')
             E = Entity(type='MyEntity', id='1')
             L = LabelAdd(entity=E, label='foo')
+            Effects = [LabelAdd(entity=E, label='foo')]
             WhenRules(rules_any=[R], then={then}, name='d', mode='rollout', rollout_percent=5)
             """
         )
-    assert 'direct call with an `entity` argument' in e.value.rendered()
+    rendered = e.value.rendered()
+    assert 'direct call with an `entity` argument' in rendered
+    assert hint in rendered
 
 
 def test_rollout_runtime_fails_closed_without_entity(mocker: MockFixture) -> None:

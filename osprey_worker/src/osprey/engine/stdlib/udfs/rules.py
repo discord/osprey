@@ -56,17 +56,23 @@ def _modes_enabled() -> bool:
     return os.environ.get(_MODES_ENABLED_ENV, '').strip().lower() in _TRUTHY
 
 
-def _udf_takes_entity(validation_context: ValidationContext, item: grammar.ASTNode) -> bool:
-    """True if a `then` item is a direct call to a UDF with an `entity` argument, which rollout needs to bucket by."""
+_HINT_NOT_DIRECT_CALL = 'write each effect as a direct call inside a `then=[...]` list, not through a variable'
+_HINT_NO_ENTITY = 'this effect has no `entity` argument, so it cannot be bucketed and cannot be rolled out'
+
+
+def _rollout_effect_hint(validation_context: ValidationContext, item: grammar.ASTNode) -> Optional[str]:
+    """Returns why a `then` item cannot be bucketed by entity under `rollout`, or None if it can."""
     if not isinstance(item, grammar.Call) or not isinstance(item.func, grammar.Name):
-        return False
+        return _HINT_NOT_DIRECT_CALL
     udf_class = validation_context.udf_registry.get(item.func.identifier)
     if udf_class is None:
         # ValidateCallKwargs reports the unknown function.
-        return True
+        return None
     entity_type = udf_class.get_arguments_type().items().get('entity')
     origin = typing_inspect.get_origin(entity_type) or entity_type
-    return isinstance(origin, type) and issubclass(origin, EntityT)
+    if isinstance(origin, type) and issubclass(origin, EntityT):
+        return None
+    return _HINT_NO_ENTITY
 
 
 @dataclass(frozen=True)
@@ -246,11 +252,12 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
             then_ast = arguments.get_argument_ast('then')
             then_items = then_ast.items if isinstance(then_ast, grammar.List) else [then_ast]
             for item in then_items:
-                if not _udf_takes_entity(validation_context, item):
+                hint = _rollout_effect_hint(validation_context, item)
+                if hint is not None:
                     validation_context.add_error(
                         message='`rollout` requires every `then` effect to be a direct call with an `entity` argument',
                         span=item.span,
-                        hint='write the effect call inline in `then=[...]`; rollout buckets each effect by its entity',
+                        hint=hint,
                     )
                     valid = False
             if 'rollout_percent' not in declared:

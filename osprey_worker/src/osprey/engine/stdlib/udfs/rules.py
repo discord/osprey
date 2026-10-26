@@ -1,21 +1,62 @@
+import copy
+import logging
+import os
 import re
-from typing import List, Optional, cast
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Optional, Set, Tuple, cast
 
+import sentry_sdk
 from osprey.engine.ast import grammar
 from osprey.engine.ast_validator.validation_utils import add_must_assign_to_variable_error
-from osprey.engine.executor.execution_context import WhenRulesAuditEntry
+from osprey.engine.ast_validator.validators.validate_when_rules_names import ValidateWhenRulesNames
+from osprey.engine.executor.execution_context import EffectAuditRecord, WhenRulesAuditEntry
 from osprey.engine.executor.node_executor.call_executor import CallExecutor
 from osprey.engine.language_types.effects import EffectBase
 from osprey.engine.language_types.rules import RuleT
 from osprey.engine.udf.type_helpers import validate_kwarg_node_type
 from osprey.worker.lib.instruments import metrics
 
-from ._prelude import ArgumentsBase, ExecutionContext, UDFBase, ValidationContext
+from ._prelude import ArgumentsBase, ConstExpr, ExecutionContext, UDFBase, ValidationContext
 from .categories import UdfCategories
+from .experiments import Experiment
+
+logger = logging.getLogger(__name__)
 
 _HAS_FORMAT_STRING_RE = re.compile(r'\{([^\d\W]\w*)\}')
 _ENFORCEMENT_GAP_METRIC = 'osprey.enforcement_gap'
 _ENFORCEMENT_GAP_TRUE_TAG = 'gap:true'
+_EFFECTS_METRIC = 'osprey.whenrules_effects'
+_MODE_IGNORED_METRIC = 'osprey.whenrules_mode_ignored'
+# Gates WhenRules `name`/`mode`/`rollout_percent`/`revision_id`/`release_id`. Default OFF: the arguments are still
+# validated, but blocks behave as plain enforce blocks and effects and audit entries carry no stamps.
+_MODES_ENABLED_ENV = 'OSPREY_WHEN_RULES_MODES'
+_TRUTHY = {'1', 'true', 'yes', 'on'}
+_DISPOSITION_EMITTED = 'emitted'
+_DISPOSITION_SUPPRESSED = 'suppressed'
+_DISPOSITION_NO_ENTITY = 'no_entity'
+_MODE_ARGUMENTS = ('name', 'mode', 'rollout_percent', 'revision_id', 'release_id')
+_reported_unbucketable: Set[Tuple[str, str]] = set()
+
+
+class WhenRulesMode(str, Enum):
+    OFF = 'off'
+    SHADOW = 'shadow'
+    ROLLOUT = 'rollout'
+    ENFORCE = 'enforce'
+
+
+def _modes_enabled() -> bool:
+    return os.environ.get(_MODES_ENABLED_ENV, '').strip().lower() in _TRUTHY
+
+
+@dataclass(frozen=True)
+class _ModeConfig:
+    name: Optional[str]
+    mode: WhenRulesMode
+    rollout_units: int
+    revision_id: Optional[str]
+    release_id: Optional[str]
 
 
 class RuleArguments(ArgumentsBase):
@@ -120,12 +161,110 @@ class WhenRulesArguments(ArgumentsBase):
     rules_any: List[RuleT]
     # TODO - Should we require this be non-empty?
     then: List[EffectBase]
+    name: ConstExpr[str] = ConstExpr.for_default('name', '')
+    """Unique name of the decision. Required when `mode` is not `enforce`."""
+    mode: ConstExpr[str] = ConstExpr.for_default('mode', WhenRulesMode.ENFORCE.value)
+    """One of `off`, `shadow`, `rollout`, `enforce`."""
+    rollout_percent: ConstExpr[float] = ConstExpr.for_default('rollout_percent', 0)
+    """Percentage of entities, 0 to 100, that receive effects in `rollout` mode."""
+    revision_id: ConstExpr[str] = ConstExpr.for_default('revision_id', '')
+    release_id: ConstExpr[str] = ConstExpr.for_default('release_id', '')
 
 
 class WhenRules(UDFBase[WhenRulesArguments, None]):
     """Binds rules to effects. When any of the referenced rules fire, the then= effects are applied."""
 
     category = UdfCategories.ENGINE
+
+    def __init__(self, validation_context: ValidationContext, arguments: WhenRulesArguments):
+        super().__init__(validation_context, arguments)
+        self._mode_config = self._validate_mode_arguments(validation_context, arguments)
+
+    @staticmethod
+    def _validate_mode_arguments(
+        validation_context: ValidationContext, arguments: WhenRulesArguments
+    ) -> Optional[_ModeConfig]:
+        """Validates the mode arguments and returns the runtime config, or None if the block should behave as today."""
+        declared = set(_MODE_ARGUMENTS) & set(arguments.get_call_node().argument_dict())
+        if not declared:
+            return None
+
+        name = arguments.name.value if 'name' in declared else None
+        mode_str = arguments.mode.value
+        valid = True
+
+        if name is not None and not name.strip():
+            validation_context.add_error(message='`name` must not be empty', span=arguments.name.argument_span)
+            valid = False
+
+        try:
+            mode = WhenRulesMode(mode_str)
+        except ValueError:
+            allowed = ', '.join(f'`{m.value}`' for m in WhenRulesMode)
+            validation_context.add_error(
+                message=f'unknown WhenRules mode `{mode_str}`',
+                span=arguments.mode.argument_span,
+                hint=f'mode must be one of {allowed}',
+            )
+            return None
+
+        if mode is not WhenRulesMode.ENFORCE and name is None:
+            validation_context.add_error(
+                message=f'`name` is required when mode is `{mode.value}`',
+                span=arguments.mode.argument_span,
+            )
+            valid = False
+
+        rollout_units = 0
+        if mode is WhenRulesMode.ROLLOUT:
+            if 'rollout_percent' not in declared:
+                validation_context.add_error(
+                    message='`rollout_percent` is required when mode is `rollout`',
+                    span=arguments.mode.argument_span,
+                )
+                valid = False
+            elif not 0 <= arguments.rollout_percent.value <= 100:
+                validation_context.add_error(
+                    message='`rollout_percent` must be between 0 and 100 inclusive',
+                    span=arguments.rollout_percent.argument_span,
+                )
+                valid = False
+            else:
+                rollout_units = Experiment.percentage_to_bucket_units(arguments.rollout_percent.value)
+
+        if name is not None and name.strip():
+            seen: Dict[str, grammar.Span] = validation_context.get_validator_input(ValidateWhenRulesNames, {})
+            validation_context.set_validator_input(ValidateWhenRulesNames, seen)
+            prior_span = seen.get(name)
+            if prior_span is not None:
+                validation_context.add_error(
+                    message=f'WhenRules `name` must be unique across all rule files, `{name}` is already used',
+                    span=arguments.name.argument_span,
+                    additional_spans_message='first used here:',
+                    additional_spans=[prior_span],
+                )
+                valid = False
+            else:
+                seen[name] = arguments.name.argument_span
+
+        if not valid:
+            return None
+
+        if not _modes_enabled():
+            logger.warning(
+                'when_rules_mode_ignored',
+                extra={'when_rules_name': name, 'when_rules_mode': mode.value, 'flag': _MODES_ENABLED_ENV},
+            )
+            metrics.increment(_MODE_IGNORED_METRIC, tags=[f'mode:{mode.value}'])
+            return None
+
+        return _ModeConfig(
+            name=name,
+            mode=mode,
+            rollout_units=rollout_units,
+            revision_id=arguments.revision_id.value if 'revision_id' in declared else None,
+            release_id=arguments.release_id.value if 'release_id' in declared else None,
+        )
 
     def resolve_arguments(self, execution_context: ExecutionContext, call_executor: CallExecutor) -> WhenRulesArguments:
         # WhenRules has some custom resolve logic, in order to tolerate a failure in the `rules_any` dependency chain.
@@ -192,10 +331,27 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
         assert hasattr(self, '_failed_rule_names'), 'BUG: resolve_arguments() must be called before execute()'
         failed_rule_names: List[str] = self._failed_rule_names
         then_failed: int = self._then_failed
+        config = self._mode_config
 
         effects_emitted: List[str] = []
+        effects_suppressed: List[EffectAuditRecord] = []
+        rollout_effects: List[EffectAuditRecord] = []
+        suppressed_ids: Set[int] = set()
         if passing_rules:
-            effects_emitted = [type(o).__name__ for o in arguments.then if isinstance(o, EffectBase)]
+            effects = [o for o in arguments.then if isinstance(o, EffectBase)]
+            if config is None:
+                effects_emitted = [type(o).__name__ for o in effects]
+            else:
+                for effect in effects:
+                    emit, record = self._decide(config, effect)
+                    if emit:
+                        effects_emitted.append(record.effect_type)
+                    else:
+                        suppressed_ids.add(id(effect))
+                        if config.mode is not WhenRulesMode.OFF:
+                            effects_suppressed.append(record)
+                    if config.mode is WhenRulesMode.ROLLOUT:
+                        rollout_effects.append(record)
 
         entry = WhenRulesAuditEntry(
             rules_evaluated=all_rule_names,
@@ -204,6 +360,12 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
             effects_emitted=effects_emitted,
             effects_failed=then_failed,
             is_degraded=len(failed_rule_names) > 0,
+            name=config.name if config else None,
+            mode=config.mode.value if config else None,
+            revision_id=config.revision_id if config else None,
+            release_id=config.release_id if config else None,
+            effects_suppressed=effects_suppressed,
+            rollout_effects=rollout_effects,
         )
         execution_context.add_rule_audit_entry(entry)
 
@@ -219,7 +381,63 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
 
         for outcome in arguments.then:
             if isinstance(outcome, EffectBase):
+                if id(outcome) in suppressed_ids:
+                    continue
+                if config is not None:
+                    outcome = self._stamp(config, outcome)
                 outcome.add_rules(passing_rules)
                 execution_context.add_effect(outcome)
             else:
                 raise TypeError(f'BUG: Non-EffectBase type for WhenRules: {outcome!r} (type: {type(outcome)})')
+
+    @staticmethod
+    def _decide(config: _ModeConfig, effect: EffectBase) -> Tuple[bool, EffectAuditRecord]:
+        """Decides whether a matched effect is emitted under the block's mode, and builds its audit record."""
+        effect_type = type(effect).__name__
+        mode = config.mode
+        emit = mode is WhenRulesMode.ENFORCE
+        record = EffectAuditRecord(effect_type=effect_type)
+        disposition = _DISPOSITION_EMITTED if emit else _DISPOSITION_SUPPRESSED
+
+        if mode is WhenRulesMode.ROLLOUT:
+            assert config.name is not None
+            entity = effect.primary_entity()
+            if entity is None:
+                # Fail closed: an effect that cannot be bucketed must not reach entities outside the rollout.
+                disposition = _DISPOSITION_NO_ENTITY
+                record.in_bucket = False
+                if (config.name, effect_type) not in _reported_unbucketable:
+                    _reported_unbucketable.add((config.name, effect_type))
+                    logger.error(
+                        'when_rules_rollout_effect_without_entity',
+                        extra={'when_rules_name': config.name, 'effect_type': effect_type},
+                    )
+                    sentry_sdk.capture_message(
+                        f'WhenRules rollout `{config.name}` has {effect_type} effects with no primary entity;'
+                        ' they are suppressed',
+                        level='error',
+                    )
+            else:
+                record.entity = str(entity)
+                record.bucket = Experiment.hash_mod(config.name, str(entity.id))
+                record.in_bucket = record.bucket < config.rollout_units
+                emit = record.in_bucket
+                disposition = _DISPOSITION_EMITTED if emit else _DISPOSITION_SUPPRESSED
+
+        if mode is not WhenRulesMode.OFF:
+            metrics.increment(
+                _EFFECTS_METRIC,
+                tags=[f'mode:{mode.value}', f'disposition:{disposition}', f'block:{config.name}'],
+            )
+        return emit, record
+
+    @staticmethod
+    def _stamp(config: _ModeConfig, effect: EffectBase) -> EffectBase:
+        """Returns a copy of the effect carrying the block's identity, so an effect shared by two blocks keeps both."""
+        stamped = copy.copy(effect)
+        stamped.rules = list(effect.rules)
+        stamped.when_rules_name = config.name
+        stamped.when_rules_mode = config.mode.value
+        stamped.revision_id = config.revision_id
+        stamped.release_id = config.release_id
+        return stamped

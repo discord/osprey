@@ -41,6 +41,9 @@ class LabelEffect(EffectToCustomExtractedFeatureBase[List[str]]):
     suppressed: bool = False
     """If set to true, the effect should not be applied."""
 
+    def primary_entity(self) -> EntityT[Any]:
+        return self.entity
+
     def to_str(self) -> str:
         return ENTITY_LABEL_MUTATION_DIMENSION_VALUE(self.entity.type, self.name, self.status)
 

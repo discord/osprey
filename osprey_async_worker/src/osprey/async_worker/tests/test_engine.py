@@ -125,10 +125,11 @@ async def test_handle_updated_sources_keeps_old_graph_on_compile_failure():
 async def test_failed_compile_retries_when_provider_redelivers_same_hash():
     """A failed compile must not advance the provider's dedup baseline, or every
     re-delivery of that hash is skipped and the pod serves stale rules until restart."""
+    v1_hash = Sources.from_dict({'main.sml': '# v1'}).hash()
     v2 = {'main.sml': '# v2'}
     provider = AsyncEtcdSourcesProvider(etcd_key='/k', etcd_client=MagicMock())
-    provider._current_sources = Sources.from_dict({'main.sml': '# v1'})
     initial = MagicMock(name='initial_graph')
+    initial.validated_sources.sources.hash.return_value = v1_hash
     with (
         patch.object(AsyncOspreyEngine, '_compile_execution_graph_sync', return_value=initial),
         patch.object(AsyncOspreyEngine, '_load_and_register_schemas'),
@@ -136,6 +137,7 @@ async def test_failed_compile_retries_when_provider_redelivers_same_hash():
     ):
         engine = AsyncOspreyEngine(sources_provider=provider, udf_registry=MagicMock())
     _CONSTRUCTED_ENGINES.append(engine)
+    assert provider._applied_sources_hash == v1_hash, 'engine must confirm its initial compile'
 
     new = MagicMock(name='new_graph')
     new.validated_sources.sources.hash.return_value = Sources.from_dict(v2).hash()

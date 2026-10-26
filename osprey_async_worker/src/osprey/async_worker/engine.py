@@ -131,6 +131,7 @@ class AsyncOspreyEngine:
         # Initial compile runs without periodic yields — there is no in-flight
         # work yet to protect, and we want fast cold-start.
         self._execution_graph = self._compile_execution_graph_sync(yield_during_compile=False)
+        self._sources_provider.mark_sources_applied(self._execution_graph.validated_sources.sources.hash())
         # BaseSourcesProvider.set_sources_watcher is typed Callable[[], None], but the
         # async provider (AsyncEtcdSourcesProvider) awaits an awaitable result, so a
         # coroutine callback is valid at runtime. Cast to satisfy the narrower base type.

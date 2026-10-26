@@ -407,3 +407,42 @@ async def test_reopened_stream_initial_sync_keeps_the_backoff():
         await provider._watch_loop()
 
     assert delays == [1.0, 2.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_provider_logs_through_its_module_logger_not_the_root_logger(caplog):
+    """The worker's root logger has a rate sampler that drops records; named loggers are not sampled."""
+    provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=MagicMock())
+    provider.set_sources_watcher(MagicMock())
+    event = _make_full_sync_event({'main.sml': '# broken'})
+
+    with caplog.at_level('WARNING'):
+        await provider._handle_event(event)
+        await provider._handle_event(event)
+
+    retry_records = [r for r in caplog.records if 'Retrying unapplied' in r.getMessage()]
+    assert [r.name for r in retry_records] == ['osprey.async_worker.lib.etcd.sources_provider']
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_is_logged_and_counted_once_across_scheduler_and_redelivery(caplog):
+    provider = AsyncEtcdSourcesProvider(
+        etcd_key='/test/key', etcd_client=MagicMock(), unapplied_retry_seconds=60, max_attempts_per_hash=1
+    )
+    provider.set_sources_watcher(MagicMock())
+    event = _make_full_sync_event({'main.sml': '# broken'})
+    await provider._handle_event(event)
+
+    with (
+        patch('osprey.async_worker.lib.etcd.sources_provider.metrics') as mock_metrics,
+        caplog.at_level('ERROR'),
+    ):
+        provider._schedule_unapplied_retry()
+        provider._schedule_unapplied_retry()
+        await provider._handle_event(event)
+
+    exhausted = [
+        c for c in mock_metrics.increment.call_args_list if c.args[0] == 'osprey.sources_provider.retry_exhausted'
+    ]
+    assert len(exhausted) == 1
+    assert len([r for r in caplog.records if 'Giving up' in r.getMessage()]) == 1

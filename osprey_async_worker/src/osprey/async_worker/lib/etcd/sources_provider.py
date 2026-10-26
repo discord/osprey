@@ -24,6 +24,9 @@ from osprey.worker.lib.sources_provider_base import BaseSourcesProvider
 # in-flight tasks. We accept either a sync or async callable for back-compat.
 SourcesWatcherCallback = Callable[[], Union[None, Awaitable[None]]]
 
+# A named logger: the worker's root logger carries a DynamicLogSampler that drops records once the rate is high.
+log = logging.getLogger(__name__)
+
 _WATCH_EXHAUSTED = object()
 _MAX_RETRY_SECONDS = 300.0
 
@@ -69,6 +72,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         self._retry_delay = unapplied_retry_seconds
         self._tracked_hash: Optional[str] = None
         self._attempts = 0
+        self._exhausted_reported_hash: Optional[str] = None
         self._retry_task: Optional[asyncio.Task[None]] = None
         self._handle_lock = asyncio.Lock()
 
@@ -128,7 +132,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
                     # a bare next() on an exhausted generator hangs this task forever.
                     event = await loop.run_in_executor(None, next, watcher_iter, _WATCH_EXHAUSTED)
                 except Exception:
-                    logging.exception('Error in etcd watcher loop, retrying in %.1fs', backoff)
+                    log.exception('Error in etcd watcher loop, retrying in %.1fs', backoff)
                     self._watcher = None
                     self._watcher_iter = None
                     await asyncio.sleep(backoff)
@@ -138,7 +142,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
                 if event is _WATCH_EXHAUSTED:
                     # Generator exhausted (e.g. transient etcd error inside
                     # continue_watching). Reopen the watcher fresh.
-                    logging.warning('etcd watcher stream ended, reopening in %.1fs', backoff)
+                    log.warning('etcd watcher stream ended, reopening in %.1fs', backoff)
                     self._watcher = None
                     self._watcher_iter = None
                     await asyncio.sleep(backoff)
@@ -163,7 +167,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
             self._watcher_iter = None
 
     def _report_handler_error(self) -> None:
-        logging.exception('Error handling etcd sources event; watcher stays alive')
+        log.exception('Error handling etcd sources event; watcher stays alive')
         metrics.increment('osprey.sources_provider.handler_error')
         sentry_sdk.capture_exception()
 
@@ -182,6 +186,14 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         except KeyNotFoundError:
             return FullSyncOneNoKey(self._etcd_key)
 
+    def _report_exhausted(self, sources_hash: str, attempts: int) -> None:
+        # Once per hash: both the retry scheduler and a later re-delivery can reach this.
+        if self._exhausted_reported_hash == sources_hash:
+            return
+        self._exhausted_reported_hash = sources_hash
+        log.error('Giving up on sources=%s after %d failed attempts to apply', sources_hash, attempts)
+        metrics.increment('osprey.sources_provider.retry_exhausted')
+
     def _retries_exhausted(self) -> bool:
         return (
             self._current_sources is not None
@@ -196,6 +208,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
             self._retry_delay = self._unapplied_retry_seconds
             return
         if self._retries_exhausted():
+            self._report_exhausted(self._current_sources.hash(), self._attempts)
             return
         self._retry_task = asyncio.create_task(self._retry_unapplied())
 
@@ -212,7 +225,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
                 try:
                     event = await asyncio.get_running_loop().run_in_executor(None, self._fetch_current_event)
                 except Exception:
-                    logging.exception('Error re-reading etcd sources for retry')
+                    log.exception('Error re-reading etcd sources for retry')
                     metrics.increment('osprey.sources_provider.retry_read_error')
                     sentry_sdk.capture_exception()
                 else:
@@ -241,6 +254,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
             self._current_sources = new_sources
             self._tracked_hash = None
             self._attempts = 0
+            self._exhausted_reported_hash = None
             self._retry_delay = self._unapplied_retry_seconds
             return
 
@@ -249,11 +263,10 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
             self._attempts = 0
             self._retry_delay = self._unapplied_retry_seconds
         if self._attempts >= self._max_attempts_per_hash:
-            logging.error('Giving up on sources=%s after %d failed attempts to apply', new_hash, self._attempts)
-            metrics.increment('osprey.sources_provider.retry_exhausted')
+            self._report_exhausted(new_hash, self._attempts)
             return
         if self._attempts > 0:
-            logging.warning('Retrying unapplied sources=%s (attempt %d)', new_hash, self._attempts + 1)
+            log.warning('Retrying unapplied sources=%s (attempt %d)', new_hash, self._attempts + 1)
             metrics.increment('osprey.sources_provider.reapply_unapplied')
         self._attempts += 1
 

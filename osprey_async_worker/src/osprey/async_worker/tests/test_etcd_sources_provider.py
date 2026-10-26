@@ -194,7 +194,7 @@ async def test_unapplied_sources_are_retried_by_rereading_etcd():
     """Opt-in retry: the watcher mux drops an unchanged re-delivery, so the provider re-reads etcd itself."""
     event = _make_full_sync_event({'main.sml': '# flaky'})
     client = MagicMock()
-    client.get_watcher.return_value.begin_watching.return_value = event
+    client.get.return_value.node = MagicMock(key='/test/key', value=event.value)
     provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=client, unapplied_retry_seconds=0.01)
     applied = asyncio.Event()
     calls = []
@@ -211,3 +211,55 @@ async def test_unapplied_sources_are_retried_by_rereading_etcd():
     await asyncio.wait_for(applied.wait(), timeout=5)
     assert len(calls) == 2
     await provider.stop()
+
+
+@pytest.mark.asyncio
+async def test_retries_stop_after_max_attempts_until_a_different_hash_arrives():
+    provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=MagicMock(), max_attempts_per_hash=2)
+    callback = MagicMock()
+    provider.set_sources_watcher(callback)
+    broken = _make_full_sync_event({'main.sml': '# broken'})
+
+    for _ in range(4):
+        await provider._handle_event(broken)
+    assert callback.call_count == 2
+
+    await provider._handle_event(_make_full_sync_event({'main.sml': '# other'}))
+    assert callback.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_callback_exception_clears_applied_hash_so_the_hash_is_retried():
+    """The engine can mark applied, then raise in its tail; what is applied is unknown, so nothing may be skipped."""
+    provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=MagicMock())
+    calls = []
+
+    def callback() -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            provider.mark_sources_applied(provider.get_current_sources().hash())
+            raise RuntimeError('tail failed')
+
+    provider.set_sources_watcher(callback)
+    event = _make_full_sync_event({'main.sml': '# swapped'})
+
+    with pytest.raises(RuntimeError):
+        await provider._handle_event(event)
+    await provider._handle_event(event)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_redelivery_of_applied_hash_resets_current_sources():
+    """A rollback to the applied hash after a failed compile must make it the desired sources again."""
+    provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=MagicMock())
+    provider.set_sources_watcher(MagicMock())
+    applied = _make_full_sync_event({'main.sml': '# applied'})
+    await provider._handle_event(applied)
+    provider.mark_sources_applied(provider.get_current_sources().hash())
+    await provider._handle_event(_make_full_sync_event({'main.sml': '# broken'}))
+    assert provider.get_current_sources().hash() != provider._applied_sources_hash
+
+    await provider._handle_event(applied)
+
+    assert provider.get_current_sources().hash() == provider._applied_sources_hash

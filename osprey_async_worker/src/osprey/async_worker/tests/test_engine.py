@@ -1,6 +1,7 @@
 """Tests for AsyncOspreyEngine recompile behavior on etcd updates."""
 
 import asyncio
+import json
 import threading
 import weakref
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -8,8 +9,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from osprey.async_worker import typed_contract_warmer as warmer_mod
 from osprey.async_worker.engine import AsyncOspreyEngine
+from osprey.async_worker.lib.etcd.sources_provider import AsyncEtcdSourcesProvider
+from osprey.engine.ast.sources import Sources
 from osprey.engine.executor import typed_contract_dispatch as dispatch
 from osprey.engine.executor.graph_specializer import SpecializedExecutionGraph
+from osprey.worker.lib.etcd import FullSyncOne
 
 _CONSTRUCTED_ENGINES: list[AsyncOspreyEngine] = []
 
@@ -115,6 +119,38 @@ async def test_handle_updated_sources_keeps_old_graph_on_compile_failure():
         await engine._handle_updated_sources()
 
     assert engine._execution_graph is pre_swap_graph, 'failed compile should not have replaced the existing graph'
+
+
+@pytest.mark.asyncio
+async def test_failed_compile_retries_when_provider_redelivers_same_hash():
+    """A failed compile must not advance the provider's dedup baseline, or every
+    re-delivery of that hash is skipped and the pod serves stale rules until restart."""
+    v1_hash = Sources.from_dict({'main.sml': '# v1'}).hash()
+    v2 = {'main.sml': '# v2'}
+    provider = AsyncEtcdSourcesProvider(etcd_key='/k', etcd_client=MagicMock())
+    initial = MagicMock(name='initial_graph')
+    initial.validated_sources.sources.hash.return_value = v1_hash
+    with (
+        patch.object(AsyncOspreyEngine, '_compile_execution_graph_sync', return_value=initial),
+        patch.object(AsyncOspreyEngine, '_load_and_register_schemas'),
+        patch('osprey.async_worker.engine.ConfigSubkeyHandler'),
+    ):
+        engine = AsyncOspreyEngine(sources_provider=provider, udf_registry=MagicMock())
+    _CONSTRUCTED_ENGINES.append(engine)
+    assert provider._applied_sources_hash == v1_hash, 'engine must confirm its initial compile'
+
+    new = MagicMock(name='new_graph')
+    new.validated_sources.sources.hash.return_value = Sources.from_dict(v2).hash()
+    event = MagicMock(spec=FullSyncOne, value=json.dumps(v2))
+
+    with patch.object(engine, '_compile_execution_graph_sync', side_effect=[RuntimeError('boom'), new]) as compile_:
+        await provider._handle_event(event)
+        assert engine._execution_graph is initial
+        await provider._handle_event(event)
+        await provider._handle_event(event)
+
+    assert compile_.call_count == 2, 'applied hash should suppress only the re-delivery after a successful compile'
+    assert engine._execution_graph is new
 
 
 @pytest.mark.asyncio

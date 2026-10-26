@@ -1,16 +1,16 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '4' and platform_machine == 'x86_64'",
-    "python_full_version >= '3.14' and python_full_version < '4' and platform_machine == 'x86_64'",
-    "python_full_version == '3.13.*' and platform_machine == 'x86_64'",
-    "python_full_version == '3.12.*' and platform_machine == 'x86_64'",
-    "python_full_version < '3.12' and platform_machine == 'x86_64'",
     "python_full_version >= '4' and platform_machine != 'x86_64'",
+    "python_full_version >= '3.14' and python_full_version < '4' and platform_machine == 'x86_64'",
     "python_full_version >= '3.14' and python_full_version < '4' and platform_machine != 'x86_64'",
+    "python_full_version == '3.13.*' and platform_machine == 'x86_64'",
     "python_full_version == '3.13.*' and platform_machine != 'x86_64'",
+    "python_full_version == '3.12.*' and platform_machine == 'x86_64'",
     "python_full_version == '3.12.*' and platform_machine != 'x86_64'",
+    "python_full_version < '3.12' and platform_machine == 'x86_64'",
     "python_full_version < '3.12' and platform_machine != 'x86_64'",
 ]
 
@@ -21,6 +21,7 @@ members = [
     "osprey-rpc",
     "osprey-worker",
 ]
+default-groups = ["common", "dev"]
 overrides = [{ name = "ddtrace", specifier = ">=2.17.2,<3.0.0" }]
 
 [manifest.dependency-groups]
@@ -273,11 +274,11 @@ wheels = [
 
 [[package]]
 name = "certifi"
-version = "2026.5.20"
+version = "2026.10.19"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/f3/ce/ee2ecad540810a79593028e88299baeae54d346cc7a0d94b6199988b89b1/certifi-2026.5.20.tar.gz", hash = "sha256:69dea482ab64caa7b9f6aba1c6bf48bb6a5448d1c0f1b17ab42ad8c763a5344d", size = 135422, upload-time = "2026-05-20T11:46:50.073Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a6/bd/1436c50cc46699de0230fbaacc1d1de7bfec413176099949e9d5112e88f2/certifi-2026.10.19.tar.gz", hash = "sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae", size = 137598, upload-time = "2026-10-20T02:24:16.604Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/59/8c/57e832b7af6d7c5abe66eb3fbe3a3a32f4d11ea23a1aa7131371035be991/certifi-2026.5.20-py3-none-any.whl", hash = "sha256:3c52e209ba0a4ad7aebe60436a4ab349c39e1e602e8c134221e546902ad25897", size = 134134, upload-time = "2026-05-20T11:46:48.578Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/51/29046e48f693c54e5b7412216d447a1d8362c9653148d98c02cdf65fa733/certifi-2026.10.19-py3-none-any.whl", hash = "sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b", size = 136464, upload-time = "2026-10-20T02:24:15.072Z" },
 ]
 
 [[package]]
@@ -1117,7 +1118,7 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'x86_64'",
 ]
 dependencies = [
-    { name = "six", marker = "platform_machine == 'x86_64'" },
+    { name = "six" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a3/1c/c42834d4fee45c5cf2d9546e97e879a1cbcdecfd16eb1a12144dcb91edae/grpcio-1.49.1.tar.gz", hash = "sha256:d4725fc9ec8e8822906ae26bb26f5546891aa7fbc3443de970cc556d43a5c99f", size = 22059239, upload-time = "2022-09-22T03:02:44.376Z" }
 wheels = [
@@ -1191,9 +1192,9 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'x86_64'",
 ]
 dependencies = [
-    { name = "googleapis-common-protos", marker = "platform_machine == 'x86_64'" },
-    { name = "grpcio", version = "1.49.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64'" },
-    { name = "protobuf", marker = "platform_machine == 'x86_64'" },
+    { name = "googleapis-common-protos" },
+    { name = "grpcio", version = "1.49.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/19/99/7cd6af0c6da3084fa39818af3e3de1f4ca21127004e87f39a2affe290521/grpcio-status-1.49.1.tar.gz", hash = "sha256:658f48dc146ee0c7b6eebd302d74e0d45c00727c20035ff51d68750dbaccf5d9", size = 13505, upload-time = "2022-09-22T03:02:56.074Z" }
 wheels = [
@@ -1212,9 +1213,9 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine != 'x86_64'",
 ]
 dependencies = [
-    { name = "googleapis-common-protos", marker = "platform_machine != 'x86_64'" },
-    { name = "grpcio", version = "1.53.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64'" },
-    { name = "protobuf", marker = "platform_machine != 'x86_64'" },
+    { name = "googleapis-common-protos" },
+    { name = "grpcio", version = "1.53.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/45/6c/ed089e2b0d9215a1405de8790b2d6593780690d2732e0c208da27dfd86c4/grpcio-status-1.53.2.tar.gz", hash = "sha256:9a0823b99218424f012f59f6e9d17e8f569a67f0ca47cbca27dbf3bdf72c2248", size = 13505, upload-time = "2023-08-02T16:55:34.192Z" }
 wheels = [
@@ -1233,9 +1234,9 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'x86_64'",
 ]
 dependencies = [
-    { name = "grpcio", version = "1.49.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64'" },
-    { name = "protobuf", marker = "platform_machine == 'x86_64'" },
-    { name = "setuptools", marker = "platform_machine == 'x86_64'" },
+    { name = "grpcio", version = "1.49.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf" },
+    { name = "setuptools" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6c/e4/3416d25aebc4477141a491fae2c9494c5e0437a706c59103a936aac7d072/grpcio-tools-1.49.1.tar.gz", hash = "sha256:84cc64e5b46bad43d5d7bd2fd772b656eba0366961187a847e908e2cb735db91", size = 2252679, upload-time = "2022-09-22T03:03:00.279Z" }
 wheels = [
@@ -1257,9 +1258,9 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine != 'x86_64'",
 ]
 dependencies = [
-    { name = "grpcio", version = "1.53.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64'" },
-    { name = "protobuf", marker = "platform_machine != 'x86_64'" },
-    { name = "setuptools", marker = "platform_machine != 'x86_64'" },
+    { name = "grpcio", version = "1.53.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf" },
+    { name = "setuptools" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/80/4a/d176f59e4b080f8bcd1242ca9bfa9d1a77a9ef1620725eef846f112b8a99/grpcio-tools-1.53.2.tar.gz", hash = "sha256:1b10f95d1f4af2b9d63c9beccf386b3a5e1a92f14b3f64a9a8385b6ba091e0dc", size = 2257313, upload-time = "2023-08-02T16:55:36.975Z" }
 wheels = [

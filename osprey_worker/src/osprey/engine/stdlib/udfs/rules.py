@@ -3,6 +3,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple, cast
 
@@ -28,8 +29,8 @@ _ENFORCEMENT_GAP_METRIC = 'osprey.enforcement_gap'
 _ENFORCEMENT_GAP_TRUE_TAG = 'gap:true'
 _EFFECTS_METRIC = 'osprey.whenrules_effects'
 _MODE_IGNORED_METRIC = 'osprey.whenrules_mode_ignored'
-# Gates WhenRules `name`/`mode`/`rollout_percent`/`revision_id`/`release_id`. Default OFF: the arguments are still
-# validated, but blocks behave as plain enforce blocks and effects and audit entries carry no stamps.
+# Gates WhenRules `name`/`mode`/`rollout_percent`/`revision_id`/`release_id`. Default OFF: a non-enforce `mode` fails
+# validation, and other blocks behave as today with no stamps on effects or audit entries.
 _MODES_ENABLED_ENV = 'OSPREY_WHEN_RULES_MODES'
 _TRUTHY = {'1', 'true', 'yes', 'on'}
 _DISPOSITION_EMITTED = 'emitted'
@@ -229,6 +230,12 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
                     span=arguments.rollout_percent.argument_span,
                 )
                 valid = False
+            elif Decimal(str(arguments.rollout_percent.value)) * 100 % 1 != 0:
+                validation_context.add_error(
+                    message='`rollout_percent` precision is too high, use at most two decimal places',
+                    span=arguments.rollout_percent.argument_span,
+                )
+                valid = False
             else:
                 rollout_units = Experiment.percentage_to_bucket_units(arguments.rollout_percent.value)
 
@@ -251,6 +258,14 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
             return None
 
         if not _modes_enabled():
+            if mode is not WhenRulesMode.ENFORCE:
+                # Fail closed: running a shadow, rollout, or off decision as enforce would apply it to everyone.
+                validation_context.add_error(
+                    message=f'WhenRules mode `{mode.value}` is disabled',
+                    span=arguments.mode.argument_span,
+                    hint=f'set {_MODES_ENABLED_ENV}=1 to enable WhenRules modes',
+                )
+                return None
             logger.warning(
                 'when_rules_mode_ignored',
                 extra={'when_rules_name': name, 'when_rules_mode': mode.value, 'flag': _MODES_ENABLED_ENV},
@@ -435,7 +450,7 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
     def _stamp(config: _ModeConfig, effect: EffectBase) -> EffectBase:
         """Returns a copy of the effect carrying the block's identity, so an effect shared by two blocks keeps both."""
         stamped = copy.copy(effect)
-        stamped.rules = list(effect.rules)
+        stamped.rules = []
         stamped.when_rules_name = config.name
         stamped.when_rules_mode = config.mode.value
         stamped.revision_id = config.revision_id

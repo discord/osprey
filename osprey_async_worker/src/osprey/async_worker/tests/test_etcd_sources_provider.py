@@ -343,8 +343,12 @@ async def test_retry_read_error_has_its_own_counter_and_retry_continues():
 
     with patch('osprey.async_worker.lib.etcd.sources_provider.metrics') as mock_metrics:
         provider._schedule_unapplied_retry()
-        while len(reads) < 2:
-            await asyncio.sleep(0.01)
+
+        async def two_reads() -> None:
+            while len(reads) < 2:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(two_reads(), timeout=1)
         await provider.stop()
 
     names = {call.args[0] for call in mock_metrics.increment.call_args_list}

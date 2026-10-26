@@ -131,6 +131,7 @@ class AsyncOspreyEngine:
         # Initial compile runs without periodic yields — there is no in-flight
         # work yet to protect, and we want fast cold-start.
         self._execution_graph = self._compile_execution_graph_sync(yield_during_compile=False)
+        self._sources_provider.mark_sources_applied(self._execution_graph.validated_sources.sources.hash())
         # BaseSourcesProvider.set_sources_watcher is typed Callable[[], None], but the
         # async provider (AsyncEtcdSourcesProvider) awaits an awaitable result, so a
         # coroutine callback is valid at runtime. Cast to satisfy the narrower base type.
@@ -265,8 +266,9 @@ class AsyncOspreyEngine:
 
             # Confirm to the provider which sources are now actually live so it dedups
             # future no-op re-deliveries against what we APPLIED (not just received).
-            # The compile-failure path above returns early without marking, so a
-            # transient failure self-heals on the next etcd re-delivery.
+            # The compile-failure path above returns early without marking, so the provider
+            # retries this hash when etcd next delivers it (after a watcher reconnect, since
+            # WatchMux drops repeats within one watch stream).
             self._sources_provider.mark_sources_applied(new_graph.validated_sources.sources.hash())
 
             log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')

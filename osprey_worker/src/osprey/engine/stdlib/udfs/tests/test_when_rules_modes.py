@@ -133,7 +133,7 @@ def test_rollout_emits_only_entities_under_percent(execute_with_result: ExecuteW
     assert len(entry.rollout_effects) == _ENTITY_COUNT
     assert {r.entity for r in entry.effects_suppressed} == {r.entity for r in entry.rollout_effects if not r.in_bucket}
     assert all(
-        r.bucket == Experiment.hash_mod('whenrules/d', r.entity.split('/')[1]) and (r.bucket < 5000) == r.in_bucket
+        r.bucket == Experiment.hash_mod('whenrules/d', r.entity) and (r.bucket < 5000) == r.in_bucket
         for r in entry.rollout_effects
         if r.entity
     )
@@ -203,15 +203,24 @@ def test_name_must_be_unique_across_corpus(run_validation: RunValidationFunction
     assert 'must be unique across all rule files' in e.value.rendered()
 
 
-def test_rollout_rejects_effects_without_entity(run_validation: RunValidationFunction) -> None:
+@pytest.mark.parametrize(
+    'then',
+    [
+        "[DeclareVerdict(verdict='v')]",
+        '[L]',
+    ],
+)
+def test_rollout_rejects_then_without_direct_entity_call(run_validation: RunValidationFunction, then: str) -> None:
     with pytest.raises(ValidationFailed) as e:
         run_validation(
-            """
+            f"""
             R = Rule(when_all=[True], description='')
-            WhenRules(rules_any=[R], then=[DeclareVerdict(verdict='v')], name='d', mode='rollout', rollout_percent=5)
+            E = Entity(type='MyEntity', id='1')
+            L = LabelAdd(entity=E, label='foo')
+            WhenRules(rules_any=[R], then={then}, name='d', mode='rollout', rollout_percent=5)
             """
         )
-    assert 'requires every `then` effect to be a call with an `entity` argument' in e.value.rendered()
+    assert 'direct call with an `entity` argument' in e.value.rendered()
 
 
 def test_rollout_runtime_fails_closed_without_entity(mocker: MockFixture) -> None:

@@ -244,15 +244,15 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
         rollout_units = 0
         if mode is WhenRulesMode.ROLLOUT:
             then_ast = arguments.get_argument_ast('then')
-            if isinstance(then_ast, grammar.List):
-                for item in then_ast.items:
-                    if not _udf_takes_entity(validation_context, item):
-                        validation_context.add_error(
-                            message='`rollout` requires every `then` effect to be a call with an `entity` argument',
-                            span=item.span,
-                            hint='rollout buckets each effect by its entity, so effects without one cannot be rolled out',
-                        )
-                        valid = False
+            then_items = then_ast.items if isinstance(then_ast, grammar.List) else [then_ast]
+            for item in then_items:
+                if not _udf_takes_entity(validation_context, item):
+                    validation_context.add_error(
+                        message='`rollout` requires every `then` effect to be a direct call with an `entity` argument',
+                        span=item.span,
+                        hint='write the effect call inline in `then=[...]`; rollout buckets each effect by its entity',
+                    )
+                    valid = False
             if 'rollout_percent' not in declared:
                 validation_context.add_error(
                     message='`rollout_percent` is required when mode is `rollout`',
@@ -476,7 +476,7 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
                         level='error',
                     )
             else:
-                record.bucket = Experiment.hash_mod(f'{_BUCKET_KEY_PREFIX}{config.name}', str(entity.id))
+                record.bucket = Experiment.hash_mod(f'{_BUCKET_KEY_PREFIX}{config.name}', f'{entity.type}/{entity.id}')
                 record.in_bucket = record.bucket < config.rollout_units
                 emit = record.in_bucket
                 disposition = _DISPOSITION_EMITTED if emit else _DISPOSITION_SUPPRESSED

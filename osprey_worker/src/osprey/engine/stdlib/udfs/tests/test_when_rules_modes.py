@@ -30,7 +30,7 @@ def modes_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _run(execute_with_result: ExecuteWithResultFunction, when_rules_args: str, entities: int = 1) -> ExecutionResult:
-    entity_defs = '\n'.join(f"E{i} = Entity(type='MyEntity', id='entity-{i}')" for i in range(entities))
+    entity_defs = '\n                '.join(f"E{i} = Entity(type='MyEntity', id='entity-{i}')" for i in range(entities))
     labels = ', '.join(f"LabelAdd(entity=E{i}, label='foo')" for i in range(entities))
     return execute_with_result(
         {

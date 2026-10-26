@@ -245,7 +245,7 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
             prior_span = seen.get(name)
             if prior_span is not None:
                 validation_context.add_error(
-                    message=f'WhenRules `name` must be unique across all rule files, `{name}` is already used',
+                    message=f'`name` must be unique across all rule files, `{name}` is already used',
                     span=arguments.name.argument_span,
                     additional_spans_message='first used here:',
                     additional_spans=[prior_span],
@@ -261,7 +261,7 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
             if mode is not WhenRulesMode.ENFORCE:
                 # Fail closed: running a shadow, rollout, or off decision as enforce would apply it to everyone.
                 validation_context.add_error(
-                    message=f'WhenRules mode `{mode.value}` is disabled',
+                    message=f'mode `{mode.value}` is disabled',
                     span=arguments.mode.argument_span,
                     hint=f'set {_MODES_ENABLED_ENV}=1 to enable WhenRules modes',
                 )

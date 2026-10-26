@@ -18,7 +18,14 @@ class ExecutionResultStorageBackendType(StrEnum):
 
     GCS = auto()
     """
-    Google Cloud Storage execution result store
+    Google Cloud Storage execution result store that buffers writes and flushes many of them
+    into a single object. See StoredExecutionResultGCS.
+    """
+
+    GCS_MIGRATION = auto()
+    """
+    Writes go to GCS and, while BigTable writes are on, to BigTable. Reads
+    try GCS, then fall back to BigTable. See StoredExecutionResultGCSMigration.
     """
 
     MINIO = auto()

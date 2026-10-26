@@ -122,6 +122,9 @@ class EffectAuditRecord:
 
     effect_type: str
     entity: Optional[str] = None
+    """The effect's primary entity as `type/id`, in every mode, or None if the effect has no entity."""
+    detail: Optional[str] = None
+    """The effect's `to_str()` (for a label, `type/label/status`), or None if it has none."""
     bucket: Optional[int] = None
     """The rollout bucket in [0, 10000) for the effect's primary entity. Set only in `rollout` mode."""
     in_bucket: Optional[bool] = None

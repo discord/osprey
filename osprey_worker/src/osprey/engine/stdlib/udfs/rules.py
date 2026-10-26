@@ -8,12 +8,14 @@ from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple, cast
 
 import sentry_sdk
+import typing_inspect
 from osprey.engine.ast import grammar
 from osprey.engine.ast_validator.validation_utils import add_must_assign_to_variable_error
 from osprey.engine.ast_validator.validators.validate_when_rules_names import ValidateWhenRulesNames
 from osprey.engine.executor.execution_context import EffectAuditRecord, WhenRulesAuditEntry
 from osprey.engine.executor.node_executor.call_executor import CallExecutor
 from osprey.engine.language_types.effects import EffectBase
+from osprey.engine.language_types.entities import EntityT
 from osprey.engine.language_types.rules import RuleT
 from osprey.engine.udf.type_helpers import validate_kwarg_node_type
 from osprey.worker.lib.instruments import metrics
@@ -30,12 +32,15 @@ _ENFORCEMENT_GAP_TRUE_TAG = 'gap:true'
 _EFFECTS_METRIC = 'osprey.whenrules_effects'
 _MODE_IGNORED_METRIC = 'osprey.whenrules_mode_ignored'
 # Gates WhenRules `name`/`mode`/`rollout_percent`/`revision_id`/`release_id`. Default OFF: a non-enforce `mode` fails
-# validation, and other blocks behave as today with no stamps on effects or audit entries.
+# validation, and other blocks behave as today with no stamps on effects or audit entries. The flag is read from each
+# validating process's environment, so every process that loads a corpus must set it the same way.
 _MODES_ENABLED_ENV = 'OSPREY_WHEN_RULES_MODES'
 _TRUTHY = {'1', 'true', 'yes', 'on'}
 _DISPOSITION_EMITTED = 'emitted'
 _DISPOSITION_SUPPRESSED = 'suppressed'
 _DISPOSITION_NO_ENTITY = 'no_entity'
+# Keeps decision buckets apart from `Experiment()` cohorts that share a name.
+_BUCKET_KEY_PREFIX = 'whenrules/'
 _MODE_ARGUMENTS = ('name', 'mode', 'rollout_percent', 'revision_id', 'release_id')
 _reported_unbucketable: Set[Tuple[str, str]] = set()
 
@@ -49,6 +54,19 @@ class WhenRulesMode(str, Enum):
 
 def _modes_enabled() -> bool:
     return os.environ.get(_MODES_ENABLED_ENV, '').strip().lower() in _TRUTHY
+
+
+def _udf_takes_entity(validation_context: ValidationContext, item: grammar.ASTNode) -> bool:
+    """True if a `then` item is a direct call to a UDF with an `entity` argument, which rollout needs to bucket by."""
+    if not isinstance(item, grammar.Call) or not isinstance(item.func, grammar.Name):
+        return False
+    udf_class = validation_context.udf_registry.get(item.func.identifier)
+    if udf_class is None:
+        # ValidateCallKwargs reports the unknown function.
+        return True
+    entity_type = udf_class.get_arguments_type().items().get('entity')
+    origin = typing_inspect.get_origin(entity_type) or entity_type
+    return isinstance(origin, type) and issubclass(origin, EntityT)
 
 
 @dataclass(frozen=True)
@@ -216,8 +234,25 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
             )
             valid = False
 
+        if mode is not WhenRulesMode.ROLLOUT and 'rollout_percent' in declared:
+            validation_context.add_error(
+                message=f'`rollout_percent` is only valid when mode is `rollout`, not `{mode.value}`',
+                span=arguments.rollout_percent.argument_span,
+            )
+            valid = False
+
         rollout_units = 0
         if mode is WhenRulesMode.ROLLOUT:
+            then_ast = arguments.get_argument_ast('then')
+            if isinstance(then_ast, grammar.List):
+                for item in then_ast.items:
+                    if not _udf_takes_entity(validation_context, item):
+                        validation_context.add_error(
+                            message='`rollout` requires every `then` effect to be a call with an `entity` argument',
+                            span=item.span,
+                            hint='rollout buckets each effect by its entity, so effects without one cannot be rolled out',
+                        )
+                        valid = False
             if 'rollout_percent' not in declared:
                 validation_context.add_error(
                     message='`rollout_percent` is required when mode is `rollout`',
@@ -407,18 +442,26 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
 
     @staticmethod
     def _decide(config: _ModeConfig, effect: EffectBase) -> Tuple[bool, EffectAuditRecord]:
-        """Decides whether a matched effect is emitted under the block's mode, and builds its audit record."""
+        """Decides whether a matched effect is emitted under the block's mode, and builds its audit record.
+
+        Each effect is bucketed by its own entity, so one decision can emit for some entities and not others.
+        """
         effect_type = type(effect).__name__
         mode = config.mode
+        entity = effect.primary_entity()
+        to_str = getattr(effect, 'to_str', None)
+        record = EffectAuditRecord(
+            effect_type=effect_type,
+            entity=str(entity) if entity is not None else None,
+            detail=to_str() if callable(to_str) else None,
+        )
         emit = mode is WhenRulesMode.ENFORCE
-        record = EffectAuditRecord(effect_type=effect_type)
         disposition = _DISPOSITION_EMITTED if emit else _DISPOSITION_SUPPRESSED
 
         if mode is WhenRulesMode.ROLLOUT:
             assert config.name is not None
-            entity = effect.primary_entity()
             if entity is None:
-                # Fail closed: an effect that cannot be bucketed must not reach entities outside the rollout.
+                # Validation rejects this; fail closed if a plugin effect still lacks an entity at runtime.
                 disposition = _DISPOSITION_NO_ENTITY
                 record.in_bucket = False
                 if (config.name, effect_type) not in _reported_unbucketable:
@@ -433,17 +476,13 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
                         level='error',
                     )
             else:
-                record.entity = str(entity)
-                record.bucket = Experiment.hash_mod(config.name, str(entity.id))
+                record.bucket = Experiment.hash_mod(f'{_BUCKET_KEY_PREFIX}{config.name}', str(entity.id))
                 record.in_bucket = record.bucket < config.rollout_units
                 emit = record.in_bucket
                 disposition = _DISPOSITION_EMITTED if emit else _DISPOSITION_SUPPRESSED
 
         if mode is not WhenRulesMode.OFF:
-            metrics.increment(
-                _EFFECTS_METRIC,
-                tags=[f'mode:{mode.value}', f'disposition:{disposition}', f'block:{config.name}'],
-            )
+            metrics.increment(_EFFECTS_METRIC, tags=[f'mode:{mode.value}', f'disposition:{disposition}'])
         return emit, record
 
     @staticmethod

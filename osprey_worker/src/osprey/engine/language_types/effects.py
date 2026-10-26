@@ -50,8 +50,9 @@ class EffectBase:
     """The `release_id` of the WhenRules block that emitted this effect."""
 
     def primary_entity(self) -> Optional[EntityT[Any]]:
-        """The entity used to bucket this effect for `rollout` mode, or None if the effect has no entity."""
-        return None
+        """The entity used to bucket this effect for `rollout` mode: its `entity` field, or None if it has none."""
+        entity = getattr(self, 'entity', None)
+        return entity if isinstance(entity, EntityT) else None
 
     def add_rule(self, rule: RuleT) -> Self:
         self.rules.append(rule)

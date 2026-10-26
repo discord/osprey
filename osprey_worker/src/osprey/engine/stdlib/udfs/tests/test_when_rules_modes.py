@@ -8,12 +8,14 @@ from osprey.engine.ast_validator.validators.validate_call_kwargs import Validate
 from osprey.engine.conftest import ExecuteWithResultFunction, RunValidationFunction
 from osprey.engine.executor.execution_context import ExecutionResult
 from osprey.engine.language_types.labels import LabelEffect
+from osprey.engine.language_types.verdicts import VerdictEffect
 from osprey.engine.stdlib.udfs.entity import Entity
 from osprey.engine.stdlib.udfs.experiments import Experiment
 from osprey.engine.stdlib.udfs.labels import LabelAdd
-from osprey.engine.stdlib.udfs.rules import Rule, WhenRules
+from osprey.engine.stdlib.udfs.rules import Rule, WhenRules, WhenRulesMode, _ModeConfig
 from osprey.engine.stdlib.udfs.verdicts import DeclareVerdict
 from osprey.engine.udf.registry import UDFRegistry
+from pytest_mock import MockFixture
 
 pytestmark: List[Callable[[Any], Any]] = [
     pytest.mark.use_udf_registry(UDFRegistry.with_udfs(Entity, Rule, WhenRules, LabelAdd, DeclareVerdict)),
@@ -58,21 +60,27 @@ def test_unchanged_corpus_has_no_stamps(execute_with_result: ExecuteWithResultFu
     assert entry.effects_emitted == ['LabelEffect']
 
 
-def test_flag_off_ignores_enforce_stamps_and_rejects_other_modes(
-    execute_with_result: ExecuteWithResultFunction,
-    run_validation: RunValidationFunction,
-    monkeypatch: pytest.MonkeyPatch,
+def test_flag_off_ignores_enforce_stamps(
+    execute_with_result: ExecuteWithResultFunction, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv('OSPREY_WHEN_RULES_MODES')
 
     result = _run(execute_with_result, ", name='d', revision_id='rev1'")
+
     [effect] = result.effects[LabelEffect]
     assert effect.when_rules_name is None
     assert result.rule_audit_entries[0].name is None
 
+
+@pytest.mark.parametrize('args', ["mode='off'", "mode='shadow'", "mode='rollout', rollout_percent=100"])
+def test_flag_off_rejects_non_enforce_modes(
+    execute_with_result: ExecuteWithResultFunction, monkeypatch: pytest.MonkeyPatch, args: str
+) -> None:
+    monkeypatch.delenv('OSPREY_WHEN_RULES_MODES')
+
     with pytest.raises(ValidationFailed) as e:
-        _run(execute_with_result, ", name='d', mode='shadow'")
-    assert 'mode `shadow` is disabled' in e.value.rendered()
+        _run(execute_with_result, f", name='d', {args}")
+    assert 'is disabled' in e.value.rendered()
 
 
 def test_enforce_stamps_effects_and_audit(execute_with_result: ExecuteWithResultFunction) -> None:
@@ -105,7 +113,14 @@ def test_shadow_records_suppressed_effects(execute_with_result: ExecuteWithResul
     [entry] = result.rule_audit_entries
     assert entry.mode == 'shadow'
     assert entry.effects_emitted == []
-    assert [(r.effect_type, r.bucket, r.in_bucket) for r in entry.effects_suppressed] == [('LabelEffect', None, None)]
+    [record] = entry.effects_suppressed
+    assert (record.effect_type, record.entity, record.bucket, record.in_bucket) == (
+        'LabelEffect',
+        'MyEntity/entity-0',
+        None,
+        None,
+    )
+    assert record.detail is not None and 'foo' in record.detail
 
 
 def test_rollout_emits_only_entities_under_percent(execute_with_result: ExecuteWithResultFunction) -> None:
@@ -118,7 +133,7 @@ def test_rollout_emits_only_entities_under_percent(execute_with_result: ExecuteW
     assert len(entry.rollout_effects) == _ENTITY_COUNT
     assert {r.entity for r in entry.effects_suppressed} == {r.entity for r in entry.rollout_effects if not r.in_bucket}
     assert all(
-        r.bucket == Experiment.hash_mod('d', r.entity.split('/')[1]) and (r.bucket < 5000) == r.in_bucket
+        r.bucket == Experiment.hash_mod('whenrules/d', r.entity.split('/')[1]) and (r.bucket < 5000) == r.in_bucket
         for r in entry.rollout_effects
         if r.entity
     )
@@ -150,6 +165,9 @@ def test_rollout_buckets_are_stable_as_percent_rises(execute_with_result: Execut
         ("mode='rollout', name='d'", '`rollout_percent` is required'),
         ("mode='rollout', name='d', rollout_percent=101", 'between 0 and 100'),
         ("mode='rollout', name='d', rollout_percent=-1", 'between 0 and 100'),
+        ("mode='rollout', name='d', rollout_percent=12.345", 'precision is too high'),
+        ("mode='shadow', name='d', rollout_percent=10", 'only valid when mode is `rollout`'),
+        ("name=''", '`name` must not be empty'),
     ],
 )
 def test_invalid_mode_arguments(run_validation: RunValidationFunction, args: str, expected: str) -> None:
@@ -185,24 +203,44 @@ def test_name_must_be_unique_across_corpus(run_validation: RunValidationFunction
     assert 'must be unique across all rule files' in e.value.rendered()
 
 
-def test_rollout_suppresses_effects_without_primary_entity(execute_with_result: ExecuteWithResultFunction) -> None:
+def test_rollout_rejects_effects_without_entity(run_validation: RunValidationFunction) -> None:
+    with pytest.raises(ValidationFailed) as e:
+        run_validation(
+            """
+            R = Rule(when_all=[True], description='')
+            WhenRules(rules_any=[R], then=[DeclareVerdict(verdict='v')], name='d', mode='rollout', rollout_percent=5)
+            """
+        )
+    assert 'requires every `then` effect to be a call with an `entity` argument' in e.value.rendered()
+
+
+def test_rollout_runtime_fails_closed_without_entity(mocker: MockFixture) -> None:
+    capture = mocker.patch('osprey.engine.stdlib.udfs.rules.sentry_sdk.capture_message')
+    config = _ModeConfig(
+        name='no_entity', mode=WhenRulesMode.ROLLOUT, rollout_units=10000, revision_id=None, release_id=None
+    )
+
+    emit, record = WhenRules._decide(config, VerdictEffect(verdict='v'))
+
+    assert (emit, record.in_bucket, record.bucket) == (False, False, None)
+    capture.assert_called_once()
+
+
+def test_stamped_copy_keeps_only_its_own_rules(execute_with_result: ExecuteWithResultFunction) -> None:
     result = execute_with_result(
         {
             'main.sml': """
-                R = Rule(when_all=[True], description='always')
-                WhenRules(
-                    rules_any=[R],
-                    then=[DeclareVerdict(verdict='v')],
-                    name='no_entity_block',
-                    mode='rollout',
-                    rollout_percent=100,
-                )
+                RA = Rule(when_all=[True], description='a')
+                RB = Rule(when_all=[True], description='b')
+                E = Entity(type='MyEntity', id='1')
+                L = LabelAdd(entity=E, label='foo')
+                WhenRules(rules_any=[RA], then=[L])
+                WhenRules(rules_any=[RB], then=[L], name='b')
             """,
+            'config.yaml': _CONFIG,
         }
     )
 
-    assert not result.effects
-    [entry] = result.rule_audit_entries
-    assert [(r.effect_type, r.bucket, r.in_bucket) for r in entry.effects_suppressed] == [
-        ('VerdictEffect', None, False)
-    ]
+    by_name = {e.when_rules_name: e for e in result.effects[LabelEffect]}
+    assert [r.name for r in by_name['b'].rules] == ['RB']
+    assert [r.name for r in by_name[None].rules] == ['RA']

@@ -13,14 +13,18 @@ import logging
 import random
 from typing import Any, Awaitable, Callable, Dict, Iterator, Optional, Union
 
+import sentry_sdk
 from osprey.engine.ast.sources import Sources
 from osprey.worker.lib.etcd import BaseWatcher, EtcdClient, FullSyncOne, FullSyncOneNoKey
+from osprey.worker.lib.instruments import metrics
 from osprey.worker.lib.sources_provider_base import BaseSourcesProvider
 
 # The async engine's _handle_updated_sources is a coroutine function so the
 # compile can run in a thread pool while the event loop continues servicing
 # in-flight tasks. We accept either a sync or async callable for back-compat.
 SourcesWatcherCallback = Callable[[], Union[None, Awaitable[None]]]
+
+_WATCH_EXHAUSTED = object()
 
 
 class AsyncEtcdSourcesProvider(BaseSourcesProvider):
@@ -40,6 +44,9 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         self._etcd_key = etcd_key
         self._client = etcd_client or EtcdClient()
         self._current_sources: Optional[Sources] = None
+        # Hash of the sources the engine confirmed via mark_sources_applied. Dedup keys off
+        # this, not the last received hash, so a failed compile is retried on re-delivery.
+        self._applied_sources_hash: Optional[str] = None
         self._sources_watcher_callback: Optional[SourcesWatcherCallback] = None
         self._reload_jitter_seconds = reload_jitter_seconds
         self._watcher: Optional[BaseWatcher] = None
@@ -58,6 +65,8 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         # Initial load in thread pool (sync etcd client)
         initial_dict = await loop.run_in_executor(None, self._load_initial)
         self._current_sources = Sources.from_dict(initial_dict)
+        # The engine compiles this initial snapshot at construction.
+        self._applied_sources_hash = self._current_sources.hash()
 
         # Start watcher loop as an async task
         self._watcher_task = asyncio.create_task(self._watch_loop())
@@ -99,14 +108,10 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
                 # SYNC re-fetch loop on the main asyncio thread.
                 watcher_iter = self._watcher_iter
                 try:
-                    event = await loop.run_in_executor(None, lambda: next(watcher_iter))
+                    # next() with a default: asyncio cannot raise StopIteration into a future, so
+                    # a bare next() on an exhausted generator hangs this task forever.
+                    event = await loop.run_in_executor(None, next, watcher_iter, _WATCH_EXHAUSTED)
                     backoff = 1.0  # Reset on success
-                except StopIteration:
-                    # Generator exhausted (e.g. transient etcd error inside
-                    # continue_watching). Reopen the watcher fresh.
-                    self._watcher = None
-                    self._watcher_iter = None
-                    continue
                 except Exception:
                     logging.exception('Error in etcd watcher loop, retrying in %.1fs', backoff)
                     self._watcher = None
@@ -115,8 +120,22 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
                     backoff = min(backoff * 2, 30.0)
                     continue
 
+                if event is _WATCH_EXHAUSTED:
+                    # Generator exhausted (e.g. transient etcd error inside
+                    # continue_watching). Reopen the watcher fresh.
+                    logging.warning('etcd watcher stream ended, reopening')
+                    self._watcher = None
+                    self._watcher_iter = None
+                    continue
+
                 if event is not None:
-                    await self._handle_event(event)
+                    # A raise here would end this task and silently stop all future rule updates.
+                    try:
+                        await self._handle_event(event)
+                    except Exception:
+                        logging.exception('Error handling etcd sources event; watcher stays alive')
+                        metrics.increment('osprey.sources_provider.handler_error')
+                        sentry_sdk.capture_exception()
         except asyncio.CancelledError:
             return
         finally:
@@ -131,10 +150,16 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         # Etcd watcher reconnects and session refreshes re-deliver the current
         # value as a FullSyncOne event, so we see many events where the
         # content is unchanged. Skip recompile when the sources hash matches
-        # what we already have — recompile transiently doubles peak memory and
-        # can push pods over the OOM line.
-        if self._current_sources is not None and new_sources.hash() == self._current_sources.hash():
+        # what the engine has already APPLIED — recompile transiently doubles
+        # peak memory and can push pods over the OOM line. Comparing against the
+        # last received hash would suppress the retry after a failed compile and
+        # leave the pod on the old graph until restart.
+        new_hash = new_sources.hash()
+        if self._applied_sources_hash is not None and new_hash == self._applied_sources_hash:
             return
+        if self._current_sources is not None and new_hash == self._current_sources.hash():
+            logging.warning('Retrying unapplied sources=%s after re-delivery', new_hash)
+            metrics.increment('osprey.sources_provider.reapply_unapplied')
 
         # Keep the stream connected while the engine serves its old graph; the engine
         # gates executions only for the final graph swap.
@@ -157,6 +182,9 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
 
     def set_sources_watcher(self, callback: SourcesWatcherCallback) -> None:
         self._sources_watcher_callback = callback
+
+    def mark_sources_applied(self, sources_hash: str) -> None:
+        self._applied_sources_hash = sources_hash
 
     async def stop(self) -> None:
         """Stop watching for etcd changes."""

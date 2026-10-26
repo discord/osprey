@@ -113,10 +113,10 @@ async def test_handle_event_skips_callback_on_unchanged_hash():
     provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=MagicMock())
     payload = {'main.sml': '# noop'}
 
-    # Seed _current_sources with the same content the next event will deliver.
+    # Seed the applied hash with the same content the next event will deliver.
     from osprey.engine.ast.sources import Sources
 
-    provider._current_sources = Sources.from_dict(payload)
+    provider._applied_sources_hash = Sources.from_dict(payload).hash()
 
     callback = MagicMock()
     provider.set_sources_watcher(callback)
@@ -124,3 +124,66 @@ async def test_handle_event_skips_callback_on_unchanged_hash():
     await provider._handle_event(_make_full_sync_event(payload))
 
     callback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_redelivery_after_failed_compile_recompiles_until_applied():
+    """A callback that never calls mark_sources_applied (compile failed) must be retried."""
+    provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=MagicMock())
+    callback = MagicMock()
+    provider.set_sources_watcher(callback)
+    event = _make_full_sync_event({'main.sml': '# broken'})
+
+    await provider._handle_event(event)
+    await provider._handle_event(event)
+    assert callback.call_count == 2
+
+    provider.mark_sources_applied(provider.get_current_sources().hash())
+    await provider._handle_event(event)
+    assert callback.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_handler_exception_does_not_kill_watch_loop():
+    provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=MagicMock())
+    second_handled = asyncio.Event()
+    calls = []
+
+    def callback() -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError('boom')
+        second_handled.set()
+
+    provider.set_sources_watcher(callback)
+    events = [_make_full_sync_event({'main.sml': '# one'}), _make_full_sync_event({'main.sml': '# two'})]
+    watcher = MagicMock()
+    watcher.continue_watching.return_value = iter(events)
+    provider._watcher = watcher
+
+    with patch('osprey.async_worker.lib.etcd.sources_provider.metrics') as mock_metrics:
+        provider._watcher_task = asyncio.create_task(provider._watch_loop())
+        await asyncio.wait_for(second_handled.wait(), timeout=5)
+        assert not provider._watcher_task.done()
+        mock_metrics.increment.assert_called_once_with('osprey.sources_provider.handler_error')
+
+    await provider.stop()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_watch_stream_reopens_watcher_and_redelivers():
+    """An exhausted event stream must reopen the watcher, not hang the loop on StopIteration."""
+    handled = asyncio.Event()
+    first = MagicMock()
+    first.continue_watching.return_value = iter([])
+    second = MagicMock()
+    second.continue_watching.return_value = iter([_make_full_sync_event({'main.sml': '# one'})])
+    client = MagicMock()
+    client.get_watcher.return_value = second
+    provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=client)
+    provider.set_sources_watcher(handled.set)
+    provider._watcher = first
+
+    provider._watcher_task = asyncio.create_task(provider._watch_loop())
+    await asyncio.wait_for(handled.wait(), timeout=5)
+    await provider.stop()

@@ -265,8 +265,9 @@ class AsyncOspreyEngine:
 
             # Confirm to the provider which sources are now actually live so it dedups
             # future no-op re-deliveries against what we APPLIED (not just received).
-            # The compile-failure path above returns early without marking, so a
-            # transient failure self-heals on the next etcd re-delivery.
+            # The compile-failure path above returns early without marking, so the provider
+            # retries this hash when etcd next delivers it (after a watcher reconnect, since
+            # WatchMux drops repeats within one watch stream).
             self._sources_provider.mark_sources_applied(new_graph.validated_sources.sources.hash())
 
             log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')

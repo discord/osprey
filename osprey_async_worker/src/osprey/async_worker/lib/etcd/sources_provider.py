@@ -50,6 +50,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         # to match how ReadOnlyEtcdDict drives the gevent watcher.
         self._watcher_iter: Optional[Iterator[Any]] = None
         self._watcher_task: Optional[asyncio.Task[None]] = None
+        self._applied_sources_hash: Optional[str] = None
 
     async def start(self) -> None:
         """Initialize sources from etcd and start watching for changes."""
@@ -58,6 +59,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         # Initial load in thread pool (sync etcd client)
         initial_dict = await loop.run_in_executor(None, self._load_initial)
         self._current_sources = Sources.from_dict(initial_dict)
+        self._applied_sources_hash = self._current_sources.hash()
 
         # Start watcher loop as an async task
         self._watcher_task = asyncio.create_task(self._watch_loop())
@@ -130,10 +132,11 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
 
         # Etcd watcher reconnects and session refreshes re-deliver the current
         # value as a FullSyncOne event, so we see many events where the
-        # content is unchanged. Skip recompile when the sources hash matches
-        # what we already have — recompile transiently doubles peak memory and
-        # can push pods over the OOM line.
-        if self._current_sources is not None and new_sources.hash() == self._current_sources.hash():
+        # content is unchanged. Skip recompile when the engine has already applied
+        # this hash — recompile transiently doubles peak memory and can push pods
+        # over the OOM line. Keying on the applied (not received) hash lets a failed
+        # compile retry when the hash is delivered again.
+        if self._applied_sources_hash is not None and new_sources.hash() == self._applied_sources_hash:
             return
 
         # Keep the stream connected while the engine serves its old graph; the engine
@@ -157,6 +160,9 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
 
     def set_sources_watcher(self, callback: SourcesWatcherCallback) -> None:
         self._sources_watcher_callback = callback
+
+    def mark_sources_applied(self, sources_hash: str) -> None:
+        self._applied_sources_hash = sources_hash
 
     async def stop(self) -> None:
         """Stop watching for etcd changes."""

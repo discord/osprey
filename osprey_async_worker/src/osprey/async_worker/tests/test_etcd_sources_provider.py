@@ -1,7 +1,7 @@
 """Tests for the async etcd sources provider and input stream signaler."""
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from osprey.async_worker.lib.etcd.sources_provider import AsyncEtcdSourcesProvider
@@ -109,14 +109,13 @@ async def test_handle_event_calls_sync_callback():
 
 @pytest.mark.asyncio
 async def test_handle_event_skips_callback_on_unchanged_hash():
-    """Hash-equality short-circuit: if the new sources match current, no callback."""
-    provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=MagicMock())
+    """A re-delivery of the sources loaded at start() is a no-op: no callback."""
     payload = {'main.sml': '# noop'}
-
-    # Seed _current_sources with the same content the next event will deliver.
-    from osprey.engine.ast.sources import Sources
-
-    provider._current_sources = Sources.from_dict(payload)
+    etcd_client = MagicMock()
+    etcd_client.get_watcher.return_value.begin_watching.return_value = _make_full_sync_event(payload)
+    provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=etcd_client)
+    with patch.object(provider, '_watch_loop', AsyncMock()):
+        await provider.start()
 
     callback = MagicMock()
     provider.set_sources_watcher(callback)

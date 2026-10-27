@@ -304,6 +304,10 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
                 # retry, at most max_attempts_per_hash times, and then logged as given up on.
                 self._applied_sources_hash = None
                 raise
+            finally:
+                # Report on the final failure itself: with timed retries off, no later event may come.
+                if self._attempts >= self._max_attempts_per_hash and self._applied_sources_hash != new_hash:
+                    self._report_exhausted(new_hash, self._attempts)
 
     # NOTE: BaseSourcesProvider.get_current_sources is typed -> Sources, but this
     # provider legitimately returns None before start() loads from etcd (see

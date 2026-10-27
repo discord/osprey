@@ -46,6 +46,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         reload_jitter_seconds: float = 0,
         unapplied_retry_seconds: float = 0,
         max_attempts_per_hash: int = 5,
+        exit_on_retry_exhausted: bool = False,
     ):
         self._etcd_key = etcd_key
         self._client = etcd_client or EtcdClient()
@@ -73,6 +74,11 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         self._tracked_hash: Optional[str] = None
         self._attempts = 0
         self._exhausted_reported_hash: Optional[str] = None
+        # When set, exhaustion is fatal: wait_for_retry_exhausted() returns and the runner must exit
+        # so a fresh process loads the latest sources, instead of serving the old graph indefinitely.
+        self._exit_on_retry_exhausted = exit_on_retry_exhausted
+        self._retry_exhausted = asyncio.Event()
+        self._exhausted_exit_hash = ''
         self._retry_task: Optional[asyncio.Task[None]] = None
         self._handle_lock = asyncio.Lock()
 
@@ -193,6 +199,17 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         self._exhausted_reported_hash = sources_hash
         log.error('Giving up on sources=%s after %d failed attempts to apply', sources_hash, attempts)
         metrics.increment('osprey.sources_provider.retry_exhausted')
+        if self._exit_on_retry_exhausted:
+            sentry_sdk.capture_message(
+                f'Giving up on sources={sources_hash} after {attempts} failed attempts; exiting', level='error'
+            )
+            self._exhausted_exit_hash = sources_hash
+            self._retry_exhausted.set()
+
+    async def wait_for_retry_exhausted(self) -> str:
+        """Returns the given-up sources hash once retries are exhausted; never returns unless exit_on_retry_exhausted."""
+        await self._retry_exhausted.wait()
+        return self._exhausted_exit_hash
 
     def _retries_exhausted(self) -> bool:
         return (

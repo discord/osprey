@@ -446,3 +446,38 @@ async def test_exhaustion_is_logged_and_counted_once_across_scheduler_and_redeli
     ]
     assert len(exhausted) == 1
     assert len([r for r in caplog.records if 'Giving up' in r.getMessage()]) == 1
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_with_exit_option_wakes_waiter_with_hash_and_reports_to_sentry():
+    provider = AsyncEtcdSourcesProvider(
+        etcd_key='/test/key', etcd_client=MagicMock(), max_attempts_per_hash=1, exit_on_retry_exhausted=True
+    )
+    provider.set_sources_watcher(MagicMock())
+    event = _make_full_sync_event({'main.sml': '# broken'})
+    waiter = asyncio.create_task(provider.wait_for_retry_exhausted())
+    await provider._handle_event(event)
+    assert not waiter.done()
+
+    with patch('osprey.async_worker.lib.etcd.sources_provider.sentry_sdk') as mock_sentry:
+        await provider._handle_event(event)
+
+    assert await asyncio.wait_for(waiter, timeout=1) == provider.get_current_sources().hash()
+    mock_sentry.capture_message.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_without_exit_option_keeps_serving():
+    provider = AsyncEtcdSourcesProvider(etcd_key='/test/key', etcd_client=MagicMock(), max_attempts_per_hash=1)
+    provider.set_sources_watcher(MagicMock())
+    event = _make_full_sync_event({'main.sml': '# broken'})
+    waiter = asyncio.create_task(provider.wait_for_retry_exhausted())
+
+    with patch('osprey.async_worker.lib.etcd.sources_provider.sentry_sdk') as mock_sentry:
+        await provider._handle_event(event)
+        await provider._handle_event(event)
+    await asyncio.sleep(0)
+
+    assert not waiter.done()
+    mock_sentry.capture_message.assert_not_called()
+    waiter.cancel()

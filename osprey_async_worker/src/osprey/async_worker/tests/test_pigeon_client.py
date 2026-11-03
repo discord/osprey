@@ -282,3 +282,60 @@ def test_service_definition_type():
     sd: ServiceDefinition = {'address': 'localhost', 'ip': '127.0.0.1', 'port': 5000}
     assert sd['address'] == 'localhost'
     assert sd['port'] == 5000
+
+
+@pytest.mark.asyncio
+async def test_constructor_metadata_and_baggage_reach_the_server() -> None:
+    """Without channel interceptors the server sees neither constructor metadata nor span baggage."""
+    import ddtrace
+    from google.protobuf.wrappers_pb2 import StringValue
+    from osprey.async_worker.lib.pigeon.client import RoutedClient, RoutingType
+    from osprey.worker.lib.ddtrace_utils import baggage_manager
+
+    received: list = []
+
+    async def echo(request: bytes, context: grpc.aio.ServicerContext) -> bytes:
+        received.append(dict(context.invocation_metadata()))
+        return request
+
+    server = grpc.aio.server()
+    server.add_generic_rpc_handlers(
+        [grpc.method_handlers_generic_handler('test.Echo', {'Echo': grpc.unary_unary_rpc_method_handler(echo)})]
+    )
+    port = server.add_insecure_port('127.0.0.1:0')
+    await server.start()
+
+    class EchoStub:
+        def __init__(self, channel: grpc.aio.Channel) -> None:
+            self.Echo = channel.unary_unary(
+                '/test.Echo/Echo',
+                request_serializer=StringValue.SerializeToString,
+                response_deserializer=StringValue.FromString,
+            )
+
+    client: RoutedClient = RoutedClient(
+        'echo',
+        read_timeout=5,
+        stub_cls=EchoStub,
+        routing_type=RoutingType.ENVOY,
+        envoy_endpoint={'address': '127.0.0.1', 'port': port},
+        metadata={'service': 'discord_smite'},
+    )
+
+    # A dedicated callback, so deregistering it can't remove a hook registered elsewhere.
+    def inherit_baggage(span: ddtrace.Span) -> None:
+        baggage_manager.start_span_callback(span)
+
+    ddtrace.tracer.on_start_span(inherit_baggage)
+    try:
+        with ddtrace.tracer.trace('test') as span:
+            baggage_manager.store_baggage_item(span, 'case', '42')
+            response = await client.Echo(StringValue(value='hi'), metadata=[('per-call', 'yes')])
+    finally:
+        ddtrace.tracer.deregister_on_start_span(inherit_baggage)
+        await server.stop(None)
+
+    assert response.value == 'hi'
+    assert received[0]['service'] == 'discord_smite'
+    assert received[0]['per-call'] == 'yes'
+    assert 'peer.case=42' in received[0]['baggage']

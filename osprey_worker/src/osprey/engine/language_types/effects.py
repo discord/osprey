@@ -1,11 +1,12 @@
 from abc import abstractmethod
 from dataclasses import dataclass, field
-from typing import Generic, Iterable, List, Self
+from typing import Any, Generic, Iterable, List, Optional, Self
 
 from osprey.engine.executor.custom_extracted_features import (
     CustomExtractedFeature,
     SerializableT,
 )
+from osprey.engine.language_types.entities import EntityT
 from osprey.engine.language_types.rules import RuleT
 
 
@@ -35,6 +36,23 @@ class EffectBase:
     The rules that caused this effect to be emitted.
     These are appended automatically during WhenRules execution.
     """
+
+    when_rules_name: Optional[str] = None
+    """The `name` of the WhenRules block that emitted this effect. Stamped only for blocks that declare WhenRules modes."""
+
+    when_rules_mode: Optional[str] = None
+    """The `mode` of the WhenRules block that emitted this effect."""
+
+    revision_id: Optional[str] = None
+    """The `revision_id` of the WhenRules block that emitted this effect."""
+
+    release_id: Optional[str] = None
+    """The `release_id` of the WhenRules block that emitted this effect."""
+
+    def primary_entity(self) -> Optional[EntityT[Any]]:
+        """The entity used to bucket this effect for `rollout` mode: its `entity` field, or None if it has none."""
+        entity = getattr(self, 'entity', None)
+        return entity if isinstance(entity, EntityT) else None
 
     def add_rule(self, rule: RuleT) -> Self:
         self.rules.append(rule)

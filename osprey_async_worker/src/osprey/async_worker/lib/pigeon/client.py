@@ -374,12 +374,8 @@ class RoutedClient(Generic[T]):
         except KeyError:
             addr_port = f'{service.connection_address}:{service.grpc_port}'
 
-            # grpc.aio requires async interceptors (grpc.aio.UnaryUnaryClientInterceptor).
-            # The BaggageInterceptor/MetadataInterceptor are sync interceptors that only
-            # work with ENVOY routing (pre-created channels). For discovered services
-            # (SCALAR/ROUND_ROBIN), create channels without interceptors.
             pin_override(grpc.Channel, f'{service.name}-grpc-client')
-            channel = grpc.aio.insecure_channel(addr_port, options=self._grpc_options)
+            channel = grpc.aio.insecure_channel(addr_port, options=self._grpc_options, interceptors=self._interceptors)
             self._open_channels[key] = weakref.ref(channel)
 
             pin_override(grpc.Channel, None)

@@ -26,12 +26,15 @@ pub enum EnginePool {
 }
 
 impl EnginePool {
-    pub fn from_header(value: Option<&str>) -> EnginePool {
-        match value.map(str::trim) {
-            Some("rust") => EnginePool::Rust,
-            Some("shadow") => EnginePool::Shadow,
-            _ => EnginePool::Python,
-        }
+    /// The pool a stream's header names: no header, or `python`, is python. `None` for a value naming no pool,
+    /// which the caller also treats as python.
+    pub fn from_header(value: Option<&str>) -> Option<EnginePool> {
+        let Some(value) = value.map(str::trim) else {
+            return Some(EnginePool::Python);
+        };
+        [EnginePool::Python, EnginePool::Rust, EnginePool::Shadow]
+            .into_iter()
+            .find(|pool| value.eq_ignore_ascii_case(pool.as_str()))
     }
 
     pub fn as_str(self) -> &'static str {
@@ -183,14 +186,20 @@ mod tests {
 
     #[test]
     fn missing_or_unknown_header_means_python() {
-        assert_eq!(EnginePool::from_header(None), EnginePool::Python);
-        assert_eq!(EnginePool::from_header(Some("")), EnginePool::Python);
-        assert_eq!(EnginePool::from_header(Some("java")), EnginePool::Python);
-        assert_eq!(EnginePool::from_header(Some("python")), EnginePool::Python);
-        assert_eq!(EnginePool::from_header(Some("rust")), EnginePool::Rust);
+        assert_eq!(EnginePool::from_header(None), Some(EnginePool::Python));
+        assert_eq!(EnginePool::from_header(Some("")), None);
+        assert_eq!(EnginePool::from_header(Some("java")), None);
+        assert_eq!(
+            EnginePool::from_header(Some("python")),
+            Some(EnginePool::Python)
+        );
+        assert_eq!(
+            EnginePool::from_header(Some("Rust")),
+            Some(EnginePool::Rust)
+        );
         assert_eq!(
             EnginePool::from_header(Some(" shadow ")),
-            EnginePool::Shadow
+            Some(EnginePool::Shadow)
         );
     }
 

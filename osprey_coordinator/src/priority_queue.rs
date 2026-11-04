@@ -13,7 +13,7 @@ use crate::tokio_utils::AbortOnDrop;
 use std::{
     cell::Cell,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -194,6 +194,8 @@ struct EngineQueues {
     shadow: PoolQueue,
     flags: Arc<EngineRoutingFlags>,
     metrics: Arc<OspreyCoordinatorMetrics>,
+    /// Set by the shutdown drain, which must not race actions moved between pools.
+    draining: AtomicBool,
 }
 
 /// Where one enqueue goes: exactly one production pool, plus maybe a shadow copy.
@@ -265,6 +267,9 @@ impl EngineQueues {
 
     /// Moves actions out of a production pool whose last stream has gone, so they are not stranded there.
     fn rescue_stranded(&self) {
+        if self.draining.load(Ordering::Acquire) {
+            return;
+        }
         for priority in PRIORITIES {
             if self.rust.connected() == 0 && self.python.connected() > 0 {
                 self.move_queued(EnginePool::Rust, EnginePool::Python, priority);
@@ -325,11 +330,13 @@ impl PriorityQueueSender {
         if route.shadow_copy {
             self.queues.send_shadow_copy(&ackable_action, priority);
         }
-        self.queues
-            .pool(route.pool)
-            .sender(priority)
-            .send(ackable_action)
-            .await
+        let queue = self.queues.pool(route.pool);
+        queue.sender(priority).send(ackable_action).await?;
+        // The pool's last stream may have left after route() looked; move the action now, not at the next sweep.
+        if queue.connected() == 0 {
+            self.queues.rescue_stranded();
+        }
+        Ok(())
     }
 
     pub fn len_sync(&self) -> usize {
@@ -434,10 +441,14 @@ pub struct PoolConnection {
 
 impl Drop for PoolConnection {
     fn drop(&mut self) {
-        self.queues
+        let before = self
+            .queues
             .pool(self.pool)
             .connected
             .fetch_sub(1, Ordering::Relaxed);
+        if before == 1 && self.pool != EnginePool::Shadow {
+            self.queues.rescue_stranded();
+        }
     }
 }
 
@@ -461,6 +472,7 @@ impl PoolReceivers {
     }
 
     fn nack_all(&self, priority: Priority) {
+        self.queues.draining.store(true, Ordering::Release);
         for pool in [EnginePool::Python, EnginePool::Rust, EnginePool::Shadow] {
             PriorityQueueReceiver::nack_all(self.queues.pool(pool).receiver(priority));
         }
@@ -480,6 +492,7 @@ pub fn create_engine_queues(
         shadow: PoolQueue::new(Some(shadow_capacity)),
         flags,
         metrics,
+        draining: AtomicBool::new(false),
     });
     (
         PriorityQueueSender {
@@ -738,13 +751,28 @@ mod tests {
         send(&f, 0..10, Priority::Sync).await;
         f.sender.queues.rescue_stranded();
         assert_eq!(f.sender.queues.rust.sync_sender.len(), 10);
+        // The last stream leaving moves them at once, without waiting for the sweep.
         drop(rust);
-        f.sender.queues.rescue_stranded();
         assert_eq!(
             f.queued_ids(EnginePool::Python, Priority::Sync),
             (0..10).collect::<Vec<_>>()
         );
         assert_eq!(count(&*f.metrics.engine_pool_rescued_rust_sync), 10);
+    }
+
+    #[tokio::test]
+    async fn the_shutdown_drain_stops_moving_actions_between_pools() {
+        let f = fixture(16);
+        let _python = f.receivers.connect(EnginePool::Python);
+        let rust = f.receivers.connect(EnginePool::Rust);
+        f.set("rust_bps_sync", BPS_SCALE);
+        f.receivers.nack_all_sync();
+        let (ackable_action, answer) = AckableAction::new(action(1));
+        f.sender.send_sync(ackable_action).await.unwrap();
+        drop(rust);
+        assert_eq!(f.sender.queues.rust.sync_sender.len(), 1);
+        f.receivers.nack_all_sync();
+        assert!(matches!(answer.await, Ok(AckOrNack::Nack)));
     }
 
     #[tokio::test]

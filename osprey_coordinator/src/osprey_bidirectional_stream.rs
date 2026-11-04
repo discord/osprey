@@ -197,12 +197,15 @@ impl proto::osprey_coordinator_service_server::OspreyCoordinatorService
             { connection =? request.metadata() },
             "New Connection Received"
         );
-        let pool = EnginePool::from_header(
-            request
-                .metadata()
-                .get(ENGINE_POOL_HEADER)
-                .and_then(|value| value.to_str().ok()),
-        );
+        let header = request
+            .metadata()
+            .get(ENGINE_POOL_HEADER)
+            .map(|value| value.to_str().unwrap_or_default());
+        let pool = EnginePool::from_header(header).unwrap_or_else(|| {
+            tracing::warn!({header = ?header}, "unknown engine pool header, using the python pool");
+            self.metrics.engine_pool_unknown_header.incr();
+            EnginePool::Python
+        });
         let mut in_stream = request.into_inner();
         self.metrics.new_connection_established.incr();
         let (tx, rx) = mpsc::channel(128);
@@ -359,12 +362,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_stream_pulls_only_from_the_pool_its_header_names() {
-        std::env::set_var("MAX_PQ_RECEIVE_AWAIT_TIME_MS", "200");
         let metrics = OspreyCoordinatorMetrics::new();
         let flags = Arc::new(crate::engine_pool::EngineRoutingFlags::default());
         let (sender, receivers) =
             crate::priority_queue::create_engine_queues(flags.clone(), metrics.clone(), 16);
-        let server = OspreyCoordinatorServer::new(sender.clone(), receivers.clone(), metrics);
+        let server =
+            OspreyCoordinatorServer::new(sender.clone(), receivers.clone(), metrics.clone());
         // Keep rust connected so a rust-routed action stays in the rust pool.
         let _rust = receivers.connect(EnginePool::Rust);
         assert!(flags.set("rust_bps_async", Some("10000")));
@@ -389,6 +392,11 @@ mod tests {
         });
         sender.send_async(ackable_action).await.unwrap();
         assert_eq!(first_action(&server, Some("bogus")).await, Some(3));
+        assert_eq!(
+            crate::metrics::counters::StaticCounter::value(&*metrics.engine_pool_unknown_header)
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
         assert_eq!(first_action(&server, Some("rust")).await, Some(1));
     }
 

@@ -99,6 +99,8 @@ define_metrics!(OspreyCoordinatorMetrics, [
     engine_pool_shadow_dropped_full_async => StaticCounter("engine_pool.shadow_copy", ["result" => "dropped_full", "type" => "async"]),
     engine_pool_shadow_dropped_no_receivers_sync => StaticCounter("engine_pool.shadow_copy", ["result" => "dropped_no_receivers", "type" => "sync"]),
     engine_pool_shadow_dropped_no_receivers_async => StaticCounter("engine_pool.shadow_copy", ["result" => "dropped_no_receivers", "type" => "async"]),
+    // Streams whose `osprey-engine-pool` header names no pool; they join the python pool.
+    engine_pool_unknown_header => StaticCounter("engine_pool.unknown_header"),
     engine_pool_shadow_answered_ack => StaticCounter("engine_pool.shadow_copy_answered", ["ack" => "true"]),
     engine_pool_shadow_answered_nack => StaticCounter("engine_pool.shadow_copy_answered", ["ack" => "false"]),
     engine_pool_queue_size_python_sync => StaticGauge("engine_pool.queue_size", ["pool" => "python", "type" => "sync"]),

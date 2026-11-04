@@ -3,6 +3,7 @@ mod cached_futures;
 mod consumer;
 mod coordinator_metrics;
 mod discovery;
+mod engine_pool;
 mod etcd;
 mod etcd_config;
 mod etcd_watcherd;
@@ -35,7 +36,10 @@ use crate::metrics::emit_worker::SpawnEmitWorker;
 use crate::metrics::new_client;
 
 use consumer::{start_kafka_consumer, start_pubsub_subscriber};
-use priority_queue::{create_ackable_action_priority_queue, spawn_priority_queue_metrics_worker};
+use engine_pool::{spawn_engine_routing_watcher, EngineRoutingFlags};
+use priority_queue::{
+    create_engine_queues, spawn_priority_queue_metrics_worker, spawn_stranded_action_rescuer,
+};
 use tokio::join;
 
 use crate::osprey_bidirectional_stream::OspreyCoordinatorServer;
@@ -68,6 +72,21 @@ struct CliOptions {
         env = "OSPREY_COORDINATOR_SERVICE_NAME"
     )]
     service_name: String,
+    /// etcd directory holding the engine routing flags `rust_bps_async`, `rust_bps_sync`, `shadow_bps_async` and
+    /// `shadow_bps_sync`, in basis points. A missing key is 0.
+    #[arg(
+        long,
+        default_value = "/config/osprey_coordinator/engine_routing",
+        env = "OSPREY_COORDINATOR_ENGINE_ROUTING_ETCD_ROOT"
+    )]
+    engine_routing_etcd_root: String,
+    /// Capacity of each shadow queue (sync and async); a copy that finds it full is dropped.
+    #[arg(
+        long,
+        default_value = "1000",
+        env = "OSPREY_COORDINATOR_SHADOW_QUEUE_CAPACITY"
+    )]
+    shadow_queue_capacity: usize,
 }
 
 #[tokio::main]
@@ -80,8 +99,17 @@ async fn main() -> Result<()> {
     tracing::info!("creating osprey-snowflake client");
     let snowflake_client = Arc::new(SnowflakeClient::new(opts.snowflake_api_endpoint));
 
-    let (priority_queue_sender, priority_queue_receiver) = create_ackable_action_priority_queue();
     let metrics = OspreyCoordinatorMetrics::new();
+    let engine_routing_flags = Arc::new(EngineRoutingFlags::default());
+    spawn_engine_routing_watcher(
+        opts.engine_routing_etcd_root.clone(),
+        engine_routing_flags.clone(),
+    );
+    let (priority_queue_sender, priority_queue_receivers) = create_engine_queues(
+        engine_routing_flags,
+        metrics.clone(),
+        opts.shadow_queue_capacity,
+    );
     tracing::info!("starting grpc metrics worker");
     let _worker_guard = metrics
         .clone()
@@ -90,7 +118,7 @@ async fn main() -> Result<()> {
     let osprey_coordinator_grpc_bidi_stream_service =
         OspreyCoordinatorServiceServer::new(OspreyCoordinatorServer::new(
             priority_queue_sender.clone(),
-            priority_queue_receiver.clone(),
+            priority_queue_receivers.clone(),
             metrics.clone(),
         ));
 
@@ -168,10 +196,11 @@ async fn main() -> Result<()> {
     tracing::info!("starting priority queue metrics worker");
     let _drop_guard =
         spawn_priority_queue_metrics_worker(priority_queue_sender.clone(), metrics.clone());
+    let _rescuer_guard = spawn_stranded_action_rescuer(priority_queue_sender.clone());
 
     shutdown_handler::spawn_shutdown_handler(
         priority_queue_sender.clone(),
-        priority_queue_receiver.clone(),
+        priority_queue_receivers.clone(),
         is_shutting_down.clone(),
     );
 

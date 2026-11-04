@@ -1,11 +1,11 @@
-use crate::priority_queue::{PriorityQueueReceiver, PriorityQueueSender};
+use crate::priority_queue::{PoolReceivers, PriorityQueueSender};
 use crate::signals;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub fn spawn_shutdown_handler(
     priority_queue_sender: PriorityQueueSender,
-    priority_queue_receiver: PriorityQueueReceiver,
+    priority_queue_receivers: PoolReceivers,
     is_shutting_down: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
@@ -22,9 +22,10 @@ pub fn spawn_shutdown_handler(
         // Drain everything queued-but-undispatched. Sync nacks bubble up to
         // the sync RPC handler as Status::aborted, which the client can
         // retry on a different coordinator pod. Async nacks trigger immediate
-        // pubsub redelivery rather than waiting for the lease to expire.
-        priority_queue_receiver.nack_all_sync();
-        priority_queue_receiver.nack_all_async();
+        // pubsub redelivery rather than waiting for the lease to expire. Every
+        // pool drains; shadow copies are dropped.
+        priority_queue_receivers.nack_all_sync();
+        priority_queue_receivers.nack_all_async();
         tracing::info!("nacked all queued sync + async actions");
         // Hold the channel open while workers ack dispatched-but-not-yet-acked
         // actions over bidi. At typical worker latencies of ~150ms p95, 30s

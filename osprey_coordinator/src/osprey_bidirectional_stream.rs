@@ -1,6 +1,7 @@
 use crate::coordinator_metrics::OspreyCoordinatorMetrics;
+use crate::engine_pool::{EnginePool, ENGINE_POOL_HEADER};
 use crate::priority_queue::ActionAcker;
-use crate::priority_queue::{PriorityQueueReceiver, PriorityQueueSender};
+use crate::priority_queue::{PoolReceivers, PriorityQueueReceiver, PriorityQueueSender};
 use crate::proto;
 use anyhow::{anyhow, Context, Result};
 use proto::action_request::ActionRequest;
@@ -50,7 +51,7 @@ enum ClientState {
 }
 
 pub struct OspreyCoordinatorServer {
-    priority_queue_receiver: PriorityQueueReceiver,
+    priority_queue_receivers: PoolReceivers,
     #[allow(unused)]
     priority_queue_sender: PriorityQueueSender, // TODO: use this for retrying sync actions
     metrics: Arc<OspreyCoordinatorMetrics>,
@@ -59,12 +60,12 @@ pub struct OspreyCoordinatorServer {
 impl OspreyCoordinatorServer {
     pub fn new(
         priority_queue_sender: PriorityQueueSender,
-        priority_queue_receiver: PriorityQueueReceiver,
+        priority_queue_receivers: PoolReceivers,
         metrics: Arc<OspreyCoordinatorMetrics>,
     ) -> OspreyCoordinatorServer {
         OspreyCoordinatorServer {
             priority_queue_sender,
-            priority_queue_receiver,
+            priority_queue_receivers,
             metrics,
         }
     }
@@ -74,6 +75,7 @@ fn handle_action_request(
     action_request: ActionRequest,
     current_client_state: ClientState,
     metrics: Arc<OspreyCoordinatorMetrics>,
+    pool: EnginePool,
 ) -> Result<proto::ClientDetails> {
     match (action_request, current_client_state) {
         (ActionRequest::Initial(client_details), ClientState::NoOutstandingAction) => {
@@ -87,9 +89,11 @@ fn handle_action_request(
             ack_or_nack
         )),
         (ActionRequest::AckOrNack(ack_or_nack), ClientState::OutstandingAction(state)) => {
-            metrics.bidi_acks_received.incr();
-            let duration = Instant::now().duration_since(state.send_time);
-            metrics.action_outstanding_duration.record(duration);
+            if pool != EnginePool::Shadow {
+                metrics.bidi_acks_received.incr();
+                let duration = Instant::now().duration_since(state.send_time);
+                metrics.action_outstanding_duration.record(duration);
+            }
             state.action_acker.ack_or_nack(
                 ack_or_nack
                     .ack_or_nack
@@ -115,7 +119,10 @@ async fn handle_request(
     action_receiver: &PriorityQueueReceiver,
     metrics: Arc<OspreyCoordinatorMetrics>,
     receive_timeout: Duration,
+    pool: EnginePool,
 ) -> Result<UpdateClientStateOrDisconnect> {
+    // Shadow streams keep out of the production dispatch metrics.
+    let production = pool != EnginePool::Shadow;
     match request
         .request
         .context("request object missing from proto")?
@@ -125,7 +132,7 @@ async fn handle_request(
                 .action_request
                 .context("no `action_request.action_request` in `ActionRequest` proto")?;
             let client_details =
-                handle_action_request(action_request, client_state, metrics.clone())?;
+                handle_action_request(action_request, client_state, metrics.clone(), pool)?;
             tracing::debug!("awaiting action from priority queue");
             let priority_queue_receive_start_time = Instant::now();
             let result = timeout(receive_timeout, action_receiver.recv(metrics.clone())).await;
@@ -135,18 +142,24 @@ async fn handle_request(
                     tracing::error!(
                         "Took too long to get action from priority queue, disconnecting"
                     );
-                    metrics
-                        .priority_queue_receive_time
-                        .record(Instant::now().duration_since(priority_queue_receive_start_time));
+                    if production {
+                        metrics.priority_queue_receive_time.record(
+                            Instant::now().duration_since(priority_queue_receive_start_time),
+                        );
+                    }
                     return Ok(UpdateClientStateOrDisconnect::ActionReceiverTimedOut);
                 }
             };
-            metrics
-                .priority_queue_receive_time
-                .record(Instant::now().duration_since(priority_queue_receive_start_time));
+            if production {
+                metrics
+                    .priority_queue_receive_time
+                    .record(Instant::now().duration_since(priority_queue_receive_start_time));
+            }
             let (action, action_acker) = ackable_action.into_action();
             sender.send(Ok(action)).await?;
-            metrics.bidi_actions_sent.incr();
+            if production {
+                metrics.bidi_actions_sent.incr();
+            }
             Ok(UpdateClientStateOrDisconnect::UpdateClientState(
                 ClientState::OutstandingAction(OutstandingActionState {
                     action_acker,
@@ -184,10 +197,17 @@ impl proto::osprey_coordinator_service_server::OspreyCoordinatorService
             { connection =? request.metadata() },
             "New Connection Received"
         );
+        let pool = EnginePool::from_header(
+            request
+                .metadata()
+                .get(ENGINE_POOL_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        );
         let mut in_stream = request.into_inner();
         self.metrics.new_connection_established.incr();
         let (tx, rx) = mpsc::channel(128);
-        let action_receiver = self.priority_queue_receiver.clone();
+        // Counts this stream as connected to its pool until the task below ends.
+        let pool_connection = self.priority_queue_receivers.connect(pool);
         let metrics = self.metrics.clone();
         let max_pq_receive_await_time_ms = Duration::from_millis(
             std::env::var("MAX_PQ_RECEIVE_AWAIT_TIME_MS")
@@ -219,9 +239,10 @@ impl proto::osprey_coordinator_service_server::OspreyCoordinatorService
                             client_state,
                             &tx,
                             request,
-                            &action_receiver,
+                            &pool_connection.receiver,
                             metrics.clone(),
                             max_pq_receive_await_time_ms,
+                            pool,
                         )
                         .await
                         {
@@ -279,7 +300,8 @@ impl proto::osprey_coordinator_service_server::OspreyCoordinatorService
                 }
             }
 
-            tracing::debug!("stream ended");
+            tracing::debug!({ pool = pool.as_str() }, "stream ended");
+            drop(pool_connection);
         });
 
         let out_stream = ReceiverStream::new(rx);
@@ -302,13 +324,81 @@ mod tests {
 
     use super::*;
 
+    fn action_request() -> proto::Request {
+        proto::Request {
+            request: Some(proto::request::Request::ActionRequest(
+                proto::ActionRequest {
+                    action_request: Some(proto::action_request::ActionRequest::Initial(
+                        proto::ClientDetails::default(),
+                    )),
+                },
+            )),
+        }
+    }
+
+    async fn first_action(
+        server: &OspreyCoordinatorServer,
+        header: Option<&'static str>,
+    ) -> Option<u64> {
+        let mut req = crate::tonic_mock::streaming_request(vec![action_request()]);
+        if let Some(header) = header {
+            req.metadata_mut()
+                .insert(ENGINE_POOL_HEADER, header.parse().unwrap());
+        }
+        let mut stream = server
+            .osprey_bidirectional_stream(req)
+            .await
+            .unwrap()
+            .into_inner();
+        tokio::time::timeout(Duration::from_millis(500), stream.next())
+            .await
+            .ok()
+            .flatten()
+            .map(|action| action.unwrap().action_id)
+    }
+
+    #[tokio::test]
+    async fn a_stream_pulls_only_from_the_pool_its_header_names() {
+        std::env::set_var("MAX_PQ_RECEIVE_AWAIT_TIME_MS", "200");
+        let metrics = OspreyCoordinatorMetrics::new();
+        let flags = Arc::new(crate::engine_pool::EngineRoutingFlags::default());
+        let (sender, receivers) =
+            crate::priority_queue::create_engine_queues(flags.clone(), metrics.clone(), 16);
+        let server = OspreyCoordinatorServer::new(sender.clone(), receivers.clone(), metrics);
+        // Keep rust connected so a rust-routed action stays in the rust pool.
+        let _rust = receivers.connect(EnginePool::Rust);
+        assert!(flags.set("rust_bps_async", Some("10000")));
+        let (ackable_action, _answer_1) = AckableAction::new(proto::OspreyCoordinatorAction {
+            action_id: 1,
+            ..Default::default()
+        });
+        sender.send_async(ackable_action).await.unwrap();
+        assert!(flags.set("rust_bps_async", Some("0")));
+        let (ackable_action, _answer_2) = AckableAction::new(proto::OspreyCoordinatorAction {
+            action_id: 2,
+            ..Default::default()
+        });
+        sender.send_async(ackable_action).await.unwrap();
+
+        assert_eq!(first_action(&server, Some("shadow")).await, None);
+        // A missing header, and an unknown one, mean python.
+        assert_eq!(first_action(&server, None).await, Some(2));
+        let (ackable_action, _answer_3) = AckableAction::new(proto::OspreyCoordinatorAction {
+            action_id: 3,
+            ..Default::default()
+        });
+        sender.send_async(ackable_action).await.unwrap();
+        assert_eq!(first_action(&server, Some("bogus")).await, Some(3));
+        assert_eq!(first_action(&server, Some("rust")).await, Some(1));
+    }
+
     #[tokio::test]
     async fn golden_path_bidirection_streaming_test() -> Result<()> {
         // Simple golden path test that adds two actions to the queue and asserts that a properly
         // formed bidirectional streaming request is returned the actions in that order
 
         tracing_subscriber::fmt::init();
-        let (priority_queue_sender, priority_queue_receiver) =
+        let (priority_queue_sender, priority_queue_receivers) =
             create_ackable_action_priority_queue();
         let metrics = OspreyCoordinatorMetrics::new();
         let _worker_guard = metrics
@@ -353,7 +443,7 @@ mod tests {
 
         let server = OspreyCoordinatorServer::new(
             priority_queue_sender.clone(),
-            priority_queue_receiver,
+            priority_queue_receivers,
             metrics.clone(),
         );
 

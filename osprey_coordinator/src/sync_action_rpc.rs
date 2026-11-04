@@ -302,6 +302,7 @@ impl OspreyCoordinatorSyncActionService for SyncActionServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_pool::EnginePool;
     use crate::priority_queue::create_ackable_action_priority_queue;
     use crate::proto::osprey_coordinator_action::{
         ActionData, SecretData as CoordinatorSecretData,
@@ -353,8 +354,12 @@ mod tests {
 
     async fn process_request(secret_data: Option<Vec<u8>>) -> proto::OspreyCoordinatorAction {
         let metrics = OspreyCoordinatorMetrics::new();
-        let (priority_queue_sender, priority_queue_receiver) =
+        let (priority_queue_sender, priority_queue_receivers) =
             create_ackable_action_priority_queue();
+        let priority_queue_receiver = priority_queue_receivers
+            .connect(EnginePool::Python)
+            .receiver
+            .clone();
         let server = SyncActionServer::new_with_decryptor(
             Arc::new(SnowflakeClient::new("unused".to_owned())),
             priority_queue_sender,
@@ -401,6 +406,45 @@ mod tests {
         assert!(!output.contains("ProcessActionRequest"));
         assert!(!output.contains("action_data_json"));
         assert!(!output.contains("encrypted_json_secret_data"));
+    }
+
+    #[tokio::test]
+    async fn a_shadow_copy_answer_never_changes_the_sync_reply() {
+        let metrics = OspreyCoordinatorMetrics::new();
+        let flags = Arc::new(crate::engine_pool::EngineRoutingFlags::default());
+        assert!(flags.set("shadow_bps_sync", Some("10000")));
+        let (priority_queue_sender, priority_queue_receivers) =
+            crate::priority_queue::create_engine_queues(flags, metrics.clone(), 16);
+        let python = priority_queue_receivers.connect(EnginePool::Python);
+        let shadow = priority_queue_receivers.connect(EnginePool::Shadow);
+        let server = SyncActionServer::new_with_decryptor(
+            Arc::new(SnowflakeClient::new("unused".to_owned())),
+            priority_queue_sender,
+            metrics.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(TestSecretDataDecryptor),
+        );
+        let response = tokio::spawn(async move {
+            server
+                .process_action(tonic::Request::new(request(None)))
+                .await
+        });
+
+        let copy = shadow.receiver.recv(metrics.clone()).await.unwrap();
+        assert!(copy.is_shadow_copy());
+        copy.into_action().1.ack_or_nack(AckOrNack::Nack);
+        let (action, acker) = python
+            .receiver
+            .recv(metrics.clone())
+            .await
+            .unwrap()
+            .into_action();
+        assert_eq!(action.action_id, 123);
+        let verdicts = proto::Verdicts::default();
+        acker.ack_or_nack(AckOrNack::Ack(Some(verdicts.clone())));
+
+        let reply = response.await.unwrap().unwrap().into_inner();
+        assert_eq!(reply.verdicts, Some(verdicts));
     }
 
     #[tokio::test]

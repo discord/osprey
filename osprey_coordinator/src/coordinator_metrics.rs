@@ -74,8 +74,8 @@ define_metrics!(OspreyCoordinatorMetrics, [
     bidi_actions_sent => StaticCounter("bidi_stream.actions_sent"),
     bidi_acks_received => StaticCounter("bidi_stream.acks_received"),
 
-    // Engine pools: which pool the hash chose, which pool got the action, and fallbacks when the chosen
-    // pool had no streams. `rescued` counts actions moved off a pool whose last stream went away.
+    // Engine pools: which pool the hash chose, which pool got the action, and rust-bound actions sent to python
+    // because rust had no streams. `rescued` counts actions moved off rust after its last stream went away.
     engine_pool_routed_python_sync => StaticCounter("engine_pool.routed", ["pool" => "python", "type" => "sync"]),
     engine_pool_routed_python_async => StaticCounter("engine_pool.routed", ["pool" => "python", "type" => "async"]),
     engine_pool_routed_rust_sync => StaticCounter("engine_pool.routed", ["pool" => "rust", "type" => "sync"]),
@@ -86,12 +86,8 @@ define_metrics!(OspreyCoordinatorMetrics, [
     engine_pool_enqueued_rust_async => StaticCounter("engine_pool.enqueued", ["pool" => "rust", "type" => "async"]),
     engine_pool_fallback_rust_sync => StaticCounter("engine_pool.fallback", ["pool" => "rust", "to" => "python", "type" => "sync"]),
     engine_pool_fallback_rust_async => StaticCounter("engine_pool.fallback", ["pool" => "rust", "to" => "python", "type" => "async"]),
-    engine_pool_fallback_python_sync => StaticCounter("engine_pool.fallback", ["pool" => "python", "to" => "rust", "type" => "sync"]),
-    engine_pool_fallback_python_async => StaticCounter("engine_pool.fallback", ["pool" => "python", "to" => "rust", "type" => "async"]),
     engine_pool_rescued_rust_sync => StaticCounter("engine_pool.rescued", ["pool" => "rust", "to" => "python", "type" => "sync"]),
     engine_pool_rescued_rust_async => StaticCounter("engine_pool.rescued", ["pool" => "rust", "to" => "python", "type" => "async"]),
-    engine_pool_rescued_python_sync => StaticCounter("engine_pool.rescued", ["pool" => "python", "to" => "rust", "type" => "sync"]),
-    engine_pool_rescued_python_async => StaticCounter("engine_pool.rescued", ["pool" => "python", "to" => "rust", "type" => "async"]),
     // Shadow copies of python-bound actions: sent, or dropped because the shadow queue was full or had no streams.
     engine_pool_shadow_sent_sync => StaticCounter("engine_pool.shadow_copy", ["result" => "sent", "type" => "sync"]),
     engine_pool_shadow_sent_async => StaticCounter("engine_pool.shadow_copy", ["result" => "sent", "type" => "async"]),
@@ -162,43 +158,26 @@ impl OspreyCoordinatorMetrics {
         }
     }
 
-    /// Counts a fallback away from `from`, the pool the hash chose.
-    pub fn incr_engine_pool_fallback(&self, from: EnginePool, priority: Priority) {
-        match from {
-            EnginePool::Rust => by_priority!(
-                self,
-                priority,
-                engine_pool_fallback_rust_sync,
-                engine_pool_fallback_rust_async,
-                incr()
-            ),
-            _ => by_priority!(
-                self,
-                priority,
-                engine_pool_fallback_python_sync,
-                engine_pool_fallback_python_async,
-                incr()
-            ),
-        }
+    /// Counts a rust-bound action sent to python because rust had no streams.
+    pub fn incr_engine_pool_fallback(&self, priority: Priority) {
+        by_priority!(
+            self,
+            priority,
+            engine_pool_fallback_rust_sync,
+            engine_pool_fallback_rust_async,
+            incr()
+        )
     }
 
-    pub fn incr_engine_pool_rescued(&self, from: EnginePool, priority: Priority) {
-        match from {
-            EnginePool::Rust => by_priority!(
-                self,
-                priority,
-                engine_pool_rescued_rust_sync,
-                engine_pool_rescued_rust_async,
-                incr()
-            ),
-            _ => by_priority!(
-                self,
-                priority,
-                engine_pool_rescued_python_sync,
-                engine_pool_rescued_python_async,
-                incr()
-            ),
-        }
+    /// Counts an action moved from rust, after its last stream left, to python.
+    pub fn incr_engine_pool_rescued(&self, priority: Priority) {
+        by_priority!(
+            self,
+            priority,
+            engine_pool_rescued_rust_sync,
+            engine_pool_rescued_rust_async,
+            incr()
+        )
     }
 
     pub fn incr_engine_pool_shadow_sent(&self, priority: Priority) {

@@ -5,6 +5,7 @@
 //! `routing_bucket(action_id) < rust_bps`, and a sample of the actions bound for `python` is also copied into the
 //! bounded, read-only `shadow` pool. The rates are basis points (0..=10000) read live from etcd and default to 0.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +57,16 @@ pub fn stable_hash(action_id: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// A routing key for an action whose id was minted on delivery: FNV-1a 64 of the message id (Pub/Sub's
+/// `message_id`), which every redelivery of the message keeps.
+pub fn message_routing_key(message_id: &str) -> u64 {
+    message_id
+        .bytes()
+        .fold(0xCBF2_9CE4_8422_2325, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01B3)
+        })
+}
+
 /// Bucket in `0..BPS_SCALE` deciding `rust` vs `python`.
 pub fn routing_bucket(action_id: u64) -> u32 {
     (stable_hash(action_id) % BPS_SCALE as u64) as u32
@@ -65,6 +76,13 @@ pub fn routing_bucket(action_id: u64) -> u32 {
 pub fn shadow_bucket(action_id: u64) -> u32 {
     (stable_hash(stable_hash(action_id)) % BPS_SCALE as u64) as u32
 }
+
+const FLAG_NAMES: [&str; 4] = [
+    "rust_bps_async",
+    "rust_bps_sync",
+    "shadow_bps_async",
+    "shadow_bps_sync",
+];
 
 /// Live routing rates. Every field defaults to 0: all actions go to `python` and no shadow copies are made.
 #[derive(Debug, Default)]
@@ -113,6 +131,16 @@ struct EngineRoutingKeys {
 }
 
 impl KeyHandler for EngineRoutingKeys {
+    // A snapshot is the whole truth: a flag missing from it (deleted, even while the watch was down) is 0.
+    fn handle_full_sync(&self, items: &HashMap<Arc<str>, Arc<str>>) {
+        for name in FLAG_NAMES {
+            self.flags.set(name, None);
+        }
+        for (key, value) in items.iter() {
+            self.handle_key_updated(key, Some(value));
+        }
+    }
+
     fn handle_key_updated(&self, key: &str, value: Option<&str>) {
         let name = key
             .strip_prefix(self.root.as_str())
@@ -164,6 +192,14 @@ mod tests {
             routing_bucket(1_227_039_953_469_571_133),
             routing_bucket(1_227_039_953_469_571_133)
         );
+    }
+
+    #[test]
+    fn message_routing_keys_are_pinned() {
+        // FNV-1a 64 test vectors; changing them moves id-less redeliveries between pools.
+        assert_eq!(message_routing_key(""), 0xCBF2_9CE4_8422_2325);
+        assert_eq!(message_routing_key("a"), 0xAF63_DC4C_8601_EC8C);
+        assert_eq!(message_routing_key("foobar"), 0x8594_4171_F739_67E8);
     }
 
     #[test]
@@ -235,5 +271,33 @@ mod tests {
             None,
         );
         assert_eq!(flags.rust_bps(Priority::Async), 0);
+    }
+
+    #[test]
+    fn a_full_sync_zeroes_every_flag_it_does_not_carry() {
+        let flags = Arc::new(EngineRoutingFlags::default());
+        let keys = EngineRoutingKeys {
+            root: "/config/osprey_coordinator/engine_routing".into(),
+            flags: flags.clone(),
+        };
+        for name in FLAG_NAMES {
+            assert!(flags.set(name, Some("700")));
+        }
+        let mut items: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+        items.insert(
+            "/config/osprey_coordinator/engine_routing/shadow_bps_sync".into(),
+            "50".into(),
+        );
+        keys.handle_full_sync(&items);
+        assert_eq!(flags.rust_bps(Priority::Async), 0);
+        assert_eq!(flags.rust_bps(Priority::Sync), 0);
+        assert_eq!(flags.shadow_bps(Priority::Async), 0);
+        assert_eq!(flags.shadow_bps(Priority::Sync), 50);
+        // The root deleted: an empty snapshot.
+        keys.handle_full_sync(&HashMap::new());
+        for p in [Priority::Sync, Priority::Async] {
+            assert_eq!(flags.rust_bps(p), 0);
+            assert_eq!(flags.shadow_bps(p), 0);
+        }
     }
 }

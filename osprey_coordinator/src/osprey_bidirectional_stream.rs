@@ -308,7 +308,13 @@ impl proto::osprey_coordinator_service_server::OspreyCoordinatorService
         });
 
         let out_stream = ReceiverStream::new(rx);
-        Ok(tonic::Response::new(out_stream))
+        let mut response = tonic::Response::new(out_stream);
+        // Echo the pool served, so a worker can tell a pool-aware coordinator from one that ignores its header.
+        response.metadata_mut().insert(
+            ENGINE_POOL_HEADER,
+            tonic::metadata::MetadataValue::from_static(pool.as_str()),
+        );
+        Ok(response)
     }
 }
 
@@ -342,17 +348,20 @@ mod tests {
     async fn first_action(
         server: &OspreyCoordinatorServer,
         header: Option<&'static str>,
+        echoed: &'static str,
     ) -> Option<u64> {
         let mut req = crate::tonic_mock::streaming_request(vec![action_request()]);
         if let Some(header) = header {
             req.metadata_mut()
                 .insert(ENGINE_POOL_HEADER, header.parse().unwrap());
         }
-        let mut stream = server
-            .osprey_bidirectional_stream(req)
-            .await
-            .unwrap()
-            .into_inner();
+        let response = server.osprey_bidirectional_stream(req).await.unwrap();
+        assert_eq!(
+            response.metadata().get(ENGINE_POOL_HEADER).unwrap(),
+            echoed,
+            "{header:?}"
+        );
+        let mut stream = response.into_inner();
         tokio::time::timeout(Duration::from_millis(500), stream.next())
             .await
             .ok()
@@ -383,21 +392,24 @@ mod tests {
         });
         sender.send_async(ackable_action).await.unwrap();
 
-        assert_eq!(first_action(&server, Some("shadow")).await, None);
+        assert_eq!(first_action(&server, Some("shadow"), "shadow").await, None);
         // A missing header, and an unknown one, mean python.
-        assert_eq!(first_action(&server, None).await, Some(2));
+        assert_eq!(first_action(&server, None, "python").await, Some(2));
         let (ackable_action, _answer_3) = AckableAction::new(proto::OspreyCoordinatorAction {
             action_id: 3,
             ..Default::default()
         });
         sender.send_async(ackable_action).await.unwrap();
-        assert_eq!(first_action(&server, Some("bogus")).await, Some(3));
+        assert_eq!(
+            first_action(&server, Some("bogus"), "python").await,
+            Some(3)
+        );
         assert_eq!(
             crate::metrics::counters::StaticCounter::value(&*metrics.engine_pool_unknown_header)
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-        assert_eq!(first_action(&server, Some("rust")).await, Some(1));
+        assert_eq!(first_action(&server, Some("rust"), "rust").await, Some(1));
     }
 
     #[tokio::test]

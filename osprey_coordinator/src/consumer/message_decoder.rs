@@ -5,6 +5,8 @@ use prost_types::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::engine_pool::message_routing_key;
+use crate::priority_queue::{AckOrNack, AckableAction};
 use crate::{
     coordinator_metrics::OspreyCoordinatorMetrics,
     metrics::counters::StaticCounter,
@@ -15,15 +17,42 @@ use crate::{
     snowflake_client::SnowflakeClient,
 };
 
+/// A decoded action, and whether its id was minted here because the message carried none.
+#[derive(Debug)]
+pub struct DecodedAction {
+    pub action: proto::OspreyCoordinatorAction,
+    pub id_minted: bool,
+}
+
+impl DecodedAction {
+    /// Wraps the action for the queue. A minted id differs on every delivery, so such an action routes on the
+    /// message id, which a redelivery keeps.
+    pub fn into_ackable(
+        self,
+        message_id: &str,
+    ) -> (AckableAction, tokio::sync::oneshot::Receiver<AckOrNack>) {
+        let (ackable_action, receiver) = AckableAction::new(self.action);
+        if self.id_minted {
+            (
+                ackable_action.with_routing_key(message_routing_key(message_id)),
+                receiver,
+            )
+        } else {
+            (ackable_action, receiver)
+        }
+    }
+}
+
 pub async fn decode_proto_message(
     message_data: &[u8],
     ack_id: u64,
     message_timestamp: Timestamp,
     snowflake_client: &SnowflakeClient,
     metrics: &OspreyCoordinatorMetrics,
-) -> Result<proto::OspreyCoordinatorAction> {
+) -> Result<DecodedAction> {
     let osprey_proto_action = OspreyProtoAction::decode(message_data)?;
-    let action_id = if osprey_proto_action.id == 0 {
+    let id_minted = osprey_proto_action.id == 0;
+    let action_id = if id_minted {
         metrics.action_id_snowflake_generation_proto.incr();
         snowflake_client.generate_id().await?
     } else {
@@ -34,13 +63,16 @@ pub async fn decode_proto_message(
         .ok_or_else(|| anyhow!("missing action data"))?
         .to_string()
         .to_case(Case::Snake);
-    Ok(proto::OspreyCoordinatorAction {
-        ack_id,
-        action_id,
-        action_name,
-        action_data: Some(ActionData::ProtoActionData(message_data.into())),
-        secret_data: None,
-        timestamp: Some(message_timestamp),
+    Ok(DecodedAction {
+        action: proto::OspreyCoordinatorAction {
+            ack_id,
+            action_id,
+            action_name,
+            action_data: Some(ActionData::ProtoActionData(message_data.into())),
+            secret_data: None,
+            timestamp: Some(message_timestamp),
+        },
+        id_minted,
     })
 }
 
@@ -50,7 +82,7 @@ pub async fn decode_msgpack_json_message(
     message_timestamp: Timestamp,
     snowflake_client: &SnowflakeClient,
     metrics: &OspreyCoordinatorMetrics,
-) -> Result<proto::OspreyCoordinatorAction> {
+) -> Result<DecodedAction> {
     use msgpack_simple::MsgPack;
 
     #[derive(Deserialize, Debug)]
@@ -71,6 +103,7 @@ pub async fn decode_msgpack_json_message(
         _ => None,
     };
 
+    let id_minted = action.id.is_none();
     let action_id = match action.id {
         Some(id) => id.parse::<u64>()?,
         None => {
@@ -79,12 +112,15 @@ pub async fn decode_msgpack_json_message(
         }
     };
 
-    Ok(proto::OspreyCoordinatorAction {
-        ack_id,
-        action_id,
-        action_name: action.name,
-        action_data: Some(ActionData::JsonActionData(serde_json_vec)),
-        secret_data: optional_secret_data,
-        timestamp: Some(message_timestamp),
+    Ok(DecodedAction {
+        action: proto::OspreyCoordinatorAction {
+            ack_id,
+            action_id,
+            action_name: action.name,
+            action_data: Some(ActionData::JsonActionData(serde_json_vec)),
+            secret_data: optional_secret_data,
+            timestamp: Some(message_timestamp),
+        },
+        id_minted,
     })
 }

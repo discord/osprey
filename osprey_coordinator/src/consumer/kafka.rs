@@ -3,7 +3,7 @@ use crate::consumer::message_decoder;
 use crate::coordinator_metrics::OspreyCoordinatorMetrics;
 use crate::metrics::counters::StaticCounter;
 use crate::metrics::histograms::StaticHistogram;
-use crate::priority_queue::{AckOrNack, AckableAction, PriorityQueueSender};
+use crate::priority_queue::{AckOrNack, PriorityQueueSender};
 use crate::signals::exit_signal;
 use crate::snowflake_client::SnowflakeClient;
 use anyhow::Result;
@@ -216,7 +216,7 @@ pub async fn start_kafka_consumer(
                     }
                 };
 
-                let (ackable_action, acking_receiver) = AckableAction::new(action);
+                let (ackable_action, acking_receiver) = action.into_ackable(&message_id);
 
                 tracing::debug!(
                     {ack_id = %ack_id, message_id = %message_id},

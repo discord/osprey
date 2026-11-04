@@ -169,7 +169,7 @@ impl SyncActionServer {
     async fn try_process_action(
         &self,
         ack_id: u64,
-        action_request: &ProcessActionRequest,
+        action_request: &mut ProcessActionRequest,
     ) -> Result<tonic::Response<osprey_coordinator_sync_action::ProcessActionResponse>, tonic::Status>
     {
         // Fast-reject new RPCs once this pod is draining. Returns `Unavailable`
@@ -207,6 +207,8 @@ impl SyncActionServer {
         };
 
         let action_id = osprey_coordinator_action.action_id;
+        // A retry reuses a minted id, so it routes to the same pool.
+        action_request.action_id = Some(action_id);
 
         let (ackable_action, acking_receiver) = AckableAction::new(osprey_coordinator_action);
 
@@ -281,7 +283,7 @@ impl OspreyCoordinatorSyncActionService for SyncActionServer {
     ) -> Result<tonic::Response<osprey_coordinator_sync_action::ProcessActionResponse>, tonic::Status>
     {
         self.metrics.sync_classification_action_received.incr();
-        let action_request = request.into_inner();
+        let mut action_request = request.into_inner();
         log_action_request(&action_request);
 
         let ack_id: u64 = {
@@ -289,11 +291,11 @@ impl OspreyCoordinatorSyncActionService for SyncActionServer {
             rng.gen()
         };
 
-        match self.try_process_action(ack_id, &action_request).await {
+        match self.try_process_action(ack_id, &mut action_request).await {
             response @ Ok(_) => response,
             Err(e) => {
                 tracing::error!("initial process_action attempt failed, retrying: {}", e);
-                self.try_process_action(ack_id, &action_request).await
+                self.try_process_action(ack_id, &mut action_request).await
             }
         }
     }

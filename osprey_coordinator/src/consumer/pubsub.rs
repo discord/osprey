@@ -17,8 +17,7 @@ use crate::metrics::MetricsClientBuilder;
 use crate::{
     consumer::message_decoder,
     coordinator_metrics::OspreyCoordinatorMetrics,
-    priority_queue::{AckOrNack, AckableAction, PriorityQueueSender},
-    proto,
+    priority_queue::{AckOrNack, PriorityQueueSender},
     pub_sub_streaming_pull::DetachedMessage,
     pub_sub_streaming_pull::{FlowControl, SpawnTaskPerMessageHandler, StreamingPullManager},
 };
@@ -77,7 +76,7 @@ async fn create_action_from_pubsub_message(
     message_timestamp: Timestamp,
     snowflake_client: &SnowflakeClient,
     metrics: &OspreyCoordinatorMetrics,
-) -> Result<proto::OspreyCoordinatorAction> {
+) -> Result<message_decoder::DecodedAction> {
     let decrypted_message_vector = match message_attributes.get("encrypted") {
         Some(is_encrypted) if is_encrypted == "true" => {
             Some(decrypt_pubsub_message(kms_envelope, message_data).await?)
@@ -232,7 +231,7 @@ pub async fn start_pubsub_subscriber(
                 .await
                 .map_err(|_| ())?;
 
-                let (ackable_action, acking_receiver) = AckableAction::new(action);
+                let (ackable_action, acking_receiver) = action.into_ackable(&message_id);
 
                 tracing::debug!(
                     {ack_id = %ack_id, message_id = %message_id},
@@ -390,7 +389,7 @@ mod tests {
 
         println!("{:?}", prost_action);
         assert!(prost_action.is_ok(), "prost action decoding failed");
-        let prost_action = prost_action.unwrap();
+        let prost_action = prost_action.unwrap().action;
         assert_eq!(prost_action.action_name, "guild_invite_created");
 
         let action_data = prost_action
@@ -449,7 +448,7 @@ mod tests {
 
         println!("{:?}", prost_action);
         assert!(prost_action.is_ok(), "prost action decoding failed");
-        let prost_action = prost_action.unwrap();
+        let prost_action = prost_action.unwrap().action;
         assert_eq!(prost_action.action_name, "guild_invite_created");
 
         let proto::osprey_coordinator_action::ActionData::JsonActionData(json_bytes) = prost_action
@@ -518,7 +517,7 @@ mod tests {
         .await;
 
         assert!(prost_action.is_ok(), "proto action decoding failed");
-        let prost_action = prost_action.unwrap();
+        let prost_action = prost_action.unwrap().action;
 
         // Validate we got ProtoActionData (not JsonActionData) and the bytes match input
         let proto::osprey_coordinator_action::ActionData::ProtoActionData(proto_bytes) =

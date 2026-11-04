@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::etcd::Client;
@@ -13,6 +14,15 @@ pub trait KeyHandler {
     /// Invoked anytime a configuration change to `key` has been detected.
     /// `value` is the raw string contents stored at `key`.
     fn handle_key_updated(&self, key: &str, value: Option<&str>);
+
+    /// Invoked with a full snapshot of the watched directory: the initial sync, and every resync after a reset
+    /// (empty when the directory was deleted). The default applies each item; a key absent from the snapshot
+    /// keeps its value unless the handler overrides this.
+    fn handle_full_sync(&self, items: &HashMap<Arc<str>, Arc<str>>) {
+        for (key, value) in items.iter() {
+            self.handle_key_updated(key, Some(value));
+        }
+    }
 }
 
 /// Validate a disconfig after the value from etcd event update has been successfully
@@ -47,9 +57,7 @@ pub async fn run_etcd_watcher<T: KeyHandler + Send + Sync + 'static>(
     let mut events = response.events();
     // Handle full sync event before resolving the future.
     if let RecursiveKeyWatchEvents::FullSync { items } = events.initial_event() {
-        for (key, value) in items.iter() {
-            key_handler.handle_key_updated(key, Some(value));
-        }
+        key_handler.handle_full_sync(&items);
     }
 
     // Create background task to monitor for changes
@@ -58,9 +66,7 @@ pub async fn run_etcd_watcher<T: KeyHandler + Send + Sync + 'static>(
             let event = events.next().await;
             match event {
                 RecursiveKeyWatchEvents::FullSync { items } => {
-                    for (key, value) in items.iter() {
-                        key_handler.handle_key_updated(key, Some(value));
-                    }
+                    key_handler.handle_full_sync(&items);
                 }
                 RecursiveKeyWatchEvents::SyncOne { key, value } => {
                     key_handler.handle_key_updated(&key, Some(&value));

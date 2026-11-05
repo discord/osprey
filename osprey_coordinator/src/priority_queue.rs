@@ -267,7 +267,13 @@ impl EngineQueues {
         }
         let copy = original.shadow_copy(self.metrics.clone());
         match self.shadow.sender(priority).try_send(copy) {
-            Ok(()) => self.metrics.incr_engine_pool_shadow_sent(priority),
+            Ok(()) => {
+                self.metrics.incr_engine_pool_shadow_sent(priority);
+                // The last shadow stream may have left after the check above; don't leave the copy to go stale.
+                if self.shadow.connected() == 0 {
+                    self.drop_stale_shadow_copies();
+                }
+            }
             Err(async_channel::TrySendError::Full(_)) => {
                 self.metrics.incr_engine_pool_shadow_dropped_full(priority)
             }

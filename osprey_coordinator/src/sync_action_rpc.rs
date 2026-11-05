@@ -449,6 +449,80 @@ mod tests {
         assert_eq!(reply.verdicts, Some(verdicts));
     }
 
+    /// A snowflake service on a local port that hands out 1000, 1001, ... and counts its calls.
+    async fn snowflake_service() -> (String, Arc<std::sync::atomic::AtomicU64>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let served = calls.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let mut read = 0;
+                // Read the headers and the small JSON body, then answer and close.
+                loop {
+                    let n = socket.read(&mut buf[read..]).await.unwrap_or(0);
+                    read += n;
+                    let text = String::from_utf8_lossy(&buf[..read]);
+                    if n == 0 || (text.contains("\r\n\r\n") && text.trim_end().ends_with('}')) {
+                        break;
+                    }
+                }
+                let id = 1000 + served.fetch_add(1, Ordering::SeqCst);
+                let body = format!("[{id}]");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.ok();
+            }
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_a_nack_carries_the_minted_id_to_the_same_pool() {
+        let (endpoint, mints) = snowflake_service().await;
+        let metrics = OspreyCoordinatorMetrics::new();
+        let flags = Arc::new(crate::engine_pool::EngineRoutingFlags::default());
+        assert!(flags.set("rust_bps_sync", Some("5000")));
+        let (priority_queue_sender, priority_queue_receivers) =
+            crate::priority_queue::create_engine_queues(flags, metrics.clone(), 16);
+        let python = priority_queue_receivers.connect(EnginePool::Python);
+        let rust = priority_queue_receivers.connect(EnginePool::Rust);
+        let server = SyncActionServer::new_with_decryptor(
+            Arc::new(SnowflakeClient::new(endpoint)),
+            priority_queue_sender,
+            metrics.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(TestSecretDataDecryptor),
+        );
+        let mut without_id = request(None);
+        without_id.action_id = None;
+        let response =
+            tokio::spawn(
+                async move { server.process_action(tonic::Request::new(without_id)).await },
+            );
+        let next = || async {
+            tokio::select! {
+                a = python.receiver.recv(metrics.clone()) => (EnginePool::Python, a.unwrap()),
+                a = rust.receiver.recv(metrics.clone()) => (EnginePool::Rust, a.unwrap()),
+            }
+        };
+        let (first_pool, first) = next().await;
+        let (first_action, acker) = first.into_action();
+        acker.ack_or_nack(AckOrNack::Nack);
+        let (retry_pool, retry) = next().await;
+        let (retry_action, acker) = retry.into_action();
+        acker.ack_or_nack(AckOrNack::Ack(None));
+        response.await.unwrap().unwrap();
+        assert_eq!(first_action.action_id, 1000);
+        assert_eq!(retry_action.action_id, first_action.action_id);
+        assert_eq!(retry_pool, first_pool);
+        assert_eq!(mints.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn process_action_forwards_absent_secret_data() {
         let action = process_request(None).await;

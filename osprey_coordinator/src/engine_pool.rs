@@ -119,8 +119,10 @@ impl EngineRoutingFlags {
             _ => return false,
         };
         let bps = etcd_config::convert_to_u32(value).min(BPS_SCALE);
-        field.store(bps, Ordering::Relaxed);
-        tracing::info!({flag = name, bps = bps}, "engine routing flag updated");
+        let before = field.swap(bps, Ordering::Relaxed);
+        if before != bps {
+            tracing::info!({flag = name, bps = bps, before = before}, "engine routing flag updated");
+        }
         true
     }
 }
@@ -130,22 +132,33 @@ struct EngineRoutingKeys {
     flags: Arc<EngineRoutingFlags>,
 }
 
+impl EngineRoutingKeys {
+    fn flag_name<'a>(&self, key: &'a str) -> Option<&'a str> {
+        key.strip_prefix(self.root.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+    }
+}
+
 impl KeyHandler for EngineRoutingKeys {
     // A snapshot is the whole truth: a flag missing from it (deleted, even while the watch was down) is 0.
+    // Each flag is stored once from the snapshot, so a resync never passes through 0 on the way to its value.
     fn handle_full_sync(&self, items: &HashMap<Arc<str>, Arc<str>>) {
-        for name in FLAG_NAMES {
-            self.flags.set(name, None);
-        }
+        let mut values: HashMap<&str, &str> = HashMap::new();
         for (key, value) in items.iter() {
-            self.handle_key_updated(key, Some(value));
+            match self.flag_name(key) {
+                Some(name) if FLAG_NAMES.contains(&name) => {
+                    values.insert(name, value);
+                }
+                _ => tracing::warn!({ key = %key }, "unknown engine routing key"),
+            }
+        }
+        for name in FLAG_NAMES {
+            self.flags.set(name, values.get(name).copied());
         }
     }
 
     fn handle_key_updated(&self, key: &str, value: Option<&str>) {
-        let name = key
-            .strip_prefix(self.root.as_str())
-            .and_then(|rest| rest.strip_prefix('/'));
-        match name {
+        match self.flag_name(key) {
             Some(name) if self.flags.set(name, value) => {}
             _ => tracing::warn!({ key = key }, "unknown engine routing key"),
         }
@@ -293,6 +306,22 @@ mod tests {
         assert_eq!(flags.rust_bps(Priority::Sync), 0);
         assert_eq!(flags.shadow_bps(Priority::Async), 0);
         assert_eq!(flags.shadow_bps(Priority::Sync), 50);
+        // A resync carrying the same values stores each once, so a reader never sees it pass through 0.
+        let reader_flags = flags.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let mut saw_zero = false;
+            while !reader_stop.load(Ordering::Relaxed) {
+                saw_zero |= reader_flags.shadow_bps(Priority::Sync) == 0;
+            }
+            saw_zero
+        });
+        for _ in 0..20_000 {
+            keys.handle_full_sync(&items);
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(!reader.join().unwrap(), "a resync passed through 0");
         // The root deleted: an empty snapshot.
         keys.handle_full_sync(&HashMap::new());
         for p in [Priority::Sync, Priority::Async] {

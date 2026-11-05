@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from google.api_core.exceptions import DeadlineExceeded, NotFound, RetryError
+from google.cloud import pubsub_v1
+from google.pubsub_v1 import types as gapic_types
 from osprey.async_worker.lib.publisher import _PUBLISH_RETRY, AsyncPubSubPublisher
 
 
@@ -15,6 +17,85 @@ def _make_publisher():
         publisher = AsyncPubSubPublisher(project_id='proj', topic_id='topic')
     publisher._client = MagicMock()
     return publisher
+
+
+@pytest.fixture
+def real_client_publisher(monkeypatch):
+    """Return a publisher on the real client's batching, with only the Publish RPC mocked."""
+    monkeypatch.setenv('PUBSUB_EMULATOR_HOST', 'localhost:1')
+    publisher = AsyncPubSubPublisher(project_id='proj', topic_id='topic')
+    publisher._client._gapic_publish = MagicMock()
+    return publisher
+
+
+def _publish_response(topic, messages, **kwargs):
+    return gapic_types.PublishResponse(message_ids=[str(i) for i in range(len(messages))])
+
+
+def _batch_failure():
+    return RetryError('deadline exceeded', DeadlineExceeded('504'))
+
+
+def test_client_batches_up_to_max_messages():
+    with patch('osprey.async_worker.lib.publisher.pubsub_v1.PublisherClient') as client_cls:
+        AsyncPubSubPublisher(project_id='proj', topic_id='topic', max_messages=40)
+
+    client_cls.assert_called_once_with(
+        batch_settings=pubsub_v1.types.BatchSettings(max_bytes=1_000_000, max_latency=0.05, max_messages=40)
+    )
+
+
+@patch('osprey.async_worker.lib.publisher.metrics')
+def test_sync_flush_sends_messages_in_one_request(mock_metrics, real_client_publisher):
+    rpc = real_client_publisher._client._gapic_publish
+    rpc.side_effect = _publish_response
+
+    retry_messages = real_client_publisher._sync_flush([b'a', b'b', b'c'])
+
+    assert retry_messages == []
+    rpc.assert_called_once()
+    assert [m.data for m in rpc.call_args.kwargs['messages']] == [b'a', b'b', b'c']
+    assert rpc.call_args.kwargs['retry'] is _PUBLISH_RETRY
+    success_calls = [c for c in mock_metrics.increment.call_args_list if c[0][0].endswith('publish.success')]
+    assert len(success_calls) == 3
+
+
+@pytest.mark.asyncio
+@patch('osprey.async_worker.lib.publisher.metrics')
+@patch('osprey.async_worker.lib.publisher.logger')
+async def test_failed_batch_requeues_every_message(mock_logger, mock_metrics, real_client_publisher):
+    rpc = real_client_publisher._client._gapic_publish
+    rpc.side_effect = _batch_failure()
+
+    await real_client_publisher._flush_batch([b'a', b'b', b'c'])
+
+    rpc.assert_called_once()
+    assert [real_client_publisher._queue.get_nowait() for _ in range(3)] == [b'a', b'b', b'c']
+    assert real_client_publisher._queue.empty()
+    failure_calls = [c for c in mock_metrics.increment.call_args_list if c[0][0].endswith('publish.failure')]
+    assert len(failure_calls) == 3
+    assert mock_logger.warning.call_count == 3
+
+
+@patch('osprey.async_worker.lib.publisher.metrics')
+@patch('osprey.async_worker.lib.publisher.logger')
+def test_failed_batch_with_permanent_error_drops_every_message(mock_logger, mock_metrics, real_client_publisher):
+    real_client_publisher._client._gapic_publish.side_effect = NotFound('topic not found')
+
+    assert real_client_publisher._sync_flush([b'a', b'b']) == []
+    assert mock_logger.exception.call_count == 2
+
+
+@patch('osprey.async_worker.lib.publisher.metrics')
+def test_requeued_messages_publish_in_a_later_request(mock_metrics, real_client_publisher):
+    rpc = real_client_publisher._client._gapic_publish
+    rpc.side_effect = _batch_failure()
+    retry_messages = real_client_publisher._sync_flush([b'a', b'b'])
+
+    rpc.side_effect = _publish_response
+    assert real_client_publisher._sync_flush(retry_messages) == []
+    assert [m.data for m in rpc.call_args.kwargs['messages']] == [b'a', b'b']
+    assert rpc.call_count == 2
 
 
 def _make_future(result=None, exc=None):

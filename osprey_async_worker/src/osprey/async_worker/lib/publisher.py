@@ -56,6 +56,12 @@ _PUBLISH_RETRY = Retry(
     deadline=30.0,
 )
 
+# Pub/Sub rejects publish requests over 10 MB. Capping each request at 1 MB limits how many
+# messages one failed request takes down; a single larger message still goes out alone.
+_CLIENT_BATCH_MAX_BYTES = 1_000_000
+# Long enough for a whole drained batch to reach the client before its request is sent.
+_CLIENT_BATCH_MAX_LATENCY_SECONDS = 0.05
+
 
 class AsyncPubSubPublisher:
     """Publishes Pydantic models to a Pub/Sub topic with async batching.
@@ -73,7 +79,11 @@ class AsyncPubSubPublisher:
     ):
         self._topic_path = f'projects/{project_id}/topics/{topic_id}'
         self._client = pubsub_v1.PublisherClient(
-            batch_settings=pubsub_v1.types.BatchSettings(max_messages=1),
+            batch_settings=pubsub_v1.types.BatchSettings(
+                max_bytes=_CLIENT_BATCH_MAX_BYTES,
+                max_latency=_CLIENT_BATCH_MAX_LATENCY_SECONDS,
+                max_messages=max_messages,
+            ),
         )
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._max_messages = max_messages

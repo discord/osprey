@@ -1693,7 +1693,8 @@ def test_closure_scoped_specialization_is_corpus_equivalent(capsys) -> None:
         closure_spec = specialize_graph(graph, schema, index=index, scope_to_action_closure=True)
         closure_seconds = time.perf_counter() - start
 
-        scoped_chains, scoped_sources = _scoped_chains_for_action(graph, index, action)
+        scoped_chains, scoped = _scoped_chains_for_action(graph, index, action)
+        scoped_sources = index.corpus_source_count if scoped is None else len(scoped)
         closure_keys = {_node_key_from_chain(chain) for chain in scoped_chains}
         assert len(scoped_chains) < corpus_chain_count, (
             f'{action}: closure must be a strict subset of the corpus for this fixture'
@@ -2134,3 +2135,123 @@ def test_unplannable_specialization_falls_back_to_the_legacy_scheduler(monkeypat
     fallback = execute(spec, UDFHelpers(), act, gevent.pool.Pool(4))
     assert fallback.extracted_features == expected.extracted_features
     assert shadow_divergences(expected, fallback) == []
+
+
+# ---------------------------------------------------------------------------
+# A specialization's scheduling lists and plan cover only its action's closure
+# ---------------------------------------------------------------------------
+
+
+def _per_action_require_corpus(action_names: List[str]) -> Dict[str, str]:
+    """main.sml dispatches three per-action directories through `ActionName`, the way the
+    Discord corpus does, plus one f-string Require on a variable that is NOT the action name."""
+    corpus = {
+        'main.sml': """
+            Import(rules=['models/action_name.sml'])
+
+            Require(rule=f'counters/{ActionName}.sml')
+            Require(rule=f'models/actions/{ActionName}.sml')
+            Require(rule=f'actions/{ActionName}.sml')
+            Require(rule=f'variants/{Variant}.sml')
+        """,
+        'models/action_name.sml': """
+            ActionName = GetActionName()
+            Variant: str = JsonData(path='$.variant')
+        """,
+        'variants/a.sml': 'VariantA: bool = True',
+        'variants/b.sml': 'VariantB: bool = True',
+    }
+    for name in action_names:
+        corpus[f'counters/{name}.sml'] = f'{name}_Counter: bool = True'
+        corpus[f'models/actions/{name}.sml'] = f'{name}_Model: bool = True'
+        corpus[f'actions/{name}.sml'] = f'{name}_Action: bool = True'
+    return corpus
+
+
+def test_action_name_requires_resolve_to_the_dispatched_action_in_every_directory() -> None:
+    """Every f-string Require whose only placeholder is bound to `GetActionName()` resolves to
+    exactly one file at runtime, whichever directory it points into. A Require on any other
+    variable can reach every glob match, so it stays maximal."""
+    validated, graph = _compile(_per_action_require_corpus(['alpha', 'beta', 'gamma']))
+    index = build_specialization_index(graph)
+    assert index.closure_index is not None
+
+    sources = validated.sources
+    closure = index.closure_index.reachable([sources.get_entry_point()], action_name='beta')
+
+    assert {source.path for source in closure} == {
+        'main.sml',
+        'models/action_name.sml',
+        'counters/beta.sml',
+        'models/actions/beta.sml',
+        'actions/beta.sml',
+        'variants/a.sml',
+        'variants/b.sml',
+    }
+
+
+def test_a_placeholder_not_bound_to_get_action_name_is_not_narrowed() -> None:
+    """A variable merely NAMED `ActionName` can hold any value at runtime, so narrowing a Require
+    on it to the dispatched action would leave out files the action really loads."""
+    corpus = {
+        'main.sml': """
+            Import(rules=['models/action_name.sml'])
+            Require(rule=f'actions/{ActionName}.sml')
+        """,
+        'models/action_name.sml': "ActionName: str = JsonData(path='$.kind')",
+        'actions/alpha.sml': 'AlphaAction: bool = True',
+        'actions/beta.sml': 'BetaAction: bool = True',
+    }
+    validated, graph = _compile(corpus)
+    index = build_specialization_index(graph)
+    assert index.closure_index is not None
+
+    closure = index.closure_index.reachable([validated.sources.get_entry_point()], action_name='alpha')
+
+    assert {source.path for source in closure} == {
+        'main.sml',
+        'models/action_name.sml',
+        'actions/alpha.sml',
+        'actions/beta.sml',
+    }
+
+
+def test_specialized_plan_covers_only_the_action_closure() -> None:
+    """A specialization must not carry scheduling lists or plan rows for files its action never
+    loads: those are near-copies of the whole ruleset, one per specialized action."""
+    validated, graph = _compile_effect(_golden_corpus())
+    index = build_specialization_index(graph)
+    full_plan = graph.get_execution_plan()
+    assert full_plan is not None
+
+    for action in sorted(_GOLDEN_ABSENT):
+        spec = specialize_graph(graph, _golden_schema(action), index=index)
+        plan = spec.get_execution_plan()
+        assert plan is not None and plan is not full_plan
+        assert spec.pruned_count or spec.fold_count, f'{action}: fixture must filter something'
+
+        closure = index.closure_index.reachable(
+            [validated.sources.get_entry_point(), validated.sources.get_by_path(f'actions/{action}.sml')],
+            action_name=action,
+        )
+        closure_paths = {source.path for source in closure}
+
+        assert {source.path for source in plan.source_indices} == closure_paths
+        assert {source.path for source in spec._filtered_sorted_chains} == closure_paths
+
+        closure_chain_ids = {id(chain) for source in closure for chain in graph.get_sorted_dependency_chain(source)}
+        assert {id(chain) for chain in plan.chains} <= closure_chain_ids
+        assert len(plan.chains) < len(full_plan.chains) / 2, (
+            f'{action}: plan has {len(plan.chains)} of the full {len(full_plan.chains)} chains'
+        )
+
+
+def test_a_source_outside_the_closure_keeps_the_full_graph_list() -> None:
+    """A source the action cannot load is not copied; asking for it returns the full graph's own
+    list, which is full-graph semantics and costs no memory."""
+    _, graph = _compile_effect(_golden_corpus())
+    index = build_specialization_index(graph)
+    spec = specialize_graph(graph, _golden_schema('golden_action_0'), index=index)
+
+    other = graph.validated_sources.sources.get_by_path('actions/golden_action_1.sml')
+    assert spec.get_sorted_dependency_chain(other) is graph.get_sorted_dependency_chain(other)

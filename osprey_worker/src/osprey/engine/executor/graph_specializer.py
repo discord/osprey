@@ -410,8 +410,9 @@ def _scoped_chains_for_action(
     full_graph: ExecutionGraph,
     index: SpecializationIndex,
     action_name: str,
-) -> Tuple[List[DependencyChain], int]:
-    """The chains reachable from `action_name`'s source closure, plus the closure's source count.
+) -> Tuple[List[DependencyChain], Optional[List[Source]]]:
+    """The chains reachable from `action_name`'s source closure, plus the closure's sources, or
+    None for them when the closure is the whole corpus.
 
     The closure is walked from the graph's entry point (where execution actually begins —
     `ExecutionContext.__init__` enqueues it) with the per-action `Require(rule=f'actions/{...}')`
@@ -423,7 +424,7 @@ def _scoped_chains_for_action(
     closure), so a predecessor outside it means the walk and the graph disagree.
     """
     if index.closure_index is None:
-        return _collect_all_chains_recursive(_get_all_sorted_chains(full_graph)), index.corpus_source_count
+        return _collect_all_chains_recursive(_get_all_sorted_chains(full_graph)), None
 
     sources = full_graph.validated_sources.sources
     starts: List[Source] = [sources.get_entry_point()]
@@ -434,11 +435,11 @@ def _scoped_chains_for_action(
     scoped_sources = index.closure_index.reachable(starts, action_name=action_name)
     if len(scoped_sources) >= index.corpus_source_count:
         # Closure spans the corpus (single-file or fully-imported corpus) — nothing to scope.
-        return _collect_all_chains_recursive(_get_all_sorted_chains(full_graph)), index.corpus_source_count
+        return _collect_all_chains_recursive(_get_all_sorted_chains(full_graph)), None
 
     scoped_chains = _get_all_sorted_chains(full_graph, scoped_sources)
     _assert_dependency_closed(scoped_chains, action_name)
-    return scoped_chains, len(scoped_sources)
+    return scoped_chains, scoped_sources
 
 
 def _assert_dependency_closed(chains: Sequence[DependencyChain], action_name: str) -> None:
@@ -484,16 +485,16 @@ def specialize_graph(
         index = build_specialization_index(full_graph)
 
     # Step 1 — collect the chains in scope for this action.
+    scoped_sources: Optional[List[Source]] = None
     if scope_to_action_closure:
         try:
-            all_chains, scoped_source_count = _scoped_chains_for_action(full_graph, index, schema.action)
+            all_chains, scoped_sources = _scoped_chains_for_action(full_graph, index, schema.action)
         except ClosureScopeError:
             log.exception('closure scoping disagreed with the graph for %s; using whole corpus', schema.action)
             all_chains = _collect_all_chains_recursive(_get_all_sorted_chains(full_graph))
-            scoped_source_count = index.corpus_source_count
     else:
         all_chains = _collect_all_chains_recursive(_get_all_sorted_chains(full_graph))
-        scoped_source_count = index.corpus_source_count
+    scoped_source_count = index.corpus_source_count if scoped_sources is None else len(scoped_sources)
 
     # Step 2 — constant-fold the enforcement-feeding absent subtrees (this REPLACES the old
     # "rescue"). `protected` is the transitive closure of every WhenRules chain: the rules_any
@@ -625,6 +626,7 @@ def specialize_graph(
         pruned_keys=frozenset(pruned),
         schema=schema,
         fold_values=fold_values,
+        scoped_sources=scoped_sources,
     )
 
 
@@ -704,6 +706,7 @@ class SpecializedExecutionGraph(ExecutionGraph):
         pruned_keys: FrozenSet[NodeKey],
         schema: 'ActionSchema',
         fold_values: 'Optional[Mapping[NodeKey, NodeResult]]' = None,
+        scoped_sources: Optional[Sequence[Source]] = None,
     ) -> None:
         # Initialize the base ExecutionGraph with the full graph's registry and sources
         super().__init__(
@@ -721,11 +724,18 @@ class SpecializedExecutionGraph(ExecutionGraph):
         # Keyed by NodeKey (== id(node)), so it doubles as the runtime pre-seed map.
         self._fold_values: Mapping[NodeKey, NodeResult] = fold_values or {}
         self._schema = schema
-        self._filtered_sorted_chains = self._build_filtered_sorted_chains(full_graph)
+        self._filtered_sorted_chains = self._build_filtered_sorted_chains(full_graph, scoped_sources)
         self._execution_plan = self._build_execution_plan(full_graph)
 
-    def _build_filtered_sorted_chains(self, full_graph: ExecutionGraph) -> Dict[Source, Sequence[DependencyChain]]:
-        """Precompute every source's scheduling list once, at construction.
+    def _build_filtered_sorted_chains(
+        self, full_graph: ExecutionGraph, scoped_sources: Optional[Sequence[Source]]
+    ) -> Dict[Source, Sequence[DependencyChain]]:
+        """Precompute the scheduling list of each source the action can load, once, at construction.
+
+        Only the action's closure (`scoped_sources`, or every source when it is None) is listed: the
+        action never loads any other source, and listing them would copy most of the corpus into
+        every specialization. `get_sorted_dependency_chain` answers for an unlisted source with the
+        full graph's own list.
 
         The request path asks for these lists once per enqueued source per action, and both the
         graph and its pruned/folded sets are immutable after construction, so filtering per call
@@ -740,7 +750,7 @@ class SpecializedExecutionGraph(ExecutionGraph):
         """
         excluded = frozenset(self._pruned_keys) | frozenset(self._fold_values)
         filtered: Dict[Source, Sequence[DependencyChain]] = {}
-        for source in full_graph._sorted_dependency_chains:
+        for source in full_graph._sorted_dependency_chains if scoped_sources is None else scoped_sources:
             # Via the getter, so specializing a specialized graph keeps the inner filtering.
             original = full_graph.get_sorted_dependency_chain(source)
             if not excluded:
@@ -778,7 +788,7 @@ class SpecializedExecutionGraph(ExecutionGraph):
             # the same list objects and rebuild a structurally identical plan. Share it instead.
             return shared
         try:
-            plan = ExecutionPlan.from_graph(self)
+            plan = ExecutionPlan.from_graph(self, self._filtered_sorted_chains)
             unclosed = plan.find_unclosed_source()
         except Exception:
             log.exception('could not build an execution plan for %s; using the legacy scheduler', self._schema.action)
@@ -805,9 +815,13 @@ class SpecializedExecutionGraph(ExecutionGraph):
         """Return the sorted dependency chain for a source, with pruned AND folded chains removed
         (both are excluded from scheduling — pruned resolve to None/failure, folded are pre-seeded).
 
-        Precomputed in __init__; raises KeyError for an unknown source, as the base class does.
+        Precomputed in __init__ for the action's closure. A source outside it gets the full graph's
+        own list; an unknown source raises KeyError, as the base class does.
         """
-        return self._filtered_sorted_chains[source]
+        filtered = self._filtered_sorted_chains.get(source)
+        if filtered is not None:
+            return filtered
+        return self._full_graph.get_sorted_dependency_chain(source)
 
     def is_pruned_node(self, node: ASTNode) -> bool:
         """True if this node's chain was removed from scheduling (pruned or folded). Folded nodes

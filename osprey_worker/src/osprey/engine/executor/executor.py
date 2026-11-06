@@ -12,6 +12,7 @@ from osprey.engine.executor.custom_extracted_features import (
     SampleRateExtractedFeature,
     TimestampExtractedFeature,
 )
+from osprey.engine.executor.rule_controls import annotate_execution
 from osprey.engine.stdlib.udfs.json_utils import MissingJsonPath
 from osprey.engine.udf.base import BatchableUDFBase
 from osprey.worker.lib.instruments import metrics
@@ -436,14 +437,18 @@ def execute(
 
     trace_id = str(parent_tracer_span.trace_id) if parent_tracer_span else None
 
+    rule_audit_entries = context.get_rule_audit_entries()
+    extracted_features = context.get_extracted_features()
+    annotate_execution(extracted_features, execution_graph.validated_sources.sources, rule_audit_entries)
+
     result = ExecutionResult(
-        extracted_features=context.get_extracted_features(),
+        extracted_features=extracted_features,
         action=action,
         effects=effects,
         validator_results=validator_results,
         error_infos=unexpected_error_infos,
         sample_rate=sample_rate,
         trace_id=trace_id,
-        rule_audit_entries=context.get_rule_audit_entries(),
+        rule_audit_entries=rule_audit_entries,
     )
     return result

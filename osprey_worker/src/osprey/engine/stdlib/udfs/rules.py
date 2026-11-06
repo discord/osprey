@@ -5,6 +5,7 @@ from osprey.engine.ast import grammar
 from osprey.engine.ast_validator.validation_utils import add_must_assign_to_variable_error
 from osprey.engine.executor.execution_context import WhenRulesAuditEntry
 from osprey.engine.executor.node_executor.call_executor import CallExecutor
+from osprey.engine.executor.rule_controls import suppressed_rule_names
 from osprey.engine.language_types.effects import EffectBase
 from osprey.engine.language_types.rules import RuleT
 from osprey.engine.udf.type_helpers import validate_kwarg_node_type
@@ -188,6 +189,10 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
     def execute(self, execution_context: ExecutionContext, arguments: WhenRulesArguments) -> None:
         all_rule_names = [rule.name for rule in arguments.rules_any]
         passing_rules = [rule for rule in arguments.rules_any if rule.value]
+        # A suppressed rule keeps its value, so its dependents are unaffected; only this block's effects skip it.
+        suppressed_names = suppressed_rule_names([rule.name for rule in passing_rules])
+        if suppressed_names:
+            passing_rules = [rule for rule in passing_rules if rule.name not in suppressed_names]
         passing_names = [rule.name for rule in passing_rules]
         assert hasattr(self, '_failed_rule_names'), 'BUG: resolve_arguments() must be called before execute()'
         failed_rule_names: List[str] = self._failed_rule_names
@@ -204,6 +209,7 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
             effects_emitted=effects_emitted,
             effects_failed=then_failed,
             is_degraded=len(failed_rule_names) > 0,
+            rules_suppressed=list(suppressed_names),
         )
         execution_context.add_rule_audit_entry(entry)
 

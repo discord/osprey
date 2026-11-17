@@ -30,6 +30,7 @@ from minio.error import S3Error
 from osprey.engine.executor.execution_context import ExecutionResult
 from osprey.worker.lib.instruments import metrics
 from osprey.worker.lib.osprey_shared.logging import get_logger
+from osprey.worker.lib.public_suffix_list import public_suffix_list_id
 from osprey.worker.lib.snowflake import Snowflake
 from osprey.worker.lib.storage import ExecutionResultStorageBackendType, postgres
 from osprey.worker.lib.storage.bigtable import osprey_bigtable
@@ -305,6 +306,9 @@ MAX_QUEUED_UPLOADS = 32
 REOPEN_MIN_AGE_SECONDS = 60
 
 _GCS_METRIC = 'execution_result.gcs'
+# Names the public suffix list the record's domain splits used. Readers of this store ignore it; worker parity
+# comparers read it.
+PUBLIC_SUFFIX_LIST_FIELD = 'public_suffix_list'
 
 
 def _count_dropped(records: int, cause: str) -> None:
@@ -402,6 +406,7 @@ class StoredExecutionResultGCS(ExecutionResultStore):
         self._client: Optional[storage.Client] = None
         self._client_lock = threading.Lock()
         self._writer_token = uuid4().hex[:8]
+        self._public_suffix_list = public_suffix_list_id()
 
         self._lock = threading.Lock()
         self._batches: Dict[Tuple[str, str], _Batch] = {}
@@ -457,6 +462,11 @@ class StoredExecutionResultGCS(ExecutionResultStore):
                         'extracted_features': extracted_features_json,
                         'error_traces': error_traces_json,
                         'action_data': action_data_json,
+                        **(
+                            {PUBLIC_SUFFIX_LIST_FIELD: self._public_suffix_list}
+                            if self._public_suffix_list is not None
+                            else {}
+                        ),
                     }
                 )
                 + '\n'

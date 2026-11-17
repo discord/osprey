@@ -458,6 +458,59 @@ def test_missing_id_returns_none(
     assert fake_metrics.total('.read.ids', 'result:not_in_gcs') == 1
 
 
+def _stored_lines(gcs: _FakeGCS) -> List[Dict[str, Any]]:
+    return [json.loads(line) for data, _ in gcs.objects.values() for line in gzip.decompress(data).splitlines()]
+
+
+def test_records_name_the_public_suffix_list_and_reads_are_unchanged(
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    def synthetic_id() -> str:
+        calls.append(None)
+        return '0123456789abcdef'
+
+    monkeypatch.setattr(stored_execution_result, 'public_suffix_list_id', synthetic_id)
+    store = make_store()
+    ids = [_action_id(_BASE, sequence) for sequence in range(3)]
+    for action_id in ids:
+        _insert(store, action_id)
+    store.flush()
+
+    lines = _stored_lines(gcs)
+    assert [line['public_suffix_list'] for line in lines] == ['0123456789abcdef'] * 3
+    assert {key for line in lines for key in line} == {
+        'id',
+        'ts',
+        'extracted_features',
+        'error_traces',
+        'action_data',
+        'public_suffix_list',
+    }
+    assert len(calls) == 1
+    assert store.select_one(ids[0]) == {
+        'id': ids[0],
+        'extracted_features': '{"ActionName": "test"}',
+        'error_traces': '[]',
+        'timestamp': _BASE,
+        'action_data': f'{{"action_id": {ids[0]}}}',
+    }
+
+
+def test_records_omit_the_public_suffix_list_when_it_has_no_id(
+    make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stored_execution_result, 'public_suffix_list_id', lambda: None)
+    store = make_store()
+    _insert(store, _action_id(_BASE))
+    store.flush()
+
+    (line,) = _stored_lines(gcs)
+    assert 'public_suffix_list' not in line
+    assert store.select_one(_action_id(_BASE)) is not None
+
+
 def test_reader_lists_minute_and_late_hour_prefixes_and_finds_late_records(
     make_store: Callable[..., StoredExecutionResultGCS], gcs: _FakeGCS, clock: _FakeClock
 ) -> None:

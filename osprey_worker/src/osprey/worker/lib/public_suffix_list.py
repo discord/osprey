@@ -31,18 +31,25 @@ def list_id(path: str) -> Optional[str]:
     try:
         with open(path, 'rb') as f:
             digest = hashlib.sha256(f.read()).hexdigest()
-    except OSError:
+    except Exception:
         logger.warning(f'Could not read the public suffix list at {path}; results will not name it', exc_info=True)
         return None
     return digest[:ID_HEX_DIGITS]
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def public_suffix_list_id() -> Optional[str]:
-    """The id of the list this process splits domains with, computed once."""
+    """The id of the list this process splits domains with, computed once.
+
+    `tld` parses the file lazily and keeps it for the life of the process, so this names the right list as long as
+    the file is not replaced while the process runs.
+    """
     try:
         path = list_path()
     except Exception:
         logger.warning('Could not locate the public suffix list; results will not name it', exc_info=True)
         return None
-    return list_id(path)
+    found = list_id(path)
+    if found is not None:
+        logger.info(f'Public suffix list {found} at {path}')
+    return found

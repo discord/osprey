@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
+import tld
 from osprey.worker.lib import public_suffix_list
 from osprey.worker.lib.public_suffix_list import list_id, list_path, public_suffix_list_id
 from tld import get_tld
@@ -52,6 +53,7 @@ def test_list_id_hashes_raw_bytes_without_newline_translation(tmp_path: Path) ->
 def test_an_unreadable_list_has_no_id(tmp_path: Path) -> None:
     assert list_id(str(tmp_path / 'missing.dat')) is None
     assert list_id(str(tmp_path)) is None
+    assert list_id(str(tmp_path / 'embedded\0null.dat')) is None
 
 
 def test_list_path_is_the_file_tld_splits_domains_with(tmp_path: Path) -> None:
@@ -59,9 +61,9 @@ def test_list_path_is_the_file_tld_splits_domains_with(tmp_path: Path) -> None:
     res.mkdir()
     (res / 'effective_tld_names.dat.txt').write_bytes(_SYNTHETIC_LIST)
     parent = get_setting('NAMES_LOCAL_PATH_PARENT')
-    set_setting('NAMES_LOCAL_PATH_PARENT', str(tmp_path))
-    reset_tld_names()
     try:
+        set_setting('NAMES_LOCAL_PATH_PARENT', str(tmp_path))
+        reset_tld_names()
         assert get_tld('a.b.osprey-test-tld', fix_protocol=True) == 'osprey-test-tld'
         assert list_path() == str(res / 'effective_tld_names.dat.txt')
     finally:
@@ -70,8 +72,8 @@ def test_list_path_is_the_file_tld_splits_domains_with(tmp_path: Path) -> None:
 
 
 def test_the_process_id_is_the_installed_lists_id(fresh_id: None) -> None:
-    with open(list_path(), 'rb') as f:
-        expected = hashlib.sha256(f.read()).hexdigest()[:16]
+    installed = Path(tld.__file__).parent / 'res' / 'effective_tld_names.dat.txt'
+    expected = hashlib.sha256(installed.read_bytes()).hexdigest()[:16]
 
     assert public_suffix_list_id() == expected
 

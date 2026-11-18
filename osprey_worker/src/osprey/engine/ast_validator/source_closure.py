@@ -10,6 +10,8 @@ Two consumers need "which sources can this action possibly touch?":
 Both want the same MAXIMAL static closure, so the walk lives here once. It follows
 Import edges (statically exact) and Require edges (a runtime decision, so both
 ``require_if`` branches are walked and format-string rules are glob-expanded).
+Given an action name, a format-string rule whose every placeholder is bound to
+``GetActionName()`` is resolved to that action's one file instead of globbed.
 
 Per-source adjacency is resolved once at construction; a closure walk is then pure
 graph traversal, which is what makes a per-action closure cheap enough to compute
@@ -20,8 +22,9 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple, Union
 
 from osprey.engine.ast import grammar
 from osprey.engine.ast.ast_utils import filter_nodes
@@ -40,9 +43,29 @@ ACTION_SOURCE_DIR = 'actions'
 
 ACTION_SOURCE_SUFFIX = '.sml'
 
-RequireEdge = Union[Source, str]
-"""A resolved Require target: either a concrete Source (literal ``rule=``) or a glob
-pattern (format-string ``rule=``) to be expanded against the Sources collection."""
+
+@dataclass(frozen=True)
+class FormatRequire:
+    """A format-string ``rule=``, e.g. ``f'counters/{ActionName}.sml'``."""
+
+    format_string: str
+    names: Tuple[str, ...]
+    is_action_dispatch: bool
+    """Every placeholder is bound to ``GetActionName()``, so at runtime the rule is exactly one path."""
+
+    @property
+    def glob(self) -> str:
+        return self.format_string.format(**{name: '*' for name in self.names})
+
+    def path_for(self, action_name: str) -> str:
+        return self.format_string.format(**{name: action_name for name in self.names})
+
+
+RequireEdge = Union[Source, FormatRequire]
+"""A resolved Require target: either a concrete Source (literal ``rule=``) or a format
+string (format-string ``rule=``) to be resolved against the Sources collection."""
+
+_GET_ACTION_NAME = 'GetActionName'
 
 
 def action_source_path(action_name: str) -> str:
@@ -92,15 +115,12 @@ class SourceClosureIndex:
         a format-string Require is followed, because any of them could be the runtime
         target.
 
-        With ``action_name`` set, a glob match that is a *different* action's per-action
-        source (``actions/<other>.sml``) is skipped — the corpus dispatches actions via
-        ``Require(rule=f'actions/{ActionName}.sml')``, so at runtime exactly one of those
-        matches is required and it is this action's. Every non-action glob match is still
-        followed, and a literal Require is never narrowed.
-
-        Narrowing can only ever UNDER-approximate (never over-approximate) the runtime
-        source set, which is the safe direction for the specializer: a source left out of
-        the closure simply keeps full-graph semantics.
+        With ``action_name`` set, a format-string Require whose every placeholder is bound to
+        ``GetActionName()`` (``f'actions/{ActionName}.sml'``, ``f'counters/{ActionName}.sml'``)
+        is followed to the one path it formats to for this action, which is the only file it
+        can load at runtime. Any other format-string Require is still glob-expanded, and a
+        literal Require is never narrowed, so the closure contains every source the action can
+        load: the specializer builds its scheduling lists from it alone.
         """
         visited: Set[str] = set()
         queue: deque[Source] = deque(starts)
@@ -122,14 +142,14 @@ class SourceClosureIndex:
                     if edge.path not in visited:
                         queue.append(edge)
                     continue
-                for matched in self._glob(edge):
-                    if matched.path in visited:
-                        continue
-                    if action_name is not None:
-                        matched_action = action_name_for_source(matched.path)
-                        if matched_action is not None and matched_action != action_name:
-                            continue
-                    queue.append(matched)
+                if action_name is not None and edge.is_action_dispatch:
+                    target = self._sources.get_by_path(edge.path_for(action_name))
+                    if target is not None and target.path not in visited:
+                        queue.append(target)
+                    continue
+                for matched in self._glob(edge.glob):
+                    if matched.path not in visited:
+                        queue.append(matched)
 
         return result
 
@@ -144,6 +164,7 @@ def build_source_closure_index(
 
     imports: Dict[str, Tuple[Source, ...]] = {}
     requires: Dict[str, Tuple[RequireEdge, ...]] = {}
+    action_name_bindings = _action_name_bindings(sources)
 
     for source in sources:
         import_edges = tuple(import_graph.iter_edges(source))
@@ -169,14 +190,42 @@ def build_source_closure_index(
                 if target is not None:
                     require_edges.append(target)
             elif isinstance(rule_ast_node, grammar.FormatString):
-                # Same f-string -> glob conversion the Require UDF validates with.
-                names_as_wildcards = {name.identifier: '*' for name in rule_ast_node.names}
-                require_edges.append(rule_ast_node.format_string.format(**names_as_wildcards))
+                names = tuple(name.identifier for name in rule_ast_node.names)
+                require_edges.append(
+                    FormatRequire(
+                        format_string=rule_ast_node.format_string,
+                        names=names,
+                        is_action_dispatch=bool(names) and all(name in action_name_bindings for name in names),
+                    )
+                )
 
         if require_edges:
             requires[source.path] = tuple(require_edges)
 
     return SourceClosureIndex(sources=sources, imports=imports, requires=requires)
+
+
+def _action_name_bindings(sources: 'Sources') -> FrozenSet[str]:
+    """Names whose every assignment in the corpus is ``GetActionName()``, so their runtime value
+    is always the action being executed."""
+    bound: Set[str] = set()
+    rebound: Set[str] = set()
+    for source in sources:
+        for assign in filter_nodes(source.ast_root, grammar.Assign):
+            if _is_get_action_name_call(assign.value):
+                bound.add(assign.target.identifier)
+            else:
+                rebound.add(assign.target.identifier)
+    return frozenset(bound - rebound)
+
+
+def _is_get_action_name_call(node: grammar.Expression) -> bool:
+    return (
+        isinstance(node, Call)
+        and isinstance(node.func, grammar.Name)
+        and node.func.identifier == _GET_ACTION_NAME
+        and not node.arguments
+    )
 
 
 def build_source_closure_index_for(validated_sources: 'ValidatedSources') -> Optional[SourceClosureIndex]:

@@ -24,7 +24,7 @@ state remains in a per-action ``ExecutionPlanState``.
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Tuple
 
 from osprey.engine.ast.grammar import Source
 from osprey.engine.utils.periodic_execution_yielder import maybe_periodic_yield
@@ -46,10 +46,11 @@ class ExecutionPlan:
     source_indices: Mapping[Source, Tuple[int, ...]]
 
     @classmethod
-    def from_graph(cls, graph: 'ExecutionGraph') -> 'ExecutionPlan':
+    def from_graph(cls, graph: 'ExecutionGraph', sources: Optional[Iterable[Source]] = None) -> 'ExecutionPlan':
+        """Plan every source of ``graph``, or only ``sources``: a source left out cannot be activated."""
         chains_by_id: dict[int, DependencyChain] = {}
         source_chain_ids: dict[Source, tuple[int, ...]] = {}
-        for source in graph.validated_sources.sources:
+        for source in graph.validated_sources.sources if sources is None else sources:
             chains = tuple(graph.get_sorted_dependency_chain(source))
             source_chain_ids[source] = tuple([id(chain) for chain in chains])
             for chain in chains:

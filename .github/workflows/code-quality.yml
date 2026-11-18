@@ -151,7 +151,10 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
         with:
-          toolchain: stable
+          # Pinned: rustc 1.100.0 (2026-11-09) rejects the endless loop inside
+          # try_stream! in osprey_coordinator/src/pigeon/health.rs:147 (E0271).
+          # Fix that code before moving this pin forward.
+          toolchain: 1.99.1
           components: rustfmt, clippy
 
       - name: Cache Rust dependencies

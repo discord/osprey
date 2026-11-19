@@ -126,6 +126,8 @@ class WhenRulesAuditEntry:
     effects_emitted: List[str]
     effects_failed: int
     is_degraded: bool
+    # Rules that passed but emitted nothing, because the installed rule controls suppress them.
+    rules_suppressed: List[str] = field(default_factory=list)
 
 
 class ExecutionContext:

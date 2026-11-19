@@ -117,6 +117,22 @@ class ExternalServiceException(Exception):
 
 @add_slots
 @dataclass
+class EffectAuditRecord:
+    """A would-be or emitted effect of a WhenRules block that declares a mode."""
+
+    effect_type: str
+    entity: Optional[str] = None
+    """The effect's primary entity as `type/id`, in every mode, or None if the effect has no entity."""
+    detail: Optional[str] = None
+    """The effect's `to_str()` (for a label, `type/label/status`), or None if it has none."""
+    bucket: Optional[int] = None
+    """The rollout bucket in [0, 10000) for the effect's primary entity. Set only in `rollout` mode."""
+    in_bucket: Optional[bool] = None
+    """Whether the bucket is under `rollout_percent`. Set only in `rollout` mode."""
+
+
+@add_slots
+@dataclass
 class WhenRulesAuditEntry:
     """Audit record for a single WhenRules evaluation."""
 
@@ -126,6 +142,14 @@ class WhenRulesAuditEntry:
     effects_emitted: List[str]
     effects_failed: int
     is_degraded: bool
+    name: Optional[str] = None
+    mode: Optional[str] = None
+    revision_id: Optional[str] = None
+    release_id: Optional[str] = None
+    effects_suppressed: List[EffectAuditRecord] = field(default_factory=list)
+    """Effects that matched but were not emitted: all of them in `shadow`, the out-of-bucket ones in `rollout`."""
+    rollout_effects: List[EffectAuditRecord] = field(default_factory=list)
+    """Every effect of a matched `rollout` block, emitted or suppressed, with its bucket decision."""
 
 
 class ExecutionContext:

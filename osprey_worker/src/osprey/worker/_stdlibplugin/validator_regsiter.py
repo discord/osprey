@@ -15,6 +15,7 @@ from osprey.engine.ast_validator.validators.validate_dynamic_calls_have_annotate
 from osprey.engine.ast_validator.validators.validate_experiments import ValidateExperiments
 from osprey.engine.ast_validator.validators.validate_labels import ValidateLabels
 from osprey.engine.ast_validator.validators.validate_static_types import ValidateStaticTypes
+from osprey.engine.ast_validator.validators.validate_when_rules_names import ValidateWhenRulesNames
 from osprey.engine.ast_validator.validators.variables_must_be_defined import VariablesMustBeDefined
 from osprey.worker.adaptor.plugin_manager import hookimpl_osprey
 
@@ -29,6 +30,7 @@ def register_ast_validators() -> Sequence[Type[BaseValidator]]:
         ValidateLabels,
         NoUnusedLocals,
         ValidateExperiments,
+        ValidateWhenRulesNames,
         ValidateCallKwargs,
         RuleNameToDescriptionMapping,
         UniqueStoredNames,

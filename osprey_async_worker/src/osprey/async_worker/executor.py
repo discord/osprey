@@ -38,6 +38,7 @@ from osprey.engine.executor.execution_context import (
     NodeResult,
 )
 from osprey.engine.executor.execution_graph import ExecutionGraph
+from osprey.engine.executor.metric_tags import NODE_OVERRIDE_TAGS, failure_metric_tags
 from osprey.engine.executor.node_executor.call_executor import CallExecutor
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
 from osprey.engine.stdlib.udfs.json_utils import MissingJsonPath
@@ -55,13 +56,6 @@ _DEFAULT_MAX_ASYNC_PER_EXECUTION = 12
 # Max sync evaluation time between event-loop yields while async work is pending.
 DEFAULT_YIELD_INTERVAL_S = 0.010
 _OBSERVABILITY_SAMPLE_RATE = 0.01
-_CARDINALITY_SUPPRESSION_TAGS = (
-    'host:none',
-    'kube_node:none',
-    'instance-id:none',
-    'internal-hostname:none',
-    'name:none',
-)
 
 
 def _get_ready_sync_and_async(
@@ -97,7 +91,7 @@ def _get_metric_tags(
         f'batch_type:{batchable_udf.get_batchable_arguments_type().__name__}'
         if batchable_udf is not None
         else 'batch_type:none',
-        *_CARDINALITY_SUPPRESSION_TAGS,
+        *NODE_OVERRIDE_TAGS,
     ]
 
 
@@ -115,14 +109,14 @@ def _record_udf_metric(
             exc_name = exc_name + f'.{caught_exception.code().name.lower()}'
         metrics.increment(
             'udf_execution',
-            tags=metric_tags + [f'exc_name:{exc_name}', 'result:unexpected_failure'],
+            tags=failure_metric_tags(metric_tags) + [f'exc_name:{exc_name}', 'result:unexpected_failure'],
         )
         sentry_sdk.capture_exception(caught_exception)
 
 
 def _get_permit_metric_tags(context: ExecutionContext, udf: Optional[object] = None) -> List[str]:
     udf_name = udf.__class__.__name__ if udf is not None else 'none'
-    return [f'action:{context.get_action_name()}', f'udf:{udf_name}', *_CARDINALITY_SUPPRESSION_TAGS]
+    return [f'action:{context.get_action_name()}', f'udf:{udf_name}', *NODE_OVERRIDE_TAGS]
 
 
 @asynccontextmanager
@@ -337,7 +331,7 @@ async def _execute_async_batch(
                         exc_name = exc_name + f'.{result.value.code().name.lower()}'
                     metrics.increment(
                         'udf_execution',
-                        tags=metric_tags
+                        tags=failure_metric_tags(metric_tags)
                         + [f'udf:{udf.__class__.__name__}', f'exc_name:{exc_name}', 'result:unexpected_failure'],
                     )
                 type_checked_results.append(Err(None))
@@ -550,7 +544,7 @@ async def execute(
         ready_sync, ready_async = _get_ready_sync_and_async(allow_async, context)
 
     # Per-action maxima expose saturation without emitting StatsD calls on every scheduler wave.
-    scheduler_tags = [f'action:{context.get_action_name()}', *_CARDINALITY_SUPPRESSION_TAGS]
+    scheduler_tags = [f'action:{context.get_action_name()}', *NODE_OVERRIDE_TAGS]
     metrics.histogram(
         'udf_ready_depth',
         max_ready_depth,

@@ -808,6 +808,10 @@ _BASE_METRIC_TAGS = [
 ]
 
 
+# Failures keep the Datadog Agent's host, so `kube_node` and the other host tags attach to error series.
+_FAILURE_BASE_METRIC_TAGS = ['action:test', 'encoding:unknown', 'batch_type:none']
+
+
 def _sole_call_for_metric(mock: MagicMock, metric_name: str) -> Any:
     """`execute()` also emits an unrelated `osprey.action_health` increment; isolate the call
     for the metric under test, asserting there's exactly one."""
@@ -832,7 +836,7 @@ def test_metric_tags_on_sync_call_exception(
     metrics.timed.assert_not_called()
     call = _sole_call_for_metric(metrics.increment, 'udf_execution')
     assert call.kwargs['tags'] == [
-        *_BASE_METRIC_TAGS,
+        *_FAILURE_BASE_METRIC_TAGS,
         'udf:FailingUdf',
         'exc_name:ValueError',
         'result:unexpected_failure',
@@ -857,3 +861,124 @@ def test_metric_tags_on_async_udf_success(
 
     inc_call = _sole_call_for_metric(metrics.increment, 'udf_execution')
     assert inc_call.kwargs['tags'] == [*timed_tags, 'exc_name:none', 'result:success']
+
+
+class BatchRaisingUdf(BatchableUDFBase[BatchFailingUdfArgs, int, BatchFailingUdfArgs]):
+    def execute(self, execution_context: ExecutionContext, arguments: BatchFailingUdfArgs) -> int:
+        return arguments.id
+
+    def get_batchable_arguments(self, arguments: BatchFailingUdfArgs) -> BatchFailingUdfArgs:
+        return arguments
+
+    def execute_batch(
+        self, execution_context: ExecutionContext, udfs: Sequence[UDFBase], arguments: Sequence[BatchFailingUdfArgs]
+    ) -> Sequence[Result[int, Exception]]:
+        raise ValueError('whole batch failed')
+
+
+class BatchDynamicReturnUdf(BatchableUDFBase[BatchFailingUdfArgs, Any, BatchFailingUdfArgs]):
+    """Returns a string for odd ids, which fails the `int` annotation's dynamic type check."""
+
+    def execute(self, execution_context: ExecutionContext, arguments: BatchFailingUdfArgs) -> Any:
+        return arguments.id
+
+    def get_batchable_arguments(self, arguments: BatchFailingUdfArgs) -> BatchFailingUdfArgs:
+        return arguments
+
+    def execute_batch(
+        self, execution_context: ExecutionContext, udfs: Sequence[UDFBase], arguments: Sequence[BatchFailingUdfArgs]
+    ) -> Sequence[Result[Any, Exception]]:
+        return [Ok(str(arg.id)) if arg.id % 2 else Ok(arg.id) for arg in arguments]
+
+
+def _udf_execution_tags(mock: MagicMock) -> List[List[str]]:
+    return [call.kwargs['tags'] for call in mock.call_args_list if call.args[0] == 'udf_execution']
+
+
+def _batch_tags(batch_type: str) -> List[str]:
+    return [tag if tag != 'batch_type:none' else f'batch_type:{batch_type}' for tag in _BASE_METRIC_TAGS]
+
+
+def _batch_failure_tags(batch_type: str) -> List[str]:
+    return ['action:test', 'encoding:unknown', f'batch_type:{batch_type}']
+
+
+def test_metric_tags_on_failed_batch_items(
+    batch_failing_udf: Type[BatchFailingUdf], execute: ExecuteFunction, mocker: MockFixture
+) -> None:
+    mocker.patch('osprey.worker.lib.instruments.metrics.increment')
+
+    execute(
+        """
+        A = BatchFailingUdf(id=1)
+        B = BatchFailingUdf(id=2)
+        C = BatchFailingUdf(id=3)
+        """,
+        allow_errors=True,
+        async_pool=gevent.pool.Pool(10),
+    )
+
+    assert batch_failing_udf.order_called() == [[1, 2, 3]]
+    failure = [
+        *_batch_failure_tags('BatchFailingUdfArgs'),
+        'udf:BatchFailingUdf',
+        'exc_name:ValueError',
+        'result:unexpected_failure',
+    ]
+    success = [*_batch_tags('BatchFailingUdfArgs'), 'udf:BatchFailingUdf', 'exc_name:none', 'result:success']
+    assert _udf_execution_tags(metrics.increment) == [failure, success, failure]
+
+
+def test_metric_tags_on_whole_batch_failure(
+    udf_registry: UDFRegistry, execute: ExecuteFunction, mocker: MockFixture
+) -> None:
+    udf_registry.register(BatchRaisingUdf)
+    mocker.patch('osprey.worker.lib.instruments.metrics.increment')
+
+    execute(
+        """
+        A = BatchRaisingUdf(id=1)
+        B = BatchRaisingUdf(id=2)
+        """,
+        allow_errors=True,
+        async_pool=gevent.pool.Pool(10),
+    )
+
+    failure = [
+        *_batch_failure_tags('BatchFailingUdfArgs'),
+        'udf:BatchRaisingUdf',
+        'exc_name:ValueError',
+        'result:unexpected_failure',
+    ]
+    assert _udf_execution_tags(metrics.increment) == [failure, failure]
+    batch_call = _sole_call_for_metric(metrics.increment, 'udf_execution_batch')
+    assert batch_call.kwargs['tags'] == [
+        *_batch_tags('BatchFailingUdfArgs'),
+        'exc_name:ValueError',
+        'result:unexpected_failure',
+    ]
+
+
+def test_metric_tags_on_failed_batch_type_check(
+    udf_registry: UDFRegistry, execute: ExecuteFunction, mocker: MockFixture
+) -> None:
+    udf_registry.register(BatchDynamicReturnUdf)
+    mocker.patch('osprey.worker.lib.instruments.metrics.increment')
+
+    execute(
+        """
+        A: int = BatchDynamicReturnUdf(id=1)
+        B: int = BatchDynamicReturnUdf(id=2)
+        """,
+        allow_errors=True,
+        async_pool=gevent.pool.Pool(10),
+    )
+
+    failure = [
+        *_batch_failure_tags('BatchFailingUdfArgs'),
+        'udf:BatchDynamicReturnUdf',
+        'exc_name:InvalidDynamicReturnType',
+        'result:unexpected_failure',
+    ]
+    success = [*_batch_tags('BatchFailingUdfArgs'), 'udf:BatchDynamicReturnUdf', 'exc_name:none', 'result:success']
+    assert _udf_execution_tags(metrics.increment) == [failure, success]

@@ -29,7 +29,7 @@ from osprey.engine.stdlib import get_config_registry
 from osprey.engine.udf.arguments import ArgumentsBase
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.worker.lib.instruments import metrics
-from result import Ok
+from result import Err, Ok
 
 
 class GatedArguments(ArgumentsBase):
@@ -713,3 +713,94 @@ async def test_batch_of_one_resolve_failure_surfaces_once(
     assert isinstance(result.error_infos[0].error, RuntimeError)
     assert str(result.error_infos[0].error) == 'resolve boom'
     assert counting_batchable_udf.resolve_call_count == 1
+
+
+class FailingAsyncUdf(AsyncUDFBase[ArgumentsBase, str]):
+    async def async_execute(self, execution_context: ExecutionContext, arguments: ArgumentsBase) -> str:
+        raise ValueError('intentional failure')
+
+
+class OddFailingBatchableUdf(CountingBatchableUdf):
+    """Fails every batch item whose value is odd."""
+
+    async def async_execute_batch(self, execution_context, udfs, arguments: Sequence[CountingBatchableArgs]):
+        return [Err(ValueError('odd')) if int(a.value) % 2 else Ok(a.value) for a in arguments]
+
+
+_NODE_OVERRIDE_TAGS = ['host:none', 'kube_node:none', 'instance-id:none', 'internal-hostname:none', 'name:none']
+
+
+@pytest.fixture()
+def udf_execution_tags(monkeypatch: pytest.MonkeyPatch) -> list[list[str] | None]:
+    calls: list[list[str] | None] = []
+
+    def record_increment(
+        metric_name: str, value: float = 1, tags: list[str] | None = None, sample_rate: float | None = None
+    ) -> None:
+        if metric_name == 'udf_execution':
+            calls.append(tags)
+
+    monkeypatch.setattr(metrics, 'increment', record_increment)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_failed_async_udf_keeps_node_tags(
+    async_execute_with_result, stdlib_udf_registry: UDFRegistry, udf_execution_tags
+) -> None:
+    stdlib_udf_registry.register(FailingAsyncUdf)
+
+    await async_execute_with_result('A = FailingAsyncUdf()', udf_registry=stdlib_udf_registry)
+
+    assert udf_execution_tags == [
+        [
+            'action:test',
+            'encoding:unknown',
+            'batch_type:none',
+            'udf:FailingAsyncUdf',
+            'exc_name:ValueError',
+            'result:unexpected_failure',
+        ]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_async_udf_keeps_node_overrides(
+    async_execute_with_result, stdlib_udf_registry: UDFRegistry, counting_batchable_udf, udf_execution_tags
+) -> None:
+    stdlib_udf_registry.register(counting_batchable_udf)
+
+    await async_execute_with_result('A = CountingBatchableUdf(key="solo", value="a")', udf_registry=stdlib_udf_registry)
+
+    assert udf_execution_tags == [
+        [
+            'action:test',
+            'encoding:unknown',
+            'batch_type:none',
+            *_NODE_OVERRIDE_TAGS,
+            'udf:CountingBatchableUdf',
+            'exc_name:none',
+            'result:success',
+        ]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_async_batch_items_keep_node_tags(
+    async_execute_with_result, stdlib_udf_registry: UDFRegistry, counting_batchable_udf, udf_execution_tags
+) -> None:
+    stdlib_udf_registry.register(OddFailingBatchableUdf)
+
+    await async_execute_with_result(
+        """
+        A = OddFailingBatchableUdf(key="shared", value="1")
+        B = OddFailingBatchableUdf(key="shared", value="2")
+        C = OddFailingBatchableUdf(key="shared", value="3")
+        """,
+        udf_registry=stdlib_udf_registry,
+    )
+
+    batch_tags = ['action:test', 'encoding:unknown', 'batch_type:CountingBatchableArgs']
+    failure = [*batch_tags, 'udf:OddFailingBatchableUdf', 'exc_name:ValueError', 'result:unexpected_failure']
+    success = [*batch_tags, *_NODE_OVERRIDE_TAGS, 'udf:OddFailingBatchableUdf', 'exc_name:none', 'result:success']
+    assert udf_execution_tags == [failure, success, failure]

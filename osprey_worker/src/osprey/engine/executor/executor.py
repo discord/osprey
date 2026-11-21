@@ -29,6 +29,7 @@ from .execution_context import (
     NodeResult,
 )
 from .execution_graph import ExecutionGraph
+from .metric_tags import NODE_OVERRIDE_TAGS, failure_metric_tags
 from .node_executor.call_executor import CallExecutor
 from .udf_execution_helpers import UDFHelpers
 
@@ -91,12 +92,7 @@ def _get_metric_tags(
         f'batch_type:{batchable_udf.get_batchable_arguments_type().__name__}'
         if batchable_udf is not None
         else 'batch_type:none',
-        # These are autodiscovery tags with high cardinality that we want to override so we do not ingest them
-        'host:none',
-        'kube_node:none',
-        'instance-id:none',
-        'internal-hostname:none',
-        'name:none',
+        *NODE_OVERRIDE_TAGS,
     ]
 
 
@@ -138,10 +134,11 @@ def _wrapped_batch_execution(
                 'udf_execution_batch',
                 tags=metric_tags + [f'exc_name:{e.__class__.__name__}', 'result:unexpected_failure'],
             )
+            failure_tags = failure_metric_tags(metric_tags)
             for udf in udfs:
                 metrics.increment(
                     'udf_execution',
-                    tags=metric_tags
+                    tags=failure_tags
                     + [
                         f'udf:{udf.__class__.__name__}',
                         f'exc_name:{e.__class__.__name__}',
@@ -159,7 +156,7 @@ def _wrapped_batch_execution(
                 exc_name = result.value.__class__.__name__
                 metrics.increment(
                     'udf_execution',
-                    tags=metric_tags
+                    tags=failure_metric_tags(metric_tags)
                     + [f'udf:{udf.__class__.__name__}', f'exc_name:{exc_name}', 'result:unexpected_failure'],
                 )
             type_checked_results.append(Err(None))
@@ -178,7 +175,7 @@ def _wrapped_batch_execution(
                 exc_name = e.__class__.__name__
                 metrics.increment(
                     'udf_execution',
-                    tags=metric_tags
+                    tags=failure_metric_tags(metric_tags)
                     + [f'udf:{udf.__class__.__name__}', f'exc_name:{exc_name}', 'result:unexpected_failure'],
                 )
             type_checked_results.append(Err(None))
@@ -240,7 +237,7 @@ def _wrapped_execution(
                 exc_name = caught_exception.__class__.__name__
                 metrics.increment(
                     'udf_execution',
-                    tags=_get_tags() + [f'exc_name:{exc_name}', 'result:unexpected_failure'],
+                    tags=failure_metric_tags(_get_tags()) + [f'exc_name:{exc_name}', 'result:unexpected_failure'],
                 )
 
         return execution_result
